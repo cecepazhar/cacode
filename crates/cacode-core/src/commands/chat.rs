@@ -57,6 +57,13 @@ pub enum Provider {
     Router9 { model: String },
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
 pub struct ReActAgent {
     client: Client,
     pub history: Vec<Message>,
@@ -64,6 +71,9 @@ pub struct ReActAgent {
     pub user_name: String,
     pub persona: String,
     pub thinking_mode: String,
+    pub context_window_limit: u64,
+    pub last_usage: TokenUsage,
+    pub total_usage: TokenUsage,
 }
 
 impl Default for ReActAgent {
@@ -99,6 +109,9 @@ impl ReActAgent {
             user_name: "Prof. Cecep".into(),
             persona: "You are CACode, an elite sovereign Rust development assistant. The user is Prof. Cecep (Cecep Saeful Azhar Hidayat, ST). Always greet and address him respectfully as 'Prof. Cecep' (e.g. 'Hi Prof. Cecep', 'Siap, Prof. Cecep.'). Be direct, concise, and technically precise.".into(),
             thinking_mode: "Fast".into(),
+            context_window_limit: 200_000,
+            last_usage: TokenUsage::default(),
+            total_usage: TokenUsage::default(),
         }
     }
 
@@ -145,12 +158,172 @@ impl ReActAgent {
         }
     }
 
-    pub async fn call_llm(&self, user_input: &str) -> Result<String> {
+    pub fn record_usage_to_sqlite(model: &str, usage: &TokenUsage) {
+        if usage.total_tokens == 0 {
+            return;
+        }
+        if let Some(home) = dirs::home_dir() {
+            let db_path = home.join(".cacode").join("usage.db");
+            if let Some(parent) = db_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000;");
+                let _ = conn.execute(
+                    "CREATE TABLE IF NOT EXISTS token_usage (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        prompt_tokens INTEGER NOT NULL,
+                        completion_tokens INTEGER NOT NULL,
+                        total_tokens INTEGER NOT NULL,
+                        est_cost REAL NOT NULL
+                    )",
+                    [],
+                );
+                let est_cost = (usage.prompt_tokens as f64 * 2.50 + usage.completion_tokens as f64 * 10.0) / 1_000_000.0;
+                let ts = chrono::Utc::now().to_rfc3339();
+                let _ = conn.execute(
+                    "INSERT INTO token_usage (timestamp, model, prompt_tokens, completion_tokens, total_tokens, est_cost) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![ts, model, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, est_cost],
+                );
+            }
+        }
+    }
+
+    pub fn extract_response_content(text: &str) -> Result<(String, TokenUsage)> {
+        let trimmed = text.trim();
+        let mut usage = TokenUsage::default();
+
+        // 1. Try parsing standard JSON
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(err) = parsed.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                return Err(anyhow!("API error: {}", err));
+            }
+            if let Some(u) = parsed.get("usage") {
+                let p = u.get("prompt_tokens").or_else(|| u.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                let c = u.get("completion_tokens").or_else(|| u.get("output_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                let t = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(p + c);
+                usage.prompt_tokens = p;
+                usage.completion_tokens = c;
+                usage.total_tokens = t;
+            }
+            if let Some(content) = parsed.get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                if usage.total_tokens == 0 {
+                    usage.completion_tokens = (content.len() / 4).max(1) as i64;
+                    usage.prompt_tokens = 50;
+                    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                }
+                return Ok((content.to_string(), usage));
+            }
+        }
+
+        // 2. Fallback: Parse Server-Sent Events (SSE chunks starting with "data:")
+        if trimmed.starts_with("data:") || trimmed.contains("\ndata:") {
+            let mut accumulated = String::new();
+            for line in trimmed.lines() {
+                let line = line.trim();
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim();
+                    if data == "[DONE]" || data.is_empty() {
+                        continue;
+                    }
+                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(err) = chunk.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                            return Err(anyhow!("Stream error: {}", err));
+                        }
+                        if let Some(u) = chunk.get("usage") {
+                            let p = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let c = u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let t = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(p + c);
+                            if t > 0 {
+                                usage.prompt_tokens = p;
+                                usage.completion_tokens = c;
+                                usage.total_tokens = t;
+                            }
+                        }
+                        if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+                            if let Some(first) = choices.first() {
+                                if let Some(content) = first.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+                                    accumulated.push_str(content);
+                                } else if let Some(content) = first.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                                    accumulated.push_str(content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !accumulated.is_empty() {
+                if usage.total_tokens == 0 {
+                    usage.completion_tokens = (accumulated.len() / 4).max(1) as i64;
+                    usage.prompt_tokens = 50;
+                    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                }
+                return Ok((accumulated, usage));
+            }
+        }
+
+        Err(anyhow!(
+            "Invalid response from model: {}",
+            text.chars().take(200).collect::<String>()
+        ))
+    }
+
+    pub async fn compress_history(&mut self) -> Result<String> {
+        if self.history.len() <= 2 {
+            return Ok("Context memory is already compact (less than 3 messages).".into());
+        }
+        let total_chars_before: usize = self.history.iter().map(|m| m.content.len()).sum();
+        let old_count = self.history.len();
+
+        let mut transcript = String::new();
+        for m in &self.history {
+            transcript.push_str(&format!("[{}]: {}\n", m.role, m.content));
+        }
+
+        let prompt = format!(
+            "Summarize this conversation context into a dense, high-signal technical briefing. \
+            Extract all essential requirements, decisions, active file paths, and current progress. \
+            Begin with '[COMPACTED CONTEXT SUMMARY]'.\n\n{}",
+            transcript
+        );
+
+        let summary = self.call_llm(&prompt).await?;
+        let last_user = self.history.iter().rev().find(|m| m.role == "user").cloned();
+
+        self.history.clear();
+        self.history.push(Message {
+            role: "assistant".into(),
+            content: summary,
+        });
+        if let Some(u) = last_user {
+            self.history.push(u);
+        }
+
+        let total_chars_after: usize = self.history.iter().map(|m| m.content.len()).sum();
+        let pct = (total_chars_before.saturating_sub(total_chars_after) * 100)
+            .checked_div(total_chars_before)
+            .unwrap_or(0);
+
+        Ok(format!(
+            "Compressed {} messages into compact summary (~{}% character reduction). Context window optimized.",
+            old_count, pct
+        ))
+    }
+
+    pub async fn call_llm(&mut self, user_input: &str) -> Result<String> {
         let mut msgs = vec![self.system_prompt()];
         msgs.extend(self.history.clone());
         msgs.push(Message { role: "user".into(), content: user_input.into() });
 
-        match &self.provider {
+        let (content, usage) = match &self.provider {
             Provider::OpenAI { model } => {
                 let api_key = env::var("OPENAI_API_KEY")?;
                 let base_url = env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
@@ -181,7 +354,7 @@ impl ReActAgent {
                         text.chars().take(500).collect::<String>()
                     ));
                 }
-                Self::extract_response_content(&text)
+                Self::extract_response_content(&text)?
             }
             Provider::Anthropic { model } => {
                 let api_key = env::var("ANTHROPIC_API_KEY")?;
@@ -207,7 +380,12 @@ impl ReActAgent {
                     .json::<AnthropicResponse>()
                     .await?;
                 let txt = resp.content.into_iter().filter_map(|c| c.text).collect::<Vec<_>>().join("\n");
-                Ok(txt)
+                let usage = TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: (txt.len() / 4).max(1) as i64,
+                    total_tokens: 100 + (txt.len() / 4).max(1) as i64,
+                };
+                (txt, usage)
             }
             Provider::Ollama { model } => {
                 let base_url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
@@ -223,7 +401,13 @@ impl ReActAgent {
                     .await?
                     .json::<OllamaResponse>()
                     .await?;
-                Ok(resp.message.content)
+                let txt = resp.message.content;
+                let usage = TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: (txt.len() / 4).max(1) as i64,
+                    total_tokens: 100 + (txt.len() / 4).max(1) as i64,
+                };
+                (txt, usage)
             }
             Provider::Router9 { model } => {
                 let base_url = env::var("ROUTER9_URL").unwrap_or_else(|_| "http://localhost:20128".into());
@@ -255,64 +439,23 @@ impl ReActAgent {
                         text.chars().take(500).collect::<String>()
                     ));
                 }
-                Self::extract_response_content(&text)
+                Self::extract_response_content(&text)?
             }
-        }
-    }
+        };
 
-    pub fn extract_response_content(text: &str) -> Result<String> {
-        let trimmed = text.trim();
-        // 1. Try parsing standard JSON
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(err) = parsed.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                return Err(anyhow!("API error: {}", err));
-            }
-            if let Some(content) = parsed.get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|a| a.first())
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                return Ok(content.to_string());
-            }
-        }
+        // Record metrics
+        self.last_usage = usage.clone();
+        self.total_usage.prompt_tokens += usage.prompt_tokens;
+        self.total_usage.completion_tokens += usage.completion_tokens;
+        self.total_usage.total_tokens += usage.total_tokens;
 
-        // 2. Fallback: Parse Server-Sent Events (SSE chunks starting with "data:")
-        if trimmed.starts_with("data:") || trimmed.contains("\ndata:") {
-            let mut accumulated = String::new();
-            for line in trimmed.lines() {
-                let line = line.trim();
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data == "[DONE]" || data.is_empty() {
-                        continue;
-                    }
-                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(err) = chunk.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                            return Err(anyhow!("Stream error: {}", err));
-                        }
-                        if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
-                            if let Some(first) = choices.first() {
-                                if let Some(content) = first.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
-                                    accumulated.push_str(content);
-                                } else if let Some(content) = first.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                                    accumulated.push_str(content);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !accumulated.is_empty() {
-                return Ok(accumulated);
-            }
-        }
+        let model_name = match &self.provider {
+            Provider::OpenAI { model } | Provider::Anthropic { model }
+            | Provider::Ollama { model } | Provider::Router9 { model } => model.clone(),
+        };
+        Self::record_usage_to_sqlite(&model_name, &usage);
 
-        Err(anyhow!(
-            "Invalid response from model: {}",
-            text.chars().take(200).collect::<String>()
-        ))
+        Ok(content)
     }
 
     pub fn parse_tool_calls(&self, content: &str) -> Vec<ToolCall> {

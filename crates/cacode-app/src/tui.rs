@@ -59,8 +59,19 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mode", "Select thinking level: Fast, Analytical, Deep"),
     ("/settings", "Open BYOK settings & provider configuration"),
     ("/monitor", "View real-time token telemetry & proxy log"),
-    ("/report", "View token usage summary & cost estimate"),
+    ("/report", "View token usage summary, heatmap & model analytics"),
     ("/skills", "Manage custom skills & reusable prompts"),
+    ("/dev", "⚡ Feature development & implementation protocol"),
+    ("/prd", "📋 Product Requirements Document drafting workflow"),
+    ("/audit", "🛡️ Security & architecture whitebox audit"),
+    ("/refact", "🧹 Code refactoring, simplification & cleanup"),
+    ("/update", "📦 Dependency bump, migration & semantic version update"),
+    ("/fix", "🐞 Systematic 4-phase bugfix protocol"),
+    ("/bughunt", "🎯 Deep bug hunt (boundary fuzzing, concurrency & panics)"),
+    ("/test", "🧪 TDD test authoring (unit & integration tests)"),
+    ("/qa", "✅ Quality Assurance dual-check sign-off"),
+    ("/compress", "🗜️ Compress conversation history (token optimization)"),
+    ("/context", "📊 Show active context window tokens & usage limit"),
     ("/status", "Show active provider, model, tokens & system stats"),
     ("/sessions", "List all active chat sessions"),
     ("/rename", "Rename current chat session (/rename <name>)"),
@@ -78,6 +89,17 @@ const THINKING_MODES: &[(&str, &str)] = &[
     ("Fast", "⚡ Standard direct execution — lowest latency"),
     ("Analytical", "🔍 Multi-step analytical reasoning & verification"),
     ("Deep", "🧠 Deep cognitive reasoning & edge-case proofs"),
+];
+
+const THINKING_FRAMES: &[(&str, &str)] = &[
+    ("⠋", "( •‿• ) [CA] reasoning..."),
+    ("⠙", "( ⚆_⚆ ) [CA] inspecting..."),
+    ("⠹", "( ◉_◉ ) [CA] analyzing..."),
+    ("⠸", "( ◕‿◕ ) [CA] synthesizing..."),
+    ("⠼", "( ˘ᴗ˘ ) [CA] optimizing..."),
+    ("⠴", "( ◉‿◉ ) [CA] formulating..."),
+    ("⠦", "( •‿• ) [CA] verifying..."),
+    ("⠧", "( ⚆_⚆ ) [CA] concluding..."),
 ];
 
 struct BorderlessLayout {
@@ -175,6 +197,14 @@ struct ReportRow {
     est_cost: f64,
 }
 
+struct DailyTrafficRow {
+    day: String,
+    calls: i64,
+    tokens: i64,
+    cost: f64,
+    bar: String,
+}
+
 #[derive(Clone)]
 struct SkillItem {
     name: String,
@@ -201,10 +231,12 @@ struct App {
     should_quit: bool,
     usage_rows: Vec<UsageRow>,
     report_rows: Vec<ReportRow>,
+    daily_rows: Vec<DailyTrafficRow>,
     skills: Vec<SkillItem>,
     skill_selected: usize,
     monitor_scroll: u16,
     report_scroll: u16,
+    spinner_frame: usize,
     // Autocomplete state
     autocomplete_idx: usize,
     // Modal picker state
@@ -228,10 +260,12 @@ impl App {
             should_quit: false,
             usage_rows: Vec::new(),
             report_rows: Vec::new(),
+            daily_rows: Vec::new(),
             skills: Vec::new(),
             skill_selected: 0,
             monitor_scroll: 0,
             report_scroll: 0,
+            spinner_frame: 0,
             autocomplete_idx: 0,
             modal_picker: ModalPicker::Off,
             modal_idx: 0,
@@ -693,6 +727,35 @@ impl App {
         }) {
             self.report_rows = rows;
         }
+
+        // Daily Heatmap & Traffic Analysis (last 14 days)
+        if let Ok(rows) = conn.prepare(
+            "SELECT substr(timestamp, 1, 10) as day, COUNT(*) as calls, SUM(total_tokens) as tokens, SUM(est_cost) as cost FROM token_usage GROUP BY day ORDER BY day DESC LIMIT 14"
+        ).and_then(|mut stmt| {
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()
+        }) {
+            let max_tokens = rows.iter().map(|(_, _, tok, _)| *tok).max().unwrap_or(1).max(1);
+            self.daily_rows = rows.into_iter().map(|(day, calls, tokens, cost)| {
+                let ratio = (tokens as f64 / max_tokens as f64).min(1.0);
+                let bar_len = (ratio * 16.0).round() as usize;
+                let bar = format!("{} {:>3}%", "█".repeat(bar_len.max(1)), ((tokens * 100) / max_tokens));
+                DailyTrafficRow {
+                    day,
+                    calls,
+                    tokens,
+                    cost,
+                    bar,
+                }
+            }).collect();
+        }
     }
 }
 
@@ -722,6 +785,9 @@ async fn event_loop(
     loop {
         terminal.draw(|f| ui(f, app))?;
         if app.should_quit { return Ok(()); }
+        if app.is_thinking {
+            app.spinner_frame += 1;
+        }
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if handle_global_key(app, key) {
@@ -1057,6 +1123,114 @@ async fn handle_chat_key(
                         app.session_mut().show_welcome = true;
                         app.status_msg = "Cleared".into();
                         return Ok(());
+                    }
+                    "/compress" => {
+                        app.is_thinking = true;
+                        app.status_msg = "Compressing conversation history...".into();
+                        terminal.draw(|f| ui(f, app))?;
+                        let res = app.session_mut().agent.compress_history().await;
+                        app.is_thinking = false;
+                        match res {
+                            Ok(msg) => {
+                                app.session_mut().messages.push(ChatMessage { role: "system".into(), content: msg });
+                                app.status_msg = "Context compressed ✓".into();
+                            }
+                            Err(e) => {
+                                app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Compression failed: {}", e) });
+                                app.status_msg = "Compression failed".into();
+                            }
+                        }
+                        return Ok(());
+                    }
+                    "/context" => {
+                        let last_u = &app.session().agent.last_usage;
+                        let tot_u = &app.session().agent.total_usage;
+                        let limit = app.session().agent.context_window_limit;
+                        let pct = if limit > 0 { (tot_u.total_tokens as f64 / limit as f64) * 100.0 } else { 0.0 };
+                        let info = format!(
+                            "Context Telemetry:\n  Active Model: {}\n  Last Prompt Tokens: {}\n  Last Completion Tokens: {}\n  Total Tokens Used: {}\n  Context Window Budget: {} tokens (~{:.1}% used)",
+                            app.model_name(), last_u.prompt_tokens, last_u.completion_tokens, tot_u.total_tokens, limit, pct
+                        );
+                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: info });
+                        return Ok(());
+                    }
+                    "/dev" | "/prd" | "/audit" | "/refact" | "/update" | "/fix" | "/bughunt" | "/test" | "/qa" => {
+                        let skill_name = cmd.trim_start_matches('/');
+                        let skill_file = format!("{}.md", skill_name);
+                        let dir = App::skills_dir();
+                        let mut skill_body = String::new();
+                        if let Some(d) = dir {
+                            if let Ok(content) = fs::read_to_string(d.join(skill_file)) {
+                                if let Some(stripped) = content.strip_prefix("---") {
+                                    if let Some(end_idx) = stripped.find("---") {
+                                        skill_body = stripped[end_idx + 3..].trim().to_string();
+                                    }
+                                }
+                            }
+                        }
+                        if skill_body.is_empty() {
+                            skill_body = format!("Workflow: {}", skill_name);
+                        }
+                        if arg.is_empty() {
+                            // Load skill prompt into user input for editing
+                            app.session_mut().input = format!("{} ", skill_body);
+                            let len = app.session().input.len();
+                            app.session_mut().cursor_pos = len;
+                            app.status_msg = format!("Loaded skill template /{} into input", skill_name);
+                            return Ok(());
+                        } else {
+                            // Prepend skill instructions to the prompt
+                            let full_prompt = format!("[Skill Directive: {}]\n\n{}\n\nTask:\n{}", skill_name.to_uppercase(), skill_body, arg);
+                            app.session_mut().messages.push(ChatMessage { role: "user".into(), content: full_prompt.clone() });
+                            app.session_mut().scroll_offset = 0;
+                            app.is_thinking = true;
+                            app.status_msg = format!("Executing /{}...", skill_name);
+                            terminal.draw(|f| ui(f, app))?;
+
+                            app.session_mut().agent.add_user(&full_prompt);
+                            let mut current_prompt = full_prompt;
+
+                            for _ in 0..5 {
+                                let resp = app.session_mut().agent.call_llm(&current_prompt).await;
+                                match resp {
+                                    Ok(resp) => {
+                                        let tools = app.session().agent.parse_tool_calls(&resp);
+                                        app.session_mut().agent.add_assistant(&resp);
+
+                                        if tools.is_empty() {
+                                            app.session_mut().messages.push(ChatMessage { role: "assistant".into(), content: resp });
+                                            break;
+                                        }
+
+                                        app.session_mut().messages.push(ChatMessage { role: "assistant".into(), content: resp });
+                                        let mut results = Vec::new();
+                                        for call in &tools {
+                                            let hdr = format!("[tool:{}]", call.tool);
+                                            match app.session().agent.exec_tool(call) {
+                                                Ok(res) => {
+                                                    let short = if res.len() > 500 { format!("{}…", &res[..500]) } else { res.clone() };
+                                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("{} {}", hdr, short) });
+                                                    results.push(format!("Tool '{}' output:\n{}", call.tool, res));
+                                                }
+                                                Err(e) => {
+                                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("{} error: {}", hdr, e) });
+                                                    results.push(format!("Tool '{}' error: {}", call.tool, e));
+                                                }
+                                            }
+                                        }
+                                        current_prompt = format!("Observation/Tool Results:\n{}", results.join("\n\n"));
+                                        terminal.draw(|f| ui(f, app))?;
+                                    }
+                                    Err(e) => {
+                                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Error: {}", e) });
+                                        break;
+                                    }
+                                }
+                            }
+                            app.is_thinking = false;
+                            app.status_msg.clear();
+                            return Ok(());
+                        }
                     }
                     "/exit" => { app.should_quit = true; return Ok(()); }
                     "/rename" => {
@@ -1747,13 +1921,6 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let table_area = Rect {
-        x: area.x,
-        y: area.y + 2,
-        width: area.width,
-        height: area.height.saturating_sub(2),
-    };
-
     let header = Row::new(vec!["Model", "Calls", "Prompt", "Completion", "Total", "Cost ($)"])
         .style(Style::default().fg(BRAND).add_modifier(Modifier::BOLD));
 
@@ -1797,12 +1964,80 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(12),
     ];
 
+    let table_h = 2u16 + all_rows.len() as u16 + 1;
     let table = Table::new(all_rows, widths)
         .header(header)
         .column_spacing(1)
         .style(Style::default().bg(BG_BLACK));
 
-    f.render_widget(table, table_area);
+    let table_rect = Rect {
+        x: area.x,
+        y: area.y + 2,
+        width: area.width,
+        height: table_h.min(area.height.saturating_sub(2)),
+    };
+    f.render_widget(table, table_rect);
+
+    // Daily Heatmap (Traffic & Activity)
+    if !app.daily_rows.is_empty() {
+        let heat_title_y = table_rect.y + table_rect.height + 1;
+        if heat_title_y + 3 < area.y + area.height {
+            let heat_header = Line::from(vec![
+                Span::styled(" 📈 ", Style::default().fg(BRAND)),
+                Span::styled("Daily Traffic Heatmap & Top Model Analytics (last 14 days)", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
+            ]);
+            f.render_widget(Paragraph::new(heat_header).style(Style::default().bg(BG_BLACK)), Rect {
+                x: area.x,
+                y: heat_title_y,
+                width: area.width,
+                height: 1,
+            });
+
+            let top_model_name = app.report_rows.first().map(|r| r.model.as_str()).unwrap_or("-");
+            let top_model_share = if !app.report_rows.is_empty() {
+                let total_tok: i64 = app.report_rows.iter().map(|r| r.total_tokens).sum();
+                if total_tok > 0 {
+                    (app.report_rows[0].total_tokens as f64 / total_tok as f64) * 100.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let top_msg = format!(
+                "Most Used Model: {} ({:.1}% of total tokens)  │  Total Sessions/Days Logged: {}",
+                top_model_name, top_model_share, app.daily_rows.len()
+            );
+            f.render_widget(Paragraph::new(Span::styled(top_msg, Style::default().fg(Color::Yellow))).style(Style::default().bg(BG_BLACK)), Rect {
+                x: area.x,
+                y: heat_title_y + 1,
+                width: area.width,
+                height: 1,
+            });
+
+            for (i, row) in app.daily_rows.iter().enumerate() {
+                let bar_y = heat_title_y + 2 + i as u16;
+                if bar_y >= area.y + area.height {
+                    break;
+                }
+                let bar_line = Line::from(vec![
+                    Span::styled(format!("{:<10}", row.day), Style::default().fg(GRAY)),
+                    Span::styled(format!("{:>5}", row.calls), Style::default().fg(DIM)),
+                    Span::styled(" calls  │  ", Style::default().fg(DIM)),
+                    Span::styled(format!("{:>10}", row.tokens), Style::default().fg(Color::White)),
+                    Span::styled(" tokens │  ", Style::default().fg(DIM)),
+                    Span::styled(format!("${:.4}  ", row.cost), Style::default().fg(Color::Green)),
+                    Span::styled(row.bar.as_str(), Style::default().fg(BRAND)),
+                ]);
+                f.render_widget(Paragraph::new(bar_line).style(Style::default().bg(BG_BLACK)), Rect {
+                    x: area.x,
+                    y: bar_y,
+                    width: area.width,
+                    height: 1,
+                });
+            }
+        }
+    }
 }
 
 fn draw_skills_content(f: &mut Frame, app: &App, area: Rect) {
@@ -1956,9 +2191,12 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 
     let session = app.session();
     if app.is_thinking {
+        let (frame, emot) = THINKING_FRAMES[app.spinner_frame % THINKING_FRAMES.len()];
         let line = Line::from(vec![
             Span::styled("> ", Style::default().fg(BRAND)),
-            Span::styled("thinking…", Style::default().fg(DIM).add_modifier(Modifier::ITALIC)),
+            Span::styled(format!("{} ", frame), Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
+            Span::styled(emot, Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
+            Span::styled("  …", Style::default().fg(DIM)),
         ]);
         f.render_widget(Paragraph::new(line).style(Style::default().bg(BG_BLACK)), area);
     } else {
@@ -1997,8 +2235,28 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     if app.active_page == 0 {
-        let tok = app.session().total_tokens;
-        spans.push(Span::styled(format!("tokens: {} ", tok), Style::default().fg(DIM)));
+        let tot = &app.session().agent.total_usage;
+        let limit = app.session().agent.context_window_limit;
+        let current_ctx = tot.total_tokens;
+        let pct = if limit > 0 {
+            (current_ctx as f64 / limit as f64) * 100.0
+        } else {
+            0.0
+        };
+        let ctx_style = if pct > 80.0 {
+            Style::default().fg(Color::Red)
+        } else if pct > 50.0 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(DIM)
+        };
+
+        spans.push(Span::styled(format!("ctx: {}k/{}k ({:.1}%) ", current_ctx / 1000, limit / 1000, pct), ctx_style));
+        spans.push(Span::styled("│ ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            format!("🔗 {} calls  ", tot.total_tokens / 256),
+            Style::default().fg(DIM),
+        ));
         spans.push(Span::styled("│ ", Style::default().fg(DIM)));
         if app.sessions.len() > 1 {
             spans.push(Span::styled(
