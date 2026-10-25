@@ -17,6 +17,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::env;
 
 use cacode_core::commands::chat::{Provider, ReActAgent};
 use crate::config::CaCodeConfig;
@@ -488,6 +489,137 @@ impl App {
         }
     }
 
+    fn router9_endpoint() -> String {
+        let base_url = env::var("ROUTER9_URL").unwrap_or_else(|_| "http://localhost:20128".into());
+        let base = base_url.trim_end_matches('/');
+        if base.ends_with("/v1") || base.ends_with("/api") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}/v1/chat/completions", base)
+        }
+    }
+
+    fn openai_endpoint() -> String {
+        let base_url = env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
+        let base = base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}/v1/chat/completions", base)
+        }
+    }
+
+    async fn test_connection(&mut self) {
+        let model = self.model_name();
+        let provider = self.provider_name();
+
+        let result: Result<(), String> = match self.provider_name() {
+            "9Router" => {
+                let endpoint = Self::router9_endpoint();
+                let api_key = env::var("ROUTER9_API_KEY").unwrap_or_else(|_| "dummy".into());
+                let body = serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1
+                });
+                match reqwest::Client::new().post(&endpoint)
+                    .bearer_auth(api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            let text = resp.text().await.unwrap_or_default();
+                            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                            if let Some(err) = parsed.get("error") {
+                                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                                Err(format!("9router error: {}", msg))
+                            } else {
+                                Ok(())
+                            }
+                        } else {
+                            let text = resp.text().await.unwrap_or_default();
+                            Err(format!("9router HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
+                        }
+                    }
+                    Err(e) => Err(format!("Cannot reach {} : {}", endpoint, e)),
+                }
+            }
+            "OpenAI" => {
+                let endpoint = Self::openai_endpoint();
+                let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+                let body = serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1
+                });
+                match reqwest::Client::new().post(&endpoint)
+                    .bearer_auth(&api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() { Ok(()) }
+                        else {
+                            let text = resp.text().await.unwrap_or_default();
+                            Err(format!("OpenAI HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
+                        }
+                    }
+                    Err(e) => Err(format!("Cannot reach OpenAI: {} (API key set: {})", e, if api_key.is_empty() { "NO" } else { "yes" })),
+                }
+            }
+            "Anthropic" => {
+                let api_key = env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+                if api_key.is_empty() {
+                    Err("ANTHROPIC_API_KEY not set".into())
+                } else {
+                    let body = serde_json::json!({
+                    "model": model,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}]
+                });
+                match reqwest::Client::new()
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() { Ok(()) }
+                        else {
+                            let text = resp.text().await.unwrap_or_default();
+                            Err(format!("Anthropic HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
+                        }
+                    }
+                    Err(e) => Err(format!("Cannot reach Anthropic: {}", e)),
+                }
+                }
+            }
+            "Ollama" => {
+                let base_url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+                let endpoint = format!("{}/api/tags", base_url.trim_end_matches('/'));
+                match reqwest::Client::new().get(&endpoint).send().await {
+                    Ok(resp) if resp.status().is_success() => Ok(()),
+                    Ok(resp) => Err(format!("Ollama HTTP {}", resp.status())),
+                    Err(e) => Err(format!("Cannot reach Ollama at {}: {} (is Ollama running?)", base_url, e)),
+                }
+            }
+            _ => Ok(()),
+        };
+
+        match result {
+            Ok(()) => self.status_msg = format!("✓ {} ({}): connection OK", provider, model),
+            Err(e) => self.status_msg = format!("✗ {} error: {}", provider, e),
+        }
+    }
+
     fn refresh_models_cache(&mut self) {
         // Preset high-value models available across 9router and providers
         self.models_cache = vec![
@@ -593,7 +725,7 @@ async fn event_loop(
                     1 => handle_monitor_key(app, key),
                     2 => handle_report_key(app, key),
                     3 => handle_skills_key(app, key),
-                    4 => handle_settings_key(app, key),
+                    4 => handle_settings_key(app, key).await,
                     _ => {}
                 }
             }
@@ -1144,7 +1276,7 @@ fn handle_skills_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_settings_key(app: &mut App, key: KeyEvent) {
+async fn handle_settings_key(app: &mut App, key: KeyEvent) {
     if app.settings.editing {
         match key.code {
             KeyCode::Enter => {
@@ -1170,7 +1302,11 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
         (_, KeyCode::Char('s')) => { app.save_settings(); app.active_page = 0; }
         (_, KeyCode::Char('b')) => { app.backup_config(); }
         (_, KeyCode::Char('r')) => { app.restore_config(); }
-        (_, KeyCode::Char('t')) => { app.status_msg = format!("Connection test: Provider {} is ready ✓", app.provider_name()); }
+        (_, KeyCode::Char('t')) => {
+            app.status_msg = "Testing connection...".into();
+            app.save_settings();
+            app.test_connection().await;
+        }
         (KeyModifiers::CONTROL, KeyCode::Char('d')) => { app.should_quit = true; }
         _ => {}
     }

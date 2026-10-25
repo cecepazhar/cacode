@@ -18,6 +18,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 cacode-core = { path = "../cacode-core" }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
 reedline = "0.51"
 ratatui = "0.29"
 crossterm = "0.28"

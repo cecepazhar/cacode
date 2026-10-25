@@ -94,7 +94,7 @@ impl CaCodeConfig {
         ];
         for (var, val) in mappings {
             if let Some(v) = val {
-                if !v.is_empty() && env::var(var).is_err() {
+                if !v.is_empty() {
                     env::set_var(var, v);
                 }
             }
@@ -102,7 +102,7 @@ impl CaCodeConfig {
     }
 
     pub fn effective(&self, env_name: &str, config_val: &Option<String>) -> String {
-        env::var(env_name).unwrap_or_else(|_| config_val.clone().unwrap_or_default())
+        config_val.clone().unwrap_or_else(|| env::var(env_name).unwrap_or_default())
     }
 
     pub fn display_fields(&self) -> Vec<(&'static str, &'static str, &'static str, String)> {

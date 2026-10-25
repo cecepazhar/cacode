@@ -131,8 +131,15 @@ If no tool action is needed, reply normally with natural language.".into(),
         match &self.provider {
             Provider::OpenAI { model } => {
                 let api_key = env::var("OPENAI_API_KEY")?;
+                let base_url = env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
+                let base = base_url.trim_end_matches('/');
+                let endpoint = if base.ends_with("/v1") {
+                    format!("{}/chat/completions", base)
+                } else {
+                    format!("{}/v1/chat/completions", base)
+                };
                 let resp = self.client
-                    .post("https://api.openai.com/v1/chat/completions")
+                    .post(&endpoint)
                     .bearer_auth(api_key)
                     .json(&serde_json::json!({
                         "model": model,
@@ -188,8 +195,13 @@ If no tool action is needed, reply normally with natural language.".into(),
             }
             Provider::Router9 { model } => {
                 let base_url = env::var("ROUTER9_URL").unwrap_or_else(|_| "http://localhost:20128".into());
-                let endpoint = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
                 let api_key = env::var("ROUTER9_API_KEY").unwrap_or_else(|_| "dummy".into());
+                let base = base_url.trim_end_matches('/');
+                let endpoint = if base.ends_with("/v1") || base.ends_with("/api") {
+                    format!("{}/chat/completions", base)
+                } else {
+                    format!("{}/v1/chat/completions", base)
+                };
                 let resp = self.client
                     .post(&endpoint)
                     .bearer_auth(api_key)
@@ -204,8 +216,9 @@ If no tool action is needed, reply normally with natural language.".into(),
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 if !status.is_success() {
                     return Err(anyhow!(
-                        "9router HTTP {} — {}",
+                        "9router HTTP {} (endpoint: {}) — {}",
                         status,
+                        endpoint,
                         text.chars().take(500).collect::<String>()
                     ));
                 }
