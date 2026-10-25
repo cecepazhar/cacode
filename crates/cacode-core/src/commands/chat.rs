@@ -79,7 +79,9 @@ impl ReActAgent {
             let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".into());
             Provider::Ollama { model }
         } else {
-            let model = env::var("ROUTER9_MODEL").unwrap_or_else(|_| "default".into());
+            let model = env::var("ROUTER9_MODEL")
+                .map(|m| if m == "default" || m.is_empty() { "ZA126_PRO".to_string() } else { m })
+                .unwrap_or_else(|_| "ZA126_PRO".into());
             Provider::Router9 { model }
         }
     }
@@ -196,10 +198,25 @@ If no tool action is needed, reply normally with natural language.".into(),
                         "messages": msgs,
                     }))
                     .send()
-                    .await?
-                    .json::<OpenAIResponse>()
                     .await?;
-                Ok(resp.choices.into_iter().next().ok_or_else(|| anyhow!("No choices returned from 9router"))?.message.content)
+                let status = resp.status();
+                let bytes = resp.bytes().await?;
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if !status.is_success() {
+                    return Err(anyhow!(
+                        "9router HTTP {} — {}",
+                        status,
+                        text.chars().take(500).collect::<String>()
+                    ));
+                }
+                let parsed: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|_| anyhow!("Invalid JSON from 9router ({}): {}", text.chars().take(200).collect::<String>(), status))?;
+                let err_msg = parsed.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str());
+                if let Some(msg) = err_msg {
+                    return Err(anyhow!("9router error: {}", msg));
+                }
+                let v: OpenAIResponse = serde_json::from_value(parsed)?;
+                Ok(v.choices.into_iter().next().ok_or_else(|| anyhow!("No choices returned from 9router"))?.message.content)
             }
         }
     }

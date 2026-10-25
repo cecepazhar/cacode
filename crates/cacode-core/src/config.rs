@@ -22,6 +22,8 @@ pub struct CaCodeConfig {
     pub router9_api_key: Option<String>,
     #[serde(default)]
     pub router9_model: Option<String>,
+    #[serde(default)]
+    pub thinking_mode: String,
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default = "default_app_name")]
@@ -43,7 +45,8 @@ impl Default for CaCodeConfig {
             ollama_model: None,
             router9_url: None,
             router9_api_key: None,
-            router9_model: None,
+            router9_model: Some("ZA126_PRO".into()),
+            thinking_mode: "Fast".into(),
             theme: default_theme(),
             app_name: default_app_name(),
             pro_license_key: None,
@@ -106,6 +109,7 @@ impl CaCodeConfig {
         vec![
             ("App Name", "CACODE_APP_NAME", "app_name", self.app_name.clone()),
             ("Theme Style", "CACODE_THEME", "theme", self.theme.clone()),
+            ("Thinking Mode", "CACODE_THINKING_MODE", "thinking_mode", self.thinking_mode.clone()),
             ("Pro License Key", "CACODE_PRO_LICENSE", "pro_license_key", Self::mask(&self.pro_license_key.clone().unwrap_or_default())),
             ("OpenAI API Key", "OPENAI_API_KEY", "openai_api_key", Self::mask(&self.effective("OPENAI_API_KEY", &self.openai_api_key))),
             ("OpenAI Base URL", "OPENAI_BASE_URL", "openai_base_url", self.effective("OPENAI_BASE_URL", &self.openai_base_url)),
@@ -133,6 +137,7 @@ impl CaCodeConfig {
         match key {
             "app_name" => { if let Some(v) = val { self.app_name = v; } }
             "theme" => { if let Some(v) = val { self.theme = v; } }
+            "thinking_mode" => { if let Some(v) = val { self.thinking_mode = v; } }
             "pro_license_key" => self.pro_license_key = val,
             "openai_api_key" => self.openai_api_key = val,
             "openai_base_url" => self.openai_base_url = val,

@@ -25,6 +25,7 @@ const BRAND: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const TEXT: Color = Color::White;
 const GRAY: Color = Color::Rgb(180, 180, 190);
+const BG_BLACK: Color = Color::Rgb(0, 0, 0);
 
 const LOGO: &[&str] = &[
     r"  ██████╗ █████╗  ██████╗ ██████╗ ██████╗ ███████╗",
@@ -37,69 +38,71 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v0.3.0",
+    "  Sovereign Rust Development Agent  v1.0.1",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK: OpenAI, Anthropic, Ollama, 9Router",
     "  • Local token usage monitor & cost estimator, Skill System",
     "  • Zero telemetry — your keys, your machine, your data",
     "",
-    "  Type a message below to start chatting.",
-    "  Ctrl+1-5 switch pages.  Ctrl+T new session.  Esc quit.",
+    "  Type a message to chat, or '/' for command autocomplete",
+    "    /models   /mode   /settings   /monitor   /report   /skills",
     "",
 ];
 
 const PAGE_NAMES: &[&str] = &["Chat", "Monitor", "Report", "Skills", "Settings"];
 const MAX_SESSIONS: usize = 9;
 
-struct DoubleBox {
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/models", "Interactive AI model picker"),
+    ("/mode", "Select thinking level: Fast, Analytical, Deep"),
+    ("/settings", "Open BYOK settings & provider configuration"),
+    ("/monitor", "View real-time token telemetry & proxy log"),
+    ("/report", "View token usage summary & cost estimate"),
+    ("/skills", "Manage custom skills & reusable prompts"),
+    ("/status", "Show active provider, model, tokens & system stats"),
+    ("/sessions", "List all active chat sessions"),
+    ("/rename", "Rename current chat session (/rename <name>)"),
+    ("/clear", "Clear current conversation memory"),
+    ("/export", "Export conversation transcript to Markdown file"),
+    ("/version", "Show CACode version (v1.0.1)"),
+    ("/reset", "Soft reset agent context window"),
+    ("/cd", "Change working directory (/cd <path>)"),
+    ("/pwd", "Print current working directory"),
+    ("/help", "Show all available slash commands"),
+    ("/exit", "Exit CACode"),
+];
+
+const THINKING_MODES: &[(&str, &str)] = &[
+    ("Fast", "⚡ Standard direct execution — lowest latency"),
+    ("Analytical", "🔍 Multi-step analytical reasoning & verification"),
+    ("Deep", "🧠 Deep cognitive reasoning & edge-case proofs"),
+];
+
+struct BorderlessLayout {
     divider_y: Option<u16>,
 }
 
-impl DoubleBox {
+impl BorderlessLayout {
     fn new() -> Self { Self { divider_y: None } }
     fn with_divider(mut self, y: u16) -> Self { self.divider_y = Some(y); self }
-
-    fn inner(&self, area: Rect) -> Rect {
-        Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        }
-    }
+    fn inner(&self, area: Rect) -> Rect { area }
 }
 
-impl Widget for DoubleBox {
+impl Widget for BorderlessLayout {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 2 || area.height < 2 { return; }
         let x1 = area.x;
-        let x2 = area.x + area.width - 1;
+        let x2 = area.x + area.width.saturating_sub(1);
         let y1 = area.y;
-        let y2 = area.y + area.height - 1;
-        let style = Style::default().fg(BRAND);
+        let style = Style::default().fg(DIM);
 
-        buf.set_string(x1, y1, "╔", style);
-        buf.set_string(x2, y1, "╗", style);
-        buf.set_string(x1, y2, "╚", style);
-        buf.set_string(x2, y2, "╝", style);
-
-        for x in (x1 + 1)..x2 {
-            buf.set_string(x, y1, "═", style);
-            buf.set_string(x, y2, "═", style);
-        }
-        for y in (y1 + 1)..y2 {
-            buf.set_string(x1, y, "║", style);
-            buf.set_string(x2, y, "║", style);
-        }
-
+        // Render subtle horizontal divider above input prompt
         if let Some(dy) = self.divider_y {
             let div_y = y1 + dy;
-            if div_y > y1 && div_y < y2 {
-                buf.set_string(x1, div_y, "╠", style);
-                buf.set_string(x2, div_y, "╣", style);
-                for x in (x1 + 1)..x2 {
-                    buf.set_string(x, div_y, "═", style);
+            if div_y > y1 && div_y < y1 + area.height {
+                for x in x1..=x2 {
+                    buf.set_string(x, div_y, "─", style);
                 }
             }
         }
@@ -175,6 +178,13 @@ struct SkillItem {
     content: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ModalPicker {
+    Off,
+    Models,
+    Thinking,
+}
+
 struct App {
     active_page: usize, // 0=Chat, 1=Monitor, 2=Report, 3=Skills, 4=Settings
     sessions: Vec<ChatSession>,
@@ -190,6 +200,12 @@ struct App {
     skill_selected: usize,
     monitor_scroll: u16,
     report_scroll: u16,
+    // Autocomplete state
+    autocomplete_idx: usize,
+    // Modal picker state
+    modal_picker: ModalPicker,
+    modal_idx: usize,
+    models_cache: Vec<String>,
 }
 
 impl App {
@@ -211,8 +227,13 @@ impl App {
             skill_selected: 0,
             monitor_scroll: 0,
             report_scroll: 0,
+            autocomplete_idx: 0,
+            modal_picker: ModalPicker::Off,
+            modal_idx: 0,
+            models_cache: Vec::new(),
         };
         app.refresh_skills();
+        app.refresh_models_cache();
         app
     }
 
@@ -232,6 +253,7 @@ impl App {
                 let raw = match key {
                     "app_name" => Some(config.app_name.clone()),
                     "theme" => Some(config.theme.clone()),
+                    "thinking_mode" => Some(config.thinking_mode.clone()),
                     "pro_license_key" => config.pro_license_key.clone(),
                     "openai_api_key" => config.openai_api_key.clone(),
                     "openai_base_url" => config.openai_base_url.clone(),
@@ -267,6 +289,14 @@ impl App {
         match &self.session().agent.provider {
             Provider::OpenAI { model } | Provider::Anthropic { model }
             | Provider::Ollama { model } | Provider::Router9 { model } => model.clone(),
+        }
+    }
+
+    fn thinking_mode(&self) -> &str {
+        if self.config.thinking_mode.is_empty() {
+            "Fast"
+        } else {
+            &self.config.thinking_mode
         }
     }
 
@@ -397,10 +427,10 @@ impl App {
                         let mut description = "".to_string();
                         let mut body = content.clone();
 
-                        if content.starts_with("---") {
-                            if let Some(end_idx) = content[3..].find("---") {
-                                let fm = &content[3..3 + end_idx];
-                                body = content[3 + end_idx + 3..].trim().to_string();
+                        if let Some(stripped) = content.strip_prefix("---") {
+                            if let Some(end_idx) = stripped.find("---") {
+                                let fm = &stripped[..end_idx];
+                                body = stripped[end_idx + 3..].trim().to_string();
                                 for line in fm.lines() {
                                     let parts: Vec<&str> = line.splitn(2, ':').collect();
                                     if parts.len() == 2 {
@@ -456,6 +486,25 @@ impl App {
         } else {
             Ok(false)
         }
+    }
+
+    fn refresh_models_cache(&mut self) {
+        // Preset high-value models available across 9router and providers
+        self.models_cache = vec![
+            "ZA126_PRO".into(),
+            "ZA126_OPUS".into(),
+            "ZA126".into(),
+            "ag/claude-sonnet-5-5-high".into(),
+            "ag/claude-opus-5-5-high".into(),
+            "ag/gemini-3.1-pro-high".into(),
+            "ag/gemini-4-argon-high".into(),
+            "oc/deepseek-v4-flash-free".into(),
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+            "gpt-4o".into(),
+            "gpt-4o-mini".into(),
+            "claude-3-5-sonnet-20240620".into(),
+            "llama3".into(),
+        ];
     }
 
     fn refresh_usage_data(&mut self) {
@@ -553,6 +602,12 @@ async fn event_loop(
 }
 
 fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
+    // Esc in any secondary page returns straight to Chat
+    if app.active_page != 0 && key.code == KeyCode::Esc && !app.settings.editing {
+        app.active_page = 0;
+        return true;
+    }
+
     if app.active_page == 4 && app.settings.editing {
         return false;
     }
@@ -569,7 +624,7 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
             if app.active_page == 3 { app.refresh_skills(); }
             true
         }
-        (_, KeyCode::Tab) | (_, KeyCode::F(7)) => {
+        (KeyModifiers::CONTROL, KeyCode::Tab) | (_, KeyCode::F(7)) => {
             app.active_page = (app.active_page + 1) % 5;
             if app.active_page == 1 || app.active_page == 2 { app.refresh_usage_data(); }
             if app.active_page == 3 { app.refresh_skills(); }
@@ -584,6 +639,98 @@ async fn handle_chat_key(
     key: KeyEvent,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
+    // 1. If Modal Picker is active (Models or Thinking)
+    if app.modal_picker != ModalPicker::Off {
+        match key.code {
+            KeyCode::Esc => {
+                app.modal_picker = ModalPicker::Off;
+                return Ok(());
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if app.modal_idx > 0 { app.modal_idx -= 1; }
+                return Ok(());
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max_len = match app.modal_picker {
+                    ModalPicker::Models => app.models_cache.len(),
+                    ModalPicker::Thinking => THINKING_MODES.len(),
+                    ModalPicker::Off => 0,
+                };
+                if app.modal_idx + 1 < max_len { app.modal_idx += 1; }
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                match app.modal_picker {
+                    ModalPicker::Models => {
+                        if let Some(m) = app.models_cache.get(app.modal_idx).cloned() {
+                            match &mut app.session_mut().agent.provider {
+                                Provider::OpenAI { model } => *model = m.clone(),
+                                Provider::Anthropic { model } => *model = m.clone(),
+                                Provider::Ollama { model } => *model = m.clone(),
+                                Provider::Router9 { model } => *model = m.clone(),
+                            }
+                            app.config.router9_model = Some(m.clone());
+                            let _ = app.config.save();
+                            app.status_msg = format!("Model switched to {} ✓", m);
+                        }
+                    }
+                    ModalPicker::Thinking => {
+                        if let Some((mode_name, _)) = THINKING_MODES.get(app.modal_idx) {
+                            app.config.thinking_mode = mode_name.to_string();
+                            let _ = app.config.save();
+                            app.status_msg = format!("Thinking mode set to {} ✓", mode_name);
+                        }
+                    }
+                    ModalPicker::Off => {}
+                }
+                app.modal_picker = ModalPicker::Off;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+
+    // 2. Autocomplete navigation when input starts with '/'
+    let input_str = app.session().input.clone();
+    let is_slash = input_str.starts_with('/');
+    let filtered_cmds: Vec<(&str, &str)> = if is_slash {
+        let needle = input_str.trim();
+        SLASH_COMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.starts_with(needle) || needle == "/" || cmd.contains(needle.trim_start_matches('/')))
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if is_slash && !filtered_cmds.is_empty() {
+        match key.code {
+            KeyCode::Tab => {
+                let choice = filtered_cmds[app.autocomplete_idx % filtered_cmds.len()].0;
+                app.session_mut().input = format!("{} ", choice);
+                let len = app.session().input.len();
+                app.session_mut().cursor_pos = len;
+                app.autocomplete_idx = 0;
+                return Ok(());
+            }
+            KeyCode::Up => {
+                if app.autocomplete_idx > 0 {
+                    app.autocomplete_idx -= 1;
+                } else {
+                    app.autocomplete_idx = filtered_cmds.len() - 1;
+                }
+                return Ok(());
+            }
+            KeyCode::Down => {
+                app.autocomplete_idx = (app.autocomplete_idx + 1) % filtered_cmds.len();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // 3. Regular chat inputs & shortcuts
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
             if app.is_thinking {
@@ -609,15 +756,13 @@ async fn handle_chat_key(
         (KeyModifiers::CONTROL, KeyCode::Left) | (_, KeyCode::F(8)) => {
             app.prev_session();
         }
-        (KeyModifiers::CONTROL, KeyCode::Tab) => {
-            app.next_session();
-        }
         (_, KeyCode::Enter) => {
             let input = app.session().input.trim().to_string();
             if input.is_empty() { return Ok(()); }
             app.session_mut().input.clear();
             app.session_mut().cursor_pos = 0;
             app.session_mut().show_welcome = false;
+            app.autocomplete_idx = 0;
 
             if input.starts_with('/') {
                 let parts: Vec<&str> = input.splitn(2, ' ').collect();
@@ -625,11 +770,144 @@ async fn handle_chat_key(
                 let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
                 match cmd {
-                    "/settings" => { app.active_page = 4; return Ok(()); }
+                    "/settings" | "/setting" | "/set" | "/config" | "/cfg" => {
+                        app.active_page = 4;
+                        return Ok(());
+                    }
+                    "/monitor" | "/mon" | "/usage" => {
+                        app.active_page = 1;
+                        app.refresh_usage_data();
+                        return Ok(());
+                    }
+                    "/report" | "/reports" | "/stat" | "/stats" => {
+                        app.active_page = 2;
+                        app.refresh_usage_data();
+                        return Ok(());
+                    }
+                    "/skills" | "/snip" => {
+                        app.active_page = 3;
+                        app.refresh_skills();
+                        return Ok(());
+                    }
+                    "/skill" => {
+                        let skill_parts: Vec<&str> = arg.splitn(2, ' ').collect();
+                        let sub = skill_parts.first().copied().unwrap_or("").trim();
+                        let sub_arg = skill_parts.get(1).copied().unwrap_or("").trim();
+
+                        match sub {
+                            "add" => {
+                                let add_parts: Vec<&str> = sub_arg.splitn(2, ' ').collect();
+                                let skill_name = add_parts.first().copied().unwrap_or("").trim();
+                                let inline_content = add_parts.get(1).copied().unwrap_or("").trim();
+
+                                if skill_name.is_empty() {
+                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "Usage: /skill add <name> [content]".into() });
+                                } else {
+                                    let content_to_save = if !inline_content.is_empty() {
+                                        inline_content.to_string()
+                                    } else {
+                                        app.session().messages.iter().rev().find(|m| m.role == "assistant").map(|m| m.content.clone()).unwrap_or_else(|| "No content".into())
+                                    };
+                                    match app.save_skill(skill_name, "Custom skill snippet", &content_to_save) {
+                                        Ok(_) => app.status_msg = format!("Saved skill '{}' ✓", skill_name),
+                                        Err(e) => app.status_msg = format!("Failed to save: {}", e),
+                                    }
+                                }
+                            }
+                            "del" | "delete" | "remove" => {
+                                match app.delete_skill(sub_arg) {
+                                    Ok(true) => app.status_msg = format!("Deleted skill '{}' ✓", sub_arg),
+                                    Ok(false) => app.status_msg = format!("Skill '{}' not found", sub_arg),
+                                    Err(e) => app.status_msg = format!("Delete error: {}", e),
+                                }
+                            }
+                            _ => {
+                                app.active_page = 3;
+                                app.refresh_skills();
+                            }
+                        }
+                        return Ok(());
+                    }
+                    "/models" => {
+                        app.refresh_models_cache();
+                        app.modal_picker = ModalPicker::Models;
+                        app.modal_idx = 0;
+                        return Ok(());
+                    }
+                    "/mode" => {
+                        if arg.is_empty() {
+                            app.modal_picker = ModalPicker::Thinking;
+                            app.modal_idx = match app.config.thinking_mode.as_str() {
+                                "Analytical" => 1,
+                                "Deep" => 2,
+                                _ => 0,
+                            };
+                            return Ok(());
+                        } else {
+                            let m = match arg.to_lowercase().as_str() {
+                                "fast" | "1" => "Fast",
+                                "analytical" | "2" => "Analytical",
+                                "deep" | "ultra" | "3" => "Deep",
+                                other => {
+                                    app.session_mut().messages.push(ChatMessage {
+                                        role: "system".into(),
+                                        content: format!("Unknown mode '{}'. Choose: fast, analytical, deep", other),
+                                    });
+                                    return Ok(());
+                                }
+                            };
+                            app.config.thinking_mode = m.to_string();
+                            let _ = app.config.save();
+                            app.status_msg = format!("Thinking mode set to {} ✓", m);
+                            return Ok(());
+                        }
+                    }
+                    "/model" => {
+                        if arg.is_empty() {
+                            app.refresh_models_cache();
+                            app.modal_picker = ModalPicker::Models;
+                            app.modal_idx = 0;
+                            return Ok(());
+                        } else {
+                            match &mut app.session_mut().agent.provider {
+                                Provider::OpenAI { model } => *model = arg.to_string(),
+                                Provider::Anthropic { model } => *model = arg.to_string(),
+                                Provider::Ollama { model } => *model = arg.to_string(),
+                                Provider::Router9 { model } => *model = arg.to_string(),
+                            }
+                            app.config.router9_model = Some(arg.to_string());
+                            let _ = app.config.save();
+                            app.status_msg = format!("Model changed to {}", arg);
+                        }
+                        return Ok(());
+                    }
+                    "/provider" => {
+                        let current_provider = app.provider_name().to_string();
+                        if arg.is_empty() {
+                            app.session_mut().messages.push(ChatMessage {
+                                role: "system".into(),
+                                content: format!("Current provider: {}. Usage: /provider openai|anthropic|ollama|9router", current_provider),
+                            });
+                        } else {
+                            let new_p = match arg.to_lowercase().as_str() {
+                                "openai" => Provider::OpenAI { model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()) },
+                                "anthropic" => Provider::Anthropic { model: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-20240620".into()) },
+                                "ollama" => Provider::Ollama { model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".into()) },
+                                "9router" | "router9" => Provider::Router9 { model: std::env::var("ROUTER9_MODEL").unwrap_or_else(|_| "ZA126_PRO".into()) },
+                                other => {
+                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Unknown provider: {}", other) });
+                                    return Ok(());
+                                }
+                            };
+                            app.session_mut().agent.provider = new_p;
+                            app.status_msg = format!("Provider switched to {}", arg);
+                        }
+                        return Ok(());
+                    }
                     "/help" => {
                         app.session_mut().messages.push(ChatMessage {
                             role: "system".into(),
-                            content: "Commands: /settings  /clear  /help  /exit  /rename <name>  /status  /sessions  /model <name>  /provider <name>  /export  /tokens  /reset  /cd <path>  /pwd  /version  /skill list|add|use|delete\nKeys: Ctrl+1-5 pages  Ctrl+T new session  Ctrl+W close  Ctrl+←→ switch  Esc quit".into(),
+                            content: "Available Commands:\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.1)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)".into(),
                         });
                         return Ok(());
                     }
@@ -655,8 +933,8 @@ async fn handle_chat_key(
                         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "unknown".into());
                         let cfg_path = CaCodeConfig::config_path().map(|p| p.display().to_string()).unwrap_or_else(|_| "unknown".into());
                         let info = format!(
-                            "Status:\n  Provider: {}\n  Model: {}\n  Session Tokens: {}\n  Active Sessions: {}\n  CWD: {}\n  Config: {}",
-                            app.provider_name(), app.model_name(), app.session().total_tokens, app.sessions.len(), cwd, cfg_path
+                            "Status:\n  Provider: {}\n  Model: {}\n  Thinking Mode: {}\n  Session Tokens: {}\n  Active Sessions: {}\n  CWD: {}\n  Config: {}",
+                            app.provider_name(), app.model_name(), app.thinking_mode(), app.session().total_tokens, app.sessions.len(), cwd, cfg_path
                         );
                         app.session_mut().messages.push(ChatMessage { role: "system".into(), content: info });
                         return Ok(());
@@ -668,41 +946,6 @@ async fn handle_chat_key(
                             list.push_str(&format!("  {}. {}{} [{} messages]\n", i + 1, s.name, active, s.messages.len()));
                         }
                         app.session_mut().messages.push(ChatMessage { role: "system".into(), content: list.trim().to_string() });
-                        return Ok(());
-                    }
-                    "/model" => {
-                        let current_model = app.model_name().to_string();
-                        if arg.is_empty() {
-                            app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Current model: {}. Usage: /model <name>", current_model) });
-                        } else {
-                            match &mut app.session_mut().agent.provider {
-                                Provider::OpenAI { model } => *model = arg.to_string(),
-                                Provider::Anthropic { model } => *model = arg.to_string(),
-                                Provider::Ollama { model } => *model = arg.to_string(),
-                                Provider::Router9 { model } => *model = arg.to_string(),
-                            }
-                            app.status_msg = format!("Model changed to {}", arg);
-                        }
-                        return Ok(());
-                    }
-                    "/provider" => {
-                        let current_provider = app.provider_name().to_string();
-                        if arg.is_empty() {
-                            app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Current provider: {}. Usage: /provider openai|anthropic|ollama|9router", current_provider) });
-                        } else {
-                            let new_p = match arg.to_lowercase().as_str() {
-                                "openai" => Provider::OpenAI { model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()) },
-                                "anthropic" => Provider::Anthropic { model: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-20240620".into()) },
-                                "ollama" => Provider::Ollama { model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".into()) },
-                                "9router" | "router9" => Provider::Router9 { model: std::env::var("ROUTER9_MODEL").unwrap_or_else(|_| "default".into()) },
-                                other => {
-                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Unknown provider: {}", other) });
-                                    return Ok(());
-                                }
-                            };
-                            app.session_mut().agent.provider = new_p;
-                            app.status_msg = format!("Provider switched to {}", arg);
-                        }
                         return Ok(());
                     }
                     "/export" => {
@@ -755,87 +998,38 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "CACode v0.3.0 (Sovereign Rust Agent)".into() });
-                        return Ok(());
-                    }
-                    "/skill" => {
-                        let skill_parts: Vec<&str> = arg.splitn(2, ' ').collect();
-                        let sub = skill_parts.first().copied().unwrap_or("list");
-                        let sub_arg = skill_parts.get(1).copied().unwrap_or("");
-
-                        match sub {
-                            "list" => {
-                                app.refresh_skills();
-                                let mut text = format!("Saved Skills ({}):\n", app.skills.len());
-                                for s in &app.skills {
-                                    text.push_str(&format!("  - {} ({}): {}\n", s.name, s.created, s.description));
-                                }
-                                app.session_mut().messages.push(ChatMessage { role: "system".into(), content: text.trim().to_string() });
-                            }
-                            "use" => {
-                                app.refresh_skills();
-                                let sk_opt = app.skills.iter().find(|s| s.name.eq_ignore_ascii_case(sub_arg) || s.name.to_lowercase().replace(' ', "-") == sub_arg.to_lowercase()).cloned();
-                                if let Some(sk) = sk_opt {
-                                    app.session_mut().input = sk.content.clone();
-                                    app.session_mut().cursor_pos = sk.content.len();
-                                    app.status_msg = format!("Loaded skill: {}", sk.name);
-                                } else {
-                                    app.status_msg = format!("Skill not found: {}", sub_arg);
-                                }
-                            }
-                            "delete" => {
-                                match app.delete_skill(sub_arg) {
-                                    Ok(true) => app.status_msg = format!("Deleted skill: {}", sub_arg),
-                                    Ok(false) => app.status_msg = format!("Skill not found: {}", sub_arg),
-                                    Err(e) => app.status_msg = format!("Error deleting skill: {}", e),
-                                }
-                            }
-                            "add" => {
-                                let add_parts: Vec<&str> = sub_arg.splitn(2, ' ').collect();
-                                let skill_name = add_parts.first().copied().unwrap_or("").trim();
-                                let inline_content = add_parts.get(1).copied().unwrap_or("").trim();
-
-                                if skill_name.is_empty() {
-                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "Usage: /skill add <name> [content]".into() });
-                                } else {
-                                    let content_to_save = if !inline_content.is_empty() {
-                                        inline_content.to_string()
-                                    } else {
-                                        app.session().messages.iter().rev().find(|m| m.role == "assistant").map(|m| m.content.clone()).unwrap_or_else(|| "No content specified".into())
-                                    };
-                                    match app.save_skill(skill_name, "Saved via chat command", &content_to_save) {
-                                        Ok(_) => app.status_msg = format!("Saved skill '{}' ✓", skill_name),
-                                        Err(e) => app.status_msg = format!("Failed to save skill: {}", e),
-                                    }
-                                }
-                            }
-                            _ => {
-                                app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "Usage: /skill list | /skill use <name> | /skill add <name> [content] | /skill delete <name>".into() });
-                            }
-                        }
+                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "CACode v1.0.1 (Sovereign Rust Agent)".into() });
                         return Ok(());
                     }
                     s => {
                         app.session_mut().messages.push(ChatMessage {
                             role: "system".into(),
-                            content: format!("Unknown command: {}", s),
+                            content: format!("Unknown command: {}. Type /help or / for suggestions.", s),
                         });
                         return Ok(());
                     }
                 }
             }
 
+            // Chat dispatch
             app.session_mut().messages.push(ChatMessage { role: "user".into(), content: input.clone() });
             app.session_mut().scroll_offset = 0;
             app.is_thinking = true;
             app.status_msg = "Thinking…".into();
             terminal.draw(|f| ui(f, app))?;
 
-            app.session_mut().agent.add_user(&input);
-            let mut prompt = input;
+            // Append thinking mode hint if active
+            let prompt_to_send = match app.config.thinking_mode.as_str() {
+                "Analytical" => format!("[Mode: Analytical — break down problem step-by-step before answering]\n\n{}", input),
+                "Deep" => format!("[Mode: Deep Reasoning — explore edge-cases, formal proof, and comprehensive verification]\n\n{}", input),
+                _ => input.clone(),
+            };
+
+            app.session_mut().agent.add_user(&prompt_to_send);
+            let mut current_prompt = prompt_to_send;
 
             for _ in 0..5 {
-                let resp = app.session_mut().agent.call_llm(&prompt).await;
+                let resp = app.session_mut().agent.call_llm(&current_prompt).await;
                 match resp {
                     Ok(resp) => {
                         let tools = app.session().agent.parse_tool_calls(&resp);
@@ -862,7 +1056,7 @@ async fn handle_chat_key(
                                 }
                             }
                         }
-                        prompt = format!("Observation/Tool Results:\n{}", results.join("\n\n"));
+                        current_prompt = format!("Observation/Tool Results:\n{}", results.join("\n\n"));
                         terminal.draw(|f| ui(f, app))?;
                     }
                     Err(e) => {
@@ -906,7 +1100,7 @@ async fn handle_chat_key(
 
 fn handle_monitor_key(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => { app.should_quit = true; }
+        (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => { app.active_page = 0; }
         (_, KeyCode::Char('r')) => { app.refresh_usage_data(); app.status_msg = "Refreshed".into(); }
         (_, KeyCode::Up)   => { app.monitor_scroll = app.monitor_scroll.saturating_add(1); }
         (_, KeyCode::Down) => { app.monitor_scroll = app.monitor_scroll.saturating_sub(1); }
@@ -916,7 +1110,7 @@ fn handle_monitor_key(app: &mut App, key: KeyEvent) {
 
 fn handle_report_key(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => { app.should_quit = true; }
+        (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => { app.active_page = 0; }
         (_, KeyCode::Char('r')) => { app.refresh_usage_data(); app.status_msg = "Refreshed".into(); }
         (_, KeyCode::Up)   => { app.report_scroll = app.report_scroll.saturating_add(1); }
         (_, KeyCode::Down) => { app.report_scroll = app.report_scroll.saturating_sub(1); }
@@ -926,7 +1120,7 @@ fn handle_report_key(app: &mut App, key: KeyEvent) {
 
 fn handle_skills_key(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => { app.should_quit = true; }
+        (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => { app.active_page = 0; }
         (_, KeyCode::Char('r')) => { app.refresh_skills(); app.status_msg = "Skills refreshed".into(); }
         (_, KeyCode::Up) | (_, KeyCode::Char('k')) => {
             if app.skill_selected > 0 { app.skill_selected -= 1; }
@@ -984,8 +1178,9 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
 
 fn ui(f: &mut Frame, app: &App) {
     let size = f.area();
+    // 100% full black background
     f.render_widget(Clear, size);
-    let bg = Paragraph::new("").style(Style::default().bg(Color::Black));
+    let bg = Paragraph::new("").style(Style::default().bg(BG_BLACK));
     f.render_widget(bg, size);
 
     let outer = Layout::default()
@@ -999,34 +1194,35 @@ fn ui(f: &mut Frame, app: &App) {
     let input_height: u16 = 1;
     let divider_y = box_area.height.saturating_sub(2 + input_height);
 
-    let dbox = DoubleBox::new().with_divider(divider_y);
-    let inner = dbox.inner(box_area);
-    f.render_widget(dbox, box_area);
+    let blayout = BorderlessLayout::new().with_divider(divider_y);
+    let inner = blayout.inner(box_area);
+    f.render_widget(blayout, box_area);
 
-    let page_tab_area = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: 1,
-    };
-    draw_page_tabs(f, app, page_tab_area);
+    let mut content_y = inner.y;
 
-    let sep_area = Rect {
-        x: inner.x,
-        y: inner.y + 1,
-        width: inner.width,
-        height: 1,
-    };
-    let sep_str: String = "─".repeat(inner.width as usize);
-    f.render_widget(
-        Paragraph::new(Span::styled(sep_str, Style::default().fg(DIM))),
-        sep_area,
-    );
-
-    let mut content_y = inner.y + 2;
-    let divider_abs_y = box_area.y + divider_y;
-
-    if app.active_page == 0 {
+    // Only show page tabs if NOT on chat page (chat page is 100% clean borderless)
+    if app.active_page != 0 {
+        let page_tab_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        draw_page_tabs(f, app, page_tab_area);
+        content_y = inner.y + 2;
+        let sep_area = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        };
+        let sep_str: String = "─".repeat(inner.width as usize);
+        f.render_widget(
+            Paragraph::new(Span::styled(sep_str, Style::default().fg(DIM))),
+            sep_area,
+        );
+    } else if app.sessions.len() > 1 {
+        // In chat, only show session tabs if there are 2 or more sessions
         let session_tab_area = Rect {
             x: inner.x,
             y: content_y,
@@ -1037,6 +1233,7 @@ fn ui(f: &mut Frame, app: &App) {
         content_y += 1;
     }
 
+    let divider_abs_y = box_area.y + divider_y;
     let content_area = Rect {
         x: inner.x,
         y: content_y,
@@ -1062,11 +1259,21 @@ fn ui(f: &mut Frame, app: &App) {
 
     draw_input(f, app, input_area);
     draw_status(f, app, status_area);
+
+    // Draw autocomplete popup if user is typing a slash command
+    if app.active_page == 0 && app.modal_picker == ModalPicker::Off {
+        draw_autocomplete_popup(f, app, input_area);
+    }
+
+    // Draw modal picker if active (Models or Thinking Mode)
+    if app.modal_picker != ModalPicker::Off {
+        draw_modal_picker(f, app, size);
+    }
 }
 
 fn draw_page_tabs(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
-    spans.push(Span::styled(" ", Style::default()));
+    spans.push(Span::styled(" [Esc] Back to Chat  │  ", Style::default().fg(BRAND)));
     for (i, name) in PAGE_NAMES.iter().enumerate() {
         let style = if i == app.active_page {
             Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
@@ -1078,7 +1285,7 @@ fn draw_page_tabs(f: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled("┃", Style::default().fg(DIM)));
         }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
 }
 
 fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -1094,9 +1301,9 @@ fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled("┃", Style::default().fg(DIM)));
     }
     if app.sessions.len() < MAX_SESSIONS {
-        spans.push(Span::styled(" + ", Style::default().fg(DIM)));
+        spans.push(Span::styled(" + (Ctrl+T) ", Style::default().fg(DIM)));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
 }
 
 fn draw_chat_content(f: &mut Frame, app: &App, area: Rect) {
@@ -1128,13 +1335,15 @@ fn draw_welcome(f: &mut Frame, area: Rect) {
             Style::default().fg(GRAY)
         } else if row.contains("Sovereign") {
             Style::default().fg(BRAND)
+        } else if row.contains('/') {
+            Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(DIM)
         };
         lines.push(Line::from(Span::styled(*row, style)));
     }
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).style(Style::default().bg(BG_BLACK));
     f.render_widget(p, area);
 }
 
@@ -1178,8 +1387,147 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
 
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((scroll, 0))
+        .style(Style::default().bg(BG_BLACK));
     f.render_widget(p, area);
+}
+
+fn draw_autocomplete_popup(f: &mut Frame, app: &App, input_area: Rect) {
+    let input_str = app.session().input.trim();
+    if !input_str.starts_with('/') { return; }
+
+    let needle = input_str;
+    let matches: Vec<(&str, &str)> = SLASH_COMMANDS
+        .iter()
+        .filter(|(cmd, _)| cmd.starts_with(needle) || needle == "/" || cmd.contains(needle.trim_start_matches('/')))
+        .copied()
+        .collect();
+
+    if matches.is_empty() { return; }
+
+    let count = matches.len().min(8);
+    let width = 56u16;
+    let height = count as u16;
+    let x = input_area.x.saturating_add(2);
+    let y = input_area.y.saturating_sub(height);
+
+    let popup_rect = Rect { x, y, width, height };
+    f.render_widget(Clear, popup_rect);
+
+    let items: Vec<ListItem> = matches
+        .iter()
+        .take(count)
+        .enumerate()
+        .map(|(i, (cmd, desc))| {
+            let sel = i == (app.autocomplete_idx % matches.len());
+            let (pfx, style) = if sel {
+                ("▸ ", Style::default().fg(Color::Black).bg(BRAND).add_modifier(Modifier::BOLD))
+            } else {
+                ("  ", Style::default().fg(GRAY).bg(Color::Rgb(15, 15, 20)))
+            };
+            let line = Line::from(vec![
+                Span::styled(pfx, style),
+                Span::styled(format!("{:<12}", cmd), style),
+                Span::styled(format!(" {}", desc), if sel { style } else { Style::default().fg(DIM).bg(Color::Rgb(15, 15, 20)) }),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items).style(Style::default().bg(Color::Rgb(15, 15, 20)));
+    f.render_widget(list, popup_rect);
+}
+
+fn draw_modal_picker(f: &mut Frame, app: &App, screen: Rect) {
+    let (title, count, items) = match app.modal_picker {
+        ModalPicker::Models => {
+            let items: Vec<Line> = app.models_cache.iter().enumerate().map(|(i, m)| {
+                let sel = i == app.modal_idx;
+                let is_current = m == &app.model_name();
+                let pfx = if sel { "▸ " } else { "  " };
+                let tag = if is_current { " [active]" } else { "" };
+                let style = if sel {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else if is_current {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(GRAY)
+                };
+                Line::from(vec![
+                    Span::styled(pfx, style),
+                    Span::styled(m.as_str(), style),
+                    Span::styled(tag, Style::default().fg(Color::Green)),
+                ])
+            }).collect();
+            (" Select AI Model (/models) ", app.models_cache.len(), items)
+        }
+        ModalPicker::Thinking => {
+            let items: Vec<Line> = THINKING_MODES.iter().enumerate().map(|(i, (mode, desc))| {
+                let sel = i == app.modal_idx;
+                let is_current = *mode == app.thinking_mode();
+                let pfx = if sel { "▸ " } else { "  " };
+                let tag = if is_current { " [active]" } else { "" };
+                let style = if sel {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else if is_current {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(GRAY)
+                };
+                Line::from(vec![
+                    Span::styled(pfx, style),
+                    Span::styled(format!("{:<14}", mode), style),
+                    Span::styled(format!(" — {}", desc), if sel { style } else { Style::default().fg(DIM) }),
+                    Span::styled(tag, Style::default().fg(Color::Green)),
+                ])
+            }).collect();
+            (" Select Thinking / Reasoning Mode (/mode) ", THINKING_MODES.len(), items)
+        }
+        ModalPicker::Off => return,
+    };
+
+    let width = 64u16.min(screen.width.saturating_sub(4));
+    let height = (count as u16 + 5).min(screen.height.saturating_sub(4));
+    let x = (screen.width.saturating_sub(width)) / 2;
+    let y = (screen.height.saturating_sub(height)) / 2;
+    let area = Rect { x, y, width, height };
+
+    f.render_widget(Clear, area);
+    let bg_rect = Paragraph::new("").style(Style::default().bg(Color::Rgb(15, 15, 20)));
+    f.render_widget(bg_rect, area);
+
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+
+    let header = Paragraph::new(Line::from(Span::styled(
+        title,
+        Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(header, Rect { height: 1, ..inner });
+
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(3),
+    };
+
+    let list_items: Vec<ListItem> = items.into_iter().map(ListItem::new).collect();
+    f.render_widget(List::new(list_items), list_area);
+
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled("↑↓", Style::default().fg(BRAND)),
+        Span::styled(" navigate  ", Style::default().fg(DIM)),
+        Span::styled("Enter", Style::default().fg(BRAND)),
+        Span::styled(" select  ", Style::default().fg(DIM)),
+        Span::styled("Esc", Style::default().fg(BRAND)),
+        Span::styled(" cancel", Style::default().fg(DIM)),
+    ]));
+    f.render_widget(help, Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner });
 }
 
 fn draw_monitor_content(f: &mut Frame, app: &App, area: Rect) {
@@ -1190,13 +1538,13 @@ fn draw_monitor_content(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("Token Usage Monitor", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
         Span::styled("   (press ", Style::default().fg(DIM)),
         Span::styled("r", Style::default().fg(BRAND)),
-        Span::styled(" to refresh)", Style::default().fg(DIM)),
+        Span::styled(" to refresh, Esc to back)", Style::default().fg(DIM)),
     ]);
-    f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
 
     if app.usage_rows.is_empty() {
         let msg = "No usage data recorded yet. Start monitor proxy via `cacode monitor --endpoint <url>`";
-        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM)));
+        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM))).style(Style::default().bg(BG_BLACK));
         f.render_widget(p, Rect { y: area.y + 2, height: 1, ..area });
         return;
     }
@@ -1231,7 +1579,8 @@ fn draw_monitor_content(f: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .column_spacing(1);
+        .column_spacing(1)
+        .style(Style::default().bg(BG_BLACK));
 
     f.render_widget(table, table_area);
 }
@@ -1244,13 +1593,13 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("Usage Report (per-model aggregation)", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
         Span::styled("   (press ", Style::default().fg(DIM)),
         Span::styled("r", Style::default().fg(BRAND)),
-        Span::styled(" to refresh)", Style::default().fg(DIM)),
+        Span::styled(" to refresh, Esc to back)", Style::default().fg(DIM)),
     ]);
-    f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
 
     if app.report_rows.is_empty() {
         let msg = "No usage data to aggregate.";
-        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM)));
+        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM))).style(Style::default().bg(BG_BLACK));
         f.render_widget(p, Rect { y: area.y + 2, height: 1, ..area });
         return;
     }
@@ -1307,7 +1656,8 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(all_rows, widths)
         .header(header)
-        .column_spacing(1);
+        .column_spacing(1)
+        .style(Style::default().bg(BG_BLACK));
 
     f.render_widget(table, table_area);
 }
@@ -1318,13 +1668,13 @@ fn draw_skills_content(f: &mut Frame, app: &App, area: Rect) {
     let title = Line::from(vec![
         Span::styled(" ⚡ ", Style::default().fg(BRAND)),
         Span::styled("Skills Library (~/.cacode/skills/)", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-        Span::styled("   (Enter to load into chat, r refresh)", Style::default().fg(DIM)),
+        Span::styled("   (Enter load into chat, Esc back)", Style::default().fg(DIM)),
     ]);
-    f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
 
     if app.skills.is_empty() {
         let msg = "No skills saved yet. Use `/skill add <name>` in chat to save prompt templates.";
-        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM)));
+        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM))).style(Style::default().bg(BG_BLACK));
         f.render_widget(p, Rect { y: area.y + 2, height: 1, ..area });
         return;
     }
@@ -1362,7 +1712,8 @@ fn draw_skills_content(f: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .column_spacing(1);
+        .column_spacing(1)
+        .style(Style::default().bg(BG_BLACK));
 
     f.render_widget(table, table_area);
 }
@@ -1370,11 +1721,11 @@ fn draw_skills_content(f: &mut Frame, app: &App, area: Rect) {
 fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 4 { return; }
 
-    let title = Line::from(Span::styled(
-        " ⚙  BYOK Settings ",
-        Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
-    ));
-    f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
+    let title = Line::from(vec![
+        Span::styled(" ⚙  BYOK Settings & Configuration ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
+        Span::styled(" (Esc to back)", Style::default().fg(DIM)),
+    ]);
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
 
     let list_area = Rect {
         x: area.x,
@@ -1413,7 +1764,7 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
         ]))
     }).collect();
 
-    f.render_widget(List::new(items), list_area);
+    f.render_widget(List::new(items).style(Style::default().bg(BG_BLACK)), list_area);
 
     let help_area = Rect {
         x: area.x,
@@ -1436,27 +1787,27 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("t", Style::default().fg(BRAND)),
             Span::styled(" test  ", Style::default().fg(DIM)),
             Span::styled("Esc", Style::default().fg(BRAND)),
-            Span::styled(" back", Style::default().fg(DIM)),
+            Span::styled(" back to chat", Style::default().fg(DIM)),
         ]),
         Line::from(Span::styled(
             if app.status_msg.is_empty() { "" } else { &app.status_msg },
             Style::default().fg(Color::Green),
         )),
-    ]);
+    ]).style(Style::default().bg(BG_BLACK));
     f.render_widget(help, help_area);
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     if app.active_page != 0 {
         let hint = match app.active_page {
-            1 => "↑↓ scroll  r refresh  Ctrl+1 chat",
-            2 => "↑↓ scroll  r refresh  Ctrl+1 chat",
-            3 => "↑↓ select  Enter load skill  r refresh  Ctrl+1 chat",
-            4 => "↑↓ navigate  Enter edit  s save  Esc back",
+            1 => "↑↓ scroll  r refresh  Esc back to chat",
+            2 => "↑↓ scroll  r refresh  Esc back to chat",
+            3 => "↑↓ select  Enter load skill  Esc back to chat",
+            4 => "↑↓ navigate  Enter edit  s save  Esc back to chat",
             _ => "",
         };
         let line = Line::from(Span::styled(hint, Style::default().fg(DIM)));
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(BG_BLACK)), area);
         return;
     }
 
@@ -1466,13 +1817,13 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("> ", Style::default().fg(BRAND)),
             Span::styled("thinking…", Style::default().fg(DIM).add_modifier(Modifier::ITALIC)),
         ]);
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(BG_BLACK)), area);
     } else {
         let line = Line::from(vec![
             Span::styled("> ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
             Span::styled(&*session.input, Style::default().fg(TEXT)),
         ]);
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(BG_BLACK)), area);
 
         let cx = area.x + 2 + session.cursor_pos as u16;
         let cy = area.y;
@@ -1485,37 +1836,42 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let provider = app.provider_name();
     let model = app.model_name();
+    let thinking = app.thinking_mode();
     let extra = if app.status_msg.is_empty() {
         String::new()
     } else {
         format!("  {}", app.status_msg)
     };
 
-    let page_name = PAGE_NAMES.get(app.active_page).unwrap_or(&"?");
-
     let mut spans = vec![
-        Span::styled(format!(" {} ", provider), Style::default().fg(Color::Black).bg(BRAND)),
-        Span::styled(format!(" {} ", model), Style::default().fg(BRAND)),
+        Span::styled(" CACode v1.0.1 ", Style::default().fg(Color::Black).bg(BRAND).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {} ", provider), Style::default().fg(BRAND)),
+        Span::styled("│ ", Style::default().fg(DIM)),
+        Span::styled(format!("{} ", model), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("│ ", Style::default().fg(DIM)),
+        Span::styled(format!("[{}] ", thinking), Style::default().fg(Color::Yellow)),
         Span::styled("│ ", Style::default().fg(DIM)),
     ];
 
     if app.active_page == 0 {
         let tok = app.session().total_tokens;
-        spans.push(Span::styled(format!("tokens: {}", tok), Style::default().fg(DIM)));
-        spans.push(Span::styled(" │ ", Style::default().fg(DIM)));
-        spans.push(Span::styled(
-            format!("{}/{} sessions", app.active_session + 1, app.sessions.len()),
-            Style::default().fg(DIM),
-        ));
-        spans.push(Span::styled(" │ ", Style::default().fg(DIM)));
+        spans.push(Span::styled(format!("tokens: {} ", tok), Style::default().fg(DIM)));
+        spans.push(Span::styled("│ ", Style::default().fg(DIM)));
+        if app.sessions.len() > 1 {
+            spans.push(Span::styled(
+                format!("{}/{} sessions │ ", app.active_session + 1, app.sessions.len()),
+                Style::default().fg(DIM),
+            ));
+        }
+    } else {
+        let page_name = PAGE_NAMES.get(app.active_page).unwrap_or(&"?");
+        spans.push(Span::styled(format!("[{}] │ ", page_name), Style::default().fg(BRAND)));
     }
 
-    spans.push(Span::styled(format!("[{}]", page_name), Style::default().fg(BRAND)));
-    spans.push(Span::styled(" │ ", Style::default().fg(DIM)));
-    spans.push(Span::styled("Ctrl+T new  Ctrl+1-5 pages  Esc quit", Style::default().fg(DIM)));
+    spans.push(Span::styled("Type / for commands  Esc quit", Style::default().fg(DIM)));
     spans.push(Span::styled(extra, Style::default().fg(Color::Green)));
 
     let line = Line::from(spans);
-    let p = Paragraph::new(line).style(Style::default().bg(Color::Rgb(15, 15, 20)));
+    let p = Paragraph::new(line).style(Style::default().bg(BG_BLACK));
     f.render_widget(p, area);
 }
