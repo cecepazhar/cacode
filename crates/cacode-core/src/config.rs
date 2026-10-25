@@ -22,6 +22,10 @@ pub struct CaCodeConfig {
     pub router9_api_key: Option<String>,
     #[serde(default)]
     pub router9_model: Option<String>,
+    #[serde(default = "default_user_name")]
+    pub user_name: String,
+    #[serde(default = "default_persona")]
+    pub system_persona: String,
     #[serde(default)]
     pub thinking_mode: String,
     #[serde(default = "default_theme")]
@@ -34,6 +38,10 @@ pub struct CaCodeConfig {
 
 fn default_theme() -> String { "teal".into() }
 fn default_app_name() -> String { "CACode — Sovereign Dev Agent".into() }
+fn default_user_name() -> String { "Prof. Cecep".into() }
+fn default_persona() -> String {
+    "You are CACode, a sovereign Rust-focused development agent. The user is Prof. Cecep (Cecep Saeful Azhar Hidayat, ST). Always greet and address him respectfully as 'Prof. Cecep' (e.g. 'Hi Prof. Cecep', 'Siap, Prof. Cecep.'). Be direct, technically precise, and concise. Provide working code and verified architecture solutions.".into()
+}
 
 impl Default for CaCodeConfig {
     fn default() -> Self {
@@ -46,6 +54,8 @@ impl Default for CaCodeConfig {
             router9_url: None,
             router9_api_key: None,
             router9_model: Some("ZA126_PRO".into()),
+            user_name: default_user_name(),
+            system_persona: default_persona(),
             thinking_mode: "Fast".into(),
             theme: default_theme(),
             app_name: default_app_name(),
@@ -110,6 +120,7 @@ impl CaCodeConfig {
             ("App Name", "CACODE_APP_NAME", "app_name", self.app_name.clone()),
             ("Theme Style", "CACODE_THEME", "theme", self.theme.clone()),
             ("Thinking Mode", "CACODE_THINKING_MODE", "thinking_mode", self.thinking_mode.clone()),
+            ("User Name (Greeting)", "CACODE_USER_NAME", "user_name", self.user_name.clone()),
             ("Pro License Key", "CACODE_PRO_LICENSE", "pro_license_key", Self::mask(&self.pro_license_key.clone().unwrap_or_default())),
             ("OpenAI API Key", "OPENAI_API_KEY", "openai_api_key", Self::mask(&self.effective("OPENAI_API_KEY", &self.openai_api_key))),
             ("OpenAI Base URL", "OPENAI_BASE_URL", "openai_base_url", self.effective("OPENAI_BASE_URL", &self.openai_base_url)),
@@ -138,6 +149,8 @@ impl CaCodeConfig {
             "app_name" => { if let Some(v) = val { self.app_name = v; } }
             "theme" => { if let Some(v) = val { self.theme = v; } }
             "thinking_mode" => { if let Some(v) = val { self.thinking_mode = v; } }
+            "user_name" => { if let Some(v) = val { self.user_name = v; } }
+            "system_persona" => { if let Some(v) = val { self.system_persona = v; } }
             "pro_license_key" => self.pro_license_key = val,
             "openai_api_key" => self.openai_api_key = val,
             "openai_base_url" => self.openai_base_url = val,
