@@ -230,6 +230,9 @@ impl App {
             .into_iter()
             .map(|(label, _env, key, _disp)| {
                 let raw = match key {
+                    "app_name" => Some(config.app_name.clone()),
+                    "theme" => Some(config.theme.clone()),
+                    "pro_license_key" => config.pro_license_key.clone(),
                     "openai_api_key" => config.openai_api_key.clone(),
                     "openai_base_url" => config.openai_base_url.clone(),
                     "anthropic_api_key" => config.anthropic_api_key.clone(),
@@ -244,7 +247,7 @@ impl App {
                     label,
                     key,
                     value: raw.unwrap_or_default(),
-                    is_secret: key.contains("api_key"),
+                    is_secret: key.contains("api_key") || key.contains("license"),
                 }
             })
             .collect();
