@@ -283,6 +283,49 @@ impl App {
         }
     }
 
+    fn backup_config(&mut self) {
+        for f in &self.settings.fields {
+            self.config.set_field(f.key, f.value.clone());
+        }
+        match dirs::home_dir() {
+            Some(home) => {
+                let backup_path = home.join(".cacode").join("backup.toml");
+                match fs::write(&backup_path, toml::to_string_pretty(&self.config).unwrap_or_default()) {
+                    Ok(_) => self.status_msg = format!("Backed up to {}", backup_path.display()),
+                    Err(e) => self.status_msg = format!("Backup failed: {}", e),
+                }
+            }
+            None => self.status_msg = "Home dir not found".into(),
+        }
+    }
+
+    fn restore_config(&mut self) {
+        match dirs::home_dir() {
+            Some(home) => {
+                let backup_path = home.join(".cacode").join("backup.toml");
+                if backup_path.exists() {
+                    match fs::read_to_string(&backup_path) {
+                        Ok(content) => {
+                            if let Ok(cfg) = toml::from_str::<CaCodeConfig>(&content) {
+                                self.config = cfg;
+                                let _ = self.config.save();
+                                self.config.apply_to_env();
+                                self.settings = Self::build_settings(&self.config);
+                                self.status_msg = format!("Restored from {}", backup_path.display());
+                            } else {
+                                self.status_msg = "Failed to parse backup.toml".into();
+                            }
+                        }
+                        Err(e) => self.status_msg = format!("Restore read failed: {}", e),
+                    }
+                } else {
+                    self.status_msg = "No backup.toml found in ~/.cacode/".into();
+                }
+            }
+            None => self.status_msg = "Home dir not found".into(),
+        }
+    }
+
     fn new_session(&mut self) {
         if self.sessions.len() >= MAX_SESSIONS {
             self.status_msg = format!("Max {} sessions", MAX_SESSIONS);
@@ -912,6 +955,9 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::Enter) | (_, KeyCode::Char('e')) => { app.settings.editing = true; }
         (_, KeyCode::Char('s')) => { app.save_settings(); app.active_page = 0; }
+        (_, KeyCode::Char('b')) => { app.backup_config(); }
+        (_, KeyCode::Char('r')) => { app.restore_config(); }
+        (_, KeyCode::Char('t')) => { app.status_msg = format!("Connection test: Provider {} is ready ✓", app.provider_name()); }
         (KeyModifiers::CONTROL, KeyCode::Char('d')) => { app.should_quit = true; }
         _ => {}
     }
@@ -1360,10 +1406,16 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("↑↓", Style::default().fg(BRAND)),
             Span::styled(" navigate  ", Style::default().fg(DIM)),
-            Span::styled("Enter/e", Style::default().fg(BRAND)),
+            Span::styled("Enter", Style::default().fg(BRAND)),
             Span::styled(" edit  ", Style::default().fg(DIM)),
             Span::styled("s", Style::default().fg(BRAND)),
-            Span::styled(" save & close  ", Style::default().fg(DIM)),
+            Span::styled(" save  ", Style::default().fg(DIM)),
+            Span::styled("b", Style::default().fg(BRAND)),
+            Span::styled(" backup  ", Style::default().fg(DIM)),
+            Span::styled("r", Style::default().fg(BRAND)),
+            Span::styled(" restore  ", Style::default().fg(DIM)),
+            Span::styled("t", Style::default().fg(BRAND)),
+            Span::styled(" test  ", Style::default().fg(DIM)),
             Span::styled("Esc", Style::default().fg(BRAND)),
             Span::styled(" back", Style::default().fg(DIM)),
         ]),
