@@ -61,6 +61,9 @@ pub struct ReActAgent {
     client: Client,
     pub history: Vec<Message>,
     pub provider: Provider,
+    pub user_name: String,
+    pub persona: String,
+    pub thinking_mode: String,
 }
 
 impl Default for ReActAgent {
@@ -93,6 +96,9 @@ impl ReActAgent {
             client: Client::new(),
             history: Vec::new(),
             provider: Self::detect_provider(),
+            user_name: "Prof. Cecep".into(),
+            persona: "You are CACode, an elite sovereign Rust development assistant. The user is Prof. Cecep (Cecep Saeful Azhar Hidayat, ST). Always greet and address him respectfully as 'Prof. Cecep' (e.g. 'Hi Prof. Cecep', 'Siap, Prof. Cecep.'). Be direct, concise, and technically precise.".into(),
+            thinking_mode: "Fast".into(),
         }
     }
 
@@ -104,29 +110,43 @@ impl ReActAgent {
         self.history.push(Message { role: "assistant".into(), content: content.into() });
     }
 
-    pub fn system_prompt() -> Message {
+    pub fn system_prompt(&self) -> Message {
+        let persona_intro = if !self.persona.is_empty() {
+            self.persona.clone()
+        } else {
+            format!(
+                "You are CACode, a sovereign Rust-focused development agent. The user is {}. Address the user respectfully as {} when appropriate.",
+                self.user_name, self.user_name
+            )
+        };
+
+        let thinking_hint = match self.thinking_mode.as_str() {
+            "Analytical" => "\n\n[Cognitive Mode: Analytical — analyze problems with structured step-by-step logic before answering or using tools.]",
+            "Deep" => "\n\n[Cognitive Mode: Deep Reasoning — apply comprehensive adversarial verification, edge-case proofs, and rigorous architectural checks.]",
+            _ => "",
+        };
+
+        let content = format!(
+            "{}{}\n\nAvailable tools:\n\
+            1. read_file: {{\"tool\": \"read_file\", \"args\": {{\"path\": \"...\", \"offset\": 1, \"limit\": 200}}}}\n\
+            2. patch_file: {{\"tool\": \"patch_file\", \"args\": {{\"path\": \"...\", \"old_string\": \"...\", \"new_string\": \"...\"}}}}\n\
+            3. write_file: {{\"tool\": \"write_file\", \"args\": {{\"path\": \"...\", \"content\": \"...\"}}}}\n\
+            4. bash: {{\"tool\": \"bash\", \"args\": {{\"command\": \"...\"}}}}\n\
+            5. search_files: {{\"tool\": \"search_files\", \"args\": {{\"pattern\": \"...\", \"dir\": \".\"}}}}\n\n\
+            When you need to act, output a JSON array of tool calls strictly wrapped in ```json ... ``` codeblock:\n\
+            ```json\n[\n  {{\"tool\": \"read_file\", \"args\": {{\"path\": \"src/main.rs\"}}}}\n]\n```\n\
+            If no tool action is needed, reply normally with natural language.",
+            persona_intro, thinking_hint
+        );
+
         Message {
             role: "system".into(),
-            content: "You are CACode, a sovereign Rust-focused development agent.
-Available tools:
-1. read_file: {\"tool\": \"read_file\", \"args\": {\"path\": \"...\", \"offset\": 1, \"limit\": 200}}
-2. patch_file: {\"tool\": \"patch_file\", \"args\": {\"path\": \"...\", \"old_string\": \"...\", \"new_string\": \"...\"}}
-3. write_file: {\"tool\": \"write_file\", \"args\": {\"path\": \"...\", \"content\": \"...\"}}
-4. bash: {\"tool\": \"bash\", \"args\": {\"command\": \"...\"}}
-5. search_files: {\"tool\": \"search_files\", \"args\": {\"pattern\": \"...\", \"dir\": \".\"}}
-
-When you need to act, output a JSON array of tool calls strictly wrapped in ```json ... ``` codeblock:
-```json
-[
-  {\"tool\": \"read_file\", \"args\": {\"path\": \"src/main.rs\"}}
-]
-```
-If no tool action is needed, reply normally with natural language.".into(),
+            content,
         }
     }
 
     pub async fn call_llm(&self, user_input: &str) -> Result<String> {
-        let mut msgs = vec![Self::system_prompt()];
+        let mut msgs = vec![self.system_prompt()];
         msgs.extend(self.history.clone());
         msgs.push(Message { role: "user".into(), content: user_input.into() });
 
@@ -179,7 +199,7 @@ If no tool action is needed, reply normally with natural language.".into(),
                     .json(&serde_json::json!({
                         "model": model,
                         "max_tokens": 4096,
-                        "system": Self::system_prompt().content,
+                        "system": self.system_prompt().content,
                         "messages": non_system_msgs,
                     }))
                     .send()

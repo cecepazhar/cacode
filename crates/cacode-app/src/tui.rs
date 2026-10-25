@@ -141,11 +141,15 @@ struct ChatSession {
 }
 
 impl ChatSession {
-    fn new(name: String) -> Self {
+    fn new(name: String, config: &CaCodeConfig) -> Self {
+        let mut agent = ReActAgent::new();
+        agent.user_name = config.user_name.clone();
+        agent.persona = config.system_persona.clone();
+        agent.thinking_mode = config.thinking_mode.clone();
         Self {
             name,
             messages: Vec::new(),
-            agent: ReActAgent::new(),
+            agent,
             input: String::new(),
             cursor_pos: 0,
             scroll_offset: 0,
@@ -212,7 +216,7 @@ struct App {
 impl App {
     fn new(config: CaCodeConfig) -> Self {
         let settings = Self::build_settings(&config);
-        let session = ChatSession::new("Session 1".into());
+        let session = ChatSession::new("Session 1".into(), &config);
         let mut app = Self {
             active_page: 0,
             sessions: vec![session],
@@ -310,6 +314,9 @@ impl App {
                 self.config.apply_to_env();
                 for s in &mut self.sessions {
                     s.agent.provider = ReActAgent::detect_provider();
+                    s.agent.user_name = self.config.user_name.clone();
+                    s.agent.persona = self.config.system_persona.clone();
+                    s.agent.thinking_mode = self.config.thinking_mode.clone();
                 }
                 self.status_msg = "Saved ~/.cacode/config.toml ✓".into();
             }
@@ -366,7 +373,7 @@ impl App {
             return;
         }
         let n = self.sessions.len() + 1;
-        self.sessions.push(ChatSession::new(format!("Session {}", n)));
+        self.sessions.push(ChatSession::new(format!("Session {}", n), &self.config));
         self.active_session = self.sessions.len() - 1;
         self.status_msg = format!("New session: {}", self.session().name);
     }
