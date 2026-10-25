@@ -555,11 +555,23 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('1')) => { app.active_page = 0; true }
-        (KeyModifiers::CONTROL, KeyCode::Char('2')) => { app.active_page = 1; app.refresh_usage_data(); true }
-        (KeyModifiers::CONTROL, KeyCode::Char('3')) => { app.active_page = 2; app.refresh_usage_data(); true }
-        (KeyModifiers::CONTROL, KeyCode::Char('4')) => { app.active_page = 3; app.refresh_skills(); true }
-        (KeyModifiers::CONTROL, KeyCode::Char('5')) => { app.active_page = 4; true }
+        (KeyModifiers::CONTROL, KeyCode::Char('1')) | (_, KeyCode::F(1)) => { app.active_page = 0; true }
+        (KeyModifiers::CONTROL, KeyCode::Char('2')) | (_, KeyCode::F(2)) => { app.active_page = 1; app.refresh_usage_data(); true }
+        (KeyModifiers::CONTROL, KeyCode::Char('3')) | (_, KeyCode::F(3)) => { app.active_page = 2; app.refresh_usage_data(); true }
+        (KeyModifiers::CONTROL, KeyCode::Char('4')) | (_, KeyCode::F(4)) => { app.active_page = 3; app.refresh_skills(); true }
+        (KeyModifiers::CONTROL, KeyCode::Char('5')) | (_, KeyCode::F(5)) => { app.active_page = 4; true }
+        (KeyModifiers::SHIFT, KeyCode::Tab) | (_, KeyCode::F(6)) => {
+            app.active_page = (app.active_page + 4) % 5;
+            if app.active_page == 1 || app.active_page == 2 { app.refresh_usage_data(); }
+            if app.active_page == 3 { app.refresh_skills(); }
+            true
+        }
+        (_, KeyCode::Tab) | (_, KeyCode::F(7)) => {
+            app.active_page = (app.active_page + 1) % 5;
+            if app.active_page == 1 || app.active_page == 2 { app.refresh_usage_data(); }
+            if app.active_page == 3 { app.refresh_skills(); }
+            true
+        }
         _ => false,
     }
 }
@@ -582,16 +594,16 @@ async fn handle_chat_key(
         (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
             app.active_page = 4;
         }
-        (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+        (KeyModifiers::CONTROL, KeyCode::Char('t')) | (_, KeyCode::F(10)) => {
             app.new_session();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
             app.close_session();
         }
-        (KeyModifiers::CONTROL, KeyCode::Right) => {
+        (KeyModifiers::CONTROL, KeyCode::Right) | (_, KeyCode::F(9)) => {
             app.next_session();
         }
-        (KeyModifiers::CONTROL, KeyCode::Left) => {
+        (KeyModifiers::CONTROL, KeyCode::Left) | (_, KeyCode::F(8)) => {
             app.prev_session();
         }
         (KeyModifiers::CONTROL, KeyCode::Tab) => {
@@ -938,7 +950,11 @@ fn handle_skills_key(app: &mut App, key: KeyEvent) {
 fn handle_settings_key(app: &mut App, key: KeyEvent) {
     if app.settings.editing {
         match key.code {
-            KeyCode::Enter | KeyCode::Esc => { app.settings.editing = false; }
+            KeyCode::Enter => {
+                app.settings.editing = false;
+                app.save_settings();
+            }
+            KeyCode::Esc => { app.settings.editing = false; }
             KeyCode::Backspace => { app.settings.fields[app.settings.selected].value.pop(); }
             KeyCode::Char(c) => { app.settings.fields[app.settings.selected].value.push(c); }
             _ => {}
