@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection};
+use rusqlite::Connection;
 use serde_json::json;
 use dirs;
 

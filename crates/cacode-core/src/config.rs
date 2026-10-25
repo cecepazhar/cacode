@@ -1,0 +1,126 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+/// BYOK configuration persisted to ~/.cacode/config.toml.
+/// Environment variables override config file values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaCodeConfig {
+    #[serde(default)]
+    pub openai_api_key: Option<String>,
+    #[serde(default)]
+    pub openai_base_url: Option<String>,
+    #[serde(default)]
+    pub anthropic_api_key: Option<String>,
+    #[serde(default)]
+    pub ollama_url: Option<String>,
+    #[serde(default)]
+    pub ollama_model: Option<String>,
+    #[serde(default)]
+    pub router9_url: Option<String>,
+    #[serde(default)]
+    pub router9_api_key: Option<String>,
+    #[serde(default)]
+    pub router9_model: Option<String>,
+}
+
+impl CaCodeConfig {
+    /// Returns ~/.cacode/config.toml
+    pub fn config_path() -> Result<PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
+        Ok(home.join(".cacode").join("config.toml"))
+    }
+
+    /// Load config from disk. Returns default if file doesn't exist.
+    pub fn load() -> Result<Self> {
+        let path = Self::config_path()?;
+        if path.exists() {
+            let contents = fs::read_to_string(&path)?;
+            let cfg: CaCodeConfig = toml::from_str(&contents)?;
+            Ok(cfg)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Save config to disk, creating ~/.cacode/ if needed.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::config_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(self)?;
+        fs::write(&path, contents)?;
+        Ok(())
+    }
+
+    /// Apply config values as environment variables (only if env var is not already set).
+    /// This makes config.toml a fallback for env vars.
+    pub fn apply_to_env(&self) {
+        let mappings: &[(&str, &Option<String>)] = &[
+            ("OPENAI_API_KEY", &self.openai_api_key),
+            ("OPENAI_BASE_URL", &self.openai_base_url),
+            ("ANTHROPIC_API_KEY", &self.anthropic_api_key),
+            ("OLLAMA_URL", &self.ollama_url),
+            ("OLLAMA_MODEL", &self.ollama_model),
+            ("ROUTER9_URL", &self.router9_url),
+            ("ROUTER9_API_KEY", &self.router9_api_key),
+            ("ROUTER9_MODEL", &self.router9_model),
+        ];
+        for (var, val) in mappings {
+            if let Some(v) = val {
+                if !v.is_empty() && env::var(var).is_err() {
+                    env::set_var(var, v);
+                }
+            }
+        }
+    }
+
+    /// Get effective value: env var takes priority, then config file.
+    pub fn effective(&self, env_name: &str, config_val: &Option<String>) -> String {
+        env::var(env_name).unwrap_or_else(|_| config_val.clone().unwrap_or_default())
+    }
+
+    /// Returns a list of (label, env_var_name, field_key, masked_value) for display.
+    pub fn display_fields(&self) -> Vec<(&'static str, &'static str, &'static str, String)> {
+        vec![
+            ("OpenAI API Key", "OPENAI_API_KEY", "openai_api_key", Self::mask(&self.effective("OPENAI_API_KEY", &self.openai_api_key))),
+            ("OpenAI Base URL", "OPENAI_BASE_URL", "openai_base_url", self.effective("OPENAI_BASE_URL", &self.openai_base_url)),
+            ("Anthropic API Key", "ANTHROPIC_API_KEY", "anthropic_api_key", Self::mask(&self.effective("ANTHROPIC_API_KEY", &self.anthropic_api_key))),
+            ("Ollama URL", "OLLAMA_URL", "ollama_url", self.effective("OLLAMA_URL", &self.ollama_url)),
+            ("Ollama Model", "OLLAMA_MODEL", "ollama_model", self.effective("OLLAMA_MODEL", &self.ollama_model)),
+            ("9Router URL", "ROUTER9_URL", "router9_url", self.effective("ROUTER9_URL", &self.router9_url)),
+            ("9Router API Key", "ROUTER9_API_KEY", "router9_api_key", Self::mask(&self.effective("ROUTER9_API_KEY", &self.router9_api_key))),
+            ("9Router Model", "ROUTER9_MODEL", "router9_model", self.effective("ROUTER9_MODEL", &self.router9_model)),
+        ]
+    }
+
+    /// Mask a value, showing only last 4 chars.
+    pub fn mask(val: &str) -> String {
+        if val.is_empty() {
+            "(not set)".to_string()
+        } else if val.len() <= 4 {
+            "****".to_string()
+        } else {
+            format!("{}…{}", "*".repeat(val.len().min(12) - 4), &val[val.len() - 4..])
+        }
+    }
+
+    /// Set a field by key name.
+    pub fn set_field(&mut self, key: &str, value: String) {
+        let val = if value.is_empty() { None } else { Some(value) };
+        match key {
+            "openai_api_key" => self.openai_api_key = val,
+            "openai_base_url" => self.openai_base_url = val,
+            "anthropic_api_key" => self.anthropic_api_key = val,
+            "ollama_url" => self.ollama_url = val,
+            "ollama_model" => self.ollama_model = val,
+            "router9_url" => self.router9_url = val,
+            "router9_api_key" => self.router9_api_key = val,
+            "router9_model" => self.router9_model = val,
+            _ => {}
+        }
+    }
+}

@@ -1,13 +1,16 @@
 use clap::{Parser, Subcommand};
 use anyhow::Result;
 
-use cacode::commands;
+use cacode_core::commands;
+
+mod config;
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "cacode", version, about = "Full‑lifecycle sovereign Rust CLI & chat‑agent")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Commands,
+    cmd: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -16,7 +19,7 @@ enum Commands {
     About,
     /// Show the billing information (pricing tiers, cost per model)
     Billing,
-    /// Run the interactive chat agent (core functionality – omitted here for brevity)
+    /// Run the interactive chat agent (REPL mode, non-TUI)
     Chat,
     /// Token‑usage proxy (starts the local proxy server)
     Monitor {
@@ -24,6 +27,10 @@ enum Commands {
         endpoint: String,
         #[arg(short, long, env = "COST_TABLE")]
         costs: Option<String>,
+        #[arg(long, env = "MONITOR_PORT", default_value = "8000")]
+        port: Option<u16>,
+        #[arg(long, env = "MAX_RPM", default_value = "120")]
+        max_rpm: Option<usize>,
     },
     /// Show collected token‑usage statistics
     Report {
@@ -37,13 +44,17 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.cmd {
-        Commands::About => commands::about::run()? ,
-        Commands::Billing => commands::billing::run()? ,
-        Commands::Chat => commands::chat::run().await?,
-        Commands::Monitor { endpoint, costs } => {
-            commands::monitor::run(endpoint, costs).await?;
+        None => {
+            // No subcommand → launch TUI chat interface
+            tui::run_tui().await?;
         }
-        Commands::Report { format } => commands::report::run(format)?,
+        Some(Commands::About) => commands::about::run()?,
+        Some(Commands::Billing) => commands::billing::run()?,
+        Some(Commands::Chat) => commands::chat::run().await?,
+        Some(Commands::Monitor { endpoint, costs, port, max_rpm }) => {
+            commands::monitor::run(endpoint, costs, port, max_rpm).await?;
+        }
+        Some(Commands::Report { format }) => commands::report::run(format)?,
     }
     Ok(())
 }

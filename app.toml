@@ -1,0 +1,17 @@
+[app]
+name = "CACode"
+version = "0.3.0"
+description = "Sovereign Rust Development CLI & Chat Agent"
+author = "Cecep Saeful Azhar Hidayat, ST"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cecepazhar/cacode"
+
+[features]
+tui = true
+monitor = true
+byok = true
+
+[pricing]
+free = "$0"
+pro = "$39"
+ultra = "$89"

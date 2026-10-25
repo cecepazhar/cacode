@@ -32,6 +32,7 @@ struct AnthropicResponse {
 #[derive(Debug, Deserialize)]
 struct AnthropicContent {
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     typ: String,
     text: Option<String>,
 }
@@ -58,6 +59,12 @@ pub struct ReActAgent {
     client: Client,
     pub history: Vec<Message>,
     pub provider: Provider,
+}
+
+impl Default for ReActAgent {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReActAgent {
