@@ -24,3 +24,5 @@ crossterm = "0.28"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 dirs = "5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = "0.4"

@@ -211,11 +211,13 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "cacode-core",
+ "chrono",
  "clap",
  "crossterm 0.28.1",
  "dirs",
  "ratatui",
  "reedline",
+ "rusqlite",
  "serde",
  "tokio",
  "toml",
