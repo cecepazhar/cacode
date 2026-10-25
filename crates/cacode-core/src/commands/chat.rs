@@ -15,11 +15,13 @@ pub struct Message {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIChoice {
     message: Message,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIResponse {
     choices: Vec<OpenAIChoice>,
 }
@@ -144,12 +146,22 @@ If no tool action is needed, reply normally with natural language.".into(),
                     .json(&serde_json::json!({
                         "model": model,
                         "messages": msgs,
+                        "stream": false
                     }))
                     .send()
-                    .await?
-                    .json::<OpenAIResponse>()
                     .await?;
-                Ok(resp.choices.into_iter().next().ok_or_else(|| anyhow!("No choices returned from OpenAI"))?.message.content)
+                let status = resp.status();
+                let bytes = resp.bytes().await?;
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if !status.is_success() {
+                    return Err(anyhow!(
+                        "OpenAI HTTP {} (endpoint: {}) — {}",
+                        status,
+                        endpoint,
+                        text.chars().take(500).collect::<String>()
+                    ));
+                }
+                Self::extract_response_content(&text)
             }
             Provider::Anthropic { model } => {
                 let api_key = env::var("ANTHROPIC_API_KEY")?;
@@ -208,6 +220,7 @@ If no tool action is needed, reply normally with natural language.".into(),
                     .json(&serde_json::json!({
                         "model": model,
                         "messages": msgs,
+                        "stream": false
                     }))
                     .send()
                     .await?;
@@ -222,16 +235,64 @@ If no tool action is needed, reply normally with natural language.".into(),
                         text.chars().take(500).collect::<String>()
                     ));
                 }
-                let parsed: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|_| anyhow!("Invalid JSON from 9router ({}): {}", text.chars().take(200).collect::<String>(), status))?;
-                let err_msg = parsed.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str());
-                if let Some(msg) = err_msg {
-                    return Err(anyhow!("9router error: {}", msg));
-                }
-                let v: OpenAIResponse = serde_json::from_value(parsed)?;
-                Ok(v.choices.into_iter().next().ok_or_else(|| anyhow!("No choices returned from 9router"))?.message.content)
+                Self::extract_response_content(&text)
             }
         }
+    }
+
+    pub fn extract_response_content(text: &str) -> Result<String> {
+        let trimmed = text.trim();
+        // 1. Try parsing standard JSON
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(err) = parsed.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                return Err(anyhow!("API error: {}", err));
+            }
+            if let Some(content) = parsed.get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                return Ok(content.to_string());
+            }
+        }
+
+        // 2. Fallback: Parse Server-Sent Events (SSE chunks starting with "data:")
+        if trimmed.starts_with("data:") || trimmed.contains("\ndata:") {
+            let mut accumulated = String::new();
+            for line in trimmed.lines() {
+                let line = line.trim();
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim();
+                    if data == "[DONE]" || data.is_empty() {
+                        continue;
+                    }
+                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(err) = chunk.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                            return Err(anyhow!("Stream error: {}", err));
+                        }
+                        if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+                            if let Some(first) = choices.first() {
+                                if let Some(content) = first.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+                                    accumulated.push_str(content);
+                                } else if let Some(content) = first.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                                    accumulated.push_str(content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !accumulated.is_empty() {
+                return Ok(accumulated);
+            }
+        }
+
+        Err(anyhow!(
+            "Invalid response from model: {}",
+            text.chars().take(200).collect::<String>()
+        ))
     }
 
     pub fn parse_tool_calls(&self, content: &str) -> Vec<ToolCall> {
