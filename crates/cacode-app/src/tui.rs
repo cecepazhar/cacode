@@ -7,10 +7,10 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
+    widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
     Frame, Terminal,
 };
 use rusqlite::Connection;
@@ -18,8 +18,10 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::env;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-use cacode_core::commands::chat::{Provider, ReActAgent};
+use cacode_core::commands::chat::{AgentEvent, Provider, ReActAgent, TokenUsage};
 use crate::config::CaCodeConfig;
 
 const BRAND: Color = Color::Cyan;
@@ -28,6 +30,16 @@ const TEXT: Color = Color::White;
 const GRAY: Color = Color::Rgb(180, 180, 190);
 const BG_BLACK: Color = Color::Rgb(0, 0, 0);
 
+// Minimalist single-column layout: near-black background, blue/cyan accent.
+// Codex-style navy header panel and ? shortcuts overlay are intentionally omitted.
+const BG_DARK: Color = Color::Rgb(5, 8, 15); // near-black (#05080f)
+const BG_PILL: Color = Color::Rgb(10, 16, 32); // slightly lighter pill background
+const ACCENT: Color = Color::Rgb(59, 130, 246); // #3b82f6 blue accent
+const ACCENT_DIM: Color = Color::Rgb(96, 165, 250); // brighter blue/cyan accent
+const TEXT_SOFT: Color = Color::Rgb(226, 232, 240); // soft lavender/white
+const MUTED: Color = Color::Rgb(100, 116, 139); // muted slate
+
+#[allow(dead_code)]
 const LOGO: &[&str] = &[
     r"  ██████╗ █████╗  ██████╗ ██████╗ ██████╗ ███████╗",
     r" ██╔════╝██╔══██╗██╔════╝██╔═══██╗██╔══██╗██╔════╝",
@@ -39,7 +51,7 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v1.0.1",
+    "  Sovereign Rust Development Agent  v1.0.2",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK: OpenAI, Anthropic, Ollama, 9Router",
@@ -77,7 +89,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.1)"),
+    ("/version", "Show CACode version (v1.0.2)"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -102,10 +114,12 @@ const THINKING_FRAMES: &[(&str, &str)] = &[
     ("⠧", "( ⚆_⚆ ) [CA] concluding..."),
 ];
 
+#[allow(dead_code)]
 struct BorderlessLayout {
     divider_y: Option<u16>,
 }
 
+#[allow(dead_code)]
 impl BorderlessLayout {
     fn new() -> Self { Self { divider_y: None } }
     fn with_divider(mut self, y: u16) -> Self { self.divider_y = Some(y); self }
@@ -136,6 +150,57 @@ impl Widget for BorderlessLayout {
 struct ChatMessage {
     role: String,
     content: String,
+    /// Per-turn token telemetry attached to assistant messages.
+    tokens: Option<TokenUsage>,
+    /// Wall-clock duration of the ReAct turn that produced this message.
+    duration_ms: Option<u64>,
+}
+
+impl ChatMessage {
+    fn plain(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tokens: None,
+            duration_ms: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn with_usage(
+        role: impl Into<String>,
+        content: impl Into<String>,
+        tokens: Option<TokenUsage>,
+        duration_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tokens,
+            duration_ms,
+        }
+    }
+}
+
+/// Formats a number with thousands separators, e.g. `12450` -> `12,450`.
+fn fmt_num(n: i64) -> String {
+    let neg = n < 0;
+    let s = format!("{}", n.abs());
+    let mut out = String::new();
+    let mut first = true;
+    for c in s.chars().rev() {
+        if !first && out.len().is_multiple_of(4) {
+            out.push(',');
+        }
+        out.push(c);
+        first = false;
+    }
+    let out = out.chars().rev().collect::<String>();
+    if neg {
+        format!("-{}", out)
+    } else {
+        out
+    }
 }
 
 struct SettingsField {
@@ -243,6 +308,11 @@ struct App {
     modal_picker: ModalPicker,
     modal_idx: usize,
     models_cache: Vec<String>,
+    // Non-blocking agent runtime state
+    agent_events_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    steering_tx: Option<mpsc::UnboundedSender<String>>,
+    cancel_token: Option<CancellationToken>,
+    agent_turn_session: usize,
 }
 
 impl App {
@@ -270,6 +340,10 @@ impl App {
             modal_picker: ModalPicker::Off,
             modal_idx: 0,
             models_cache: Vec::new(),
+            agent_events_rx: None,
+            steering_tx: None,
+            cancel_token: None,
+            agent_turn_session: 0,
         };
         app.refresh_skills();
         app.refresh_models_cache();
@@ -282,6 +356,182 @@ impl App {
 
     fn session_mut(&mut self) -> &mut ChatSession {
         &mut self.sessions[self.active_session]
+    }
+
+    // ------------------------------------------------------------------
+    // Non-blocking agent runtime: each submitted prompt spawns a background
+    // Tokio task; the event loop only polls `agent_events_rx` on each tick
+    // so the UI and keyboard never block on LLM calls or tool execution.
+    // ------------------------------------------------------------------
+
+    /// Begin a ReAct turn for the active session in a background task.
+    /// Returns immediately; progress is delivered via `agent_events_rx`.
+    fn start_turn(&mut self, prompt: String) {
+        if self.is_thinking {
+            // Already busy: forward it as a mid-turn steering instruction.
+            self.steer(prompt);
+            return;
+        }
+
+        let session_idx = self.active_session;
+        let session_name = self.sessions[session_idx].name.clone();
+        let user_agent = self.sessions[session_idx].agent.clone();
+        let config = self.config.clone();
+
+        // Apply session-level settings to the worker's copy so the background
+        // task matches the live UI state.
+        let mut agent = user_agent;
+        agent.user_name = config.user_name.clone();
+        agent.persona = config.system_persona.clone();
+        agent.thinking_mode = config.thinking_mode.clone();
+
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
+        let cancel = CancellationToken::new();
+
+        self.agent_events_rx = Some(ev_rx);
+        self.steering_tx = Some(steer_tx);
+        self.cancel_token = Some(cancel.clone());
+        self.agent_turn_session = session_idx;
+
+        tokio::spawn(async move {
+            agent.run_turn(prompt, ev_tx, steer_rx, cancel).await;
+        });
+
+        self.is_thinking = true;
+        self.status_msg = format!("{} — reasoning…", session_name);
+    }
+
+    /// Forward a mid-run steering instruction to the active worker.
+    fn steer(&mut self, instruction: String) {
+        if let Some(tx) = &self.steering_tx {
+            let _ = tx.send(instruction);
+        }
+    }
+
+    /// Cancel the in-flight LLM call / tool execution immediately.
+    fn cancel_turn(&mut self) {
+        if let Some(tok) = self.cancel_token.clone() {
+            tok.cancel();
+        }
+    }
+
+    /// Drains all pending agent events into the owning session.
+    /// Invoked by the event loop on every tick (non-blocking).
+    fn drain_agent_events(&mut self) {
+        // Take ownership of the receiver so we can clear it without a
+        // conflict with the mutable borrow; put it back after processing.
+        let mut rx = match self.agent_events_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let mut finished = false;
+        while let Ok(ev) = rx.try_recv() {
+            let target = if self.agent_turn_session < self.sessions.len() {
+                self.agent_turn_session
+            } else {
+                self.active_session
+            };
+
+            match ev {
+                AgentEvent::Thinking(stage) => {
+                    self.sessions[target].show_welcome = false;
+                    if self.active_session == target {
+                        self.status_msg = format!("{} — {}", self.sessions[target].name, stage);
+                    }
+                }
+                AgentEvent::AssistantChunk(text) => {
+                    self.sessions[target]
+                        .messages
+                        .push(ChatMessage::plain("assistant", text));
+                    self.sessions[target].scroll_offset = 0;
+                }
+                AgentEvent::ToolStart { tool, args } => {
+                    let short_args = if args.len() > 120 {
+                        format!("{}…", &args[..120])
+                    } else {
+                        args
+                    };
+                    self.sessions[target].messages.push(ChatMessage::plain(
+                        "system",
+                        format!("[tool:{}] {}", tool, short_args),
+                    ));
+                }
+                AgentEvent::ToolOutput { tool, output, is_error } => {
+                    let short = if output.len() > 500 {
+                        format!("{}…", &output[..500])
+                    } else {
+                        output
+                    };
+                    let line = if is_error {
+                        format!("[tool:{}] error: {}", tool, short)
+                    } else {
+                        format!("[tool:{}] {}", tool, short)
+                    };
+                    self.sessions[target].messages.push(ChatMessage::plain("system", line));
+                }
+                AgentEvent::TurnFinished {
+                    usage,
+                    total_calls,
+                    duration_ms,
+                    history,
+                    total_usage,
+                    last_usage,
+                } => {
+                    let s = &mut self.sessions[target];
+                    s.agent.history = history;
+                    s.agent.last_usage = last_usage;
+                    s.agent.total_calls = total_calls;
+                    s.total_tokens = total_usage.total_tokens as u64;
+                    s.agent.total_usage = total_usage.clone();
+                    // Attach the token/duration metadata to the last assistant
+                    // message so draw_messages can render the telemetry footer.
+                    if let Some(msg) = s.messages.iter_mut().rev().find(|m| m.role == "assistant") {
+                        msg.tokens = Some(usage);
+                        msg.duration_ms = Some(duration_ms);
+                    }
+                    if self.active_session == target {
+                        self.is_thinking = false;
+                        self.status_msg.clear();
+                    }
+                    finished = true;
+                }
+                AgentEvent::Error(e) => {
+                    let s = &mut self.sessions[target];
+                    s.messages.push(ChatMessage::plain(
+                        "system",
+                        format!("Error: {}", e),
+                    ));
+                    if self.active_session == target {
+                        self.is_thinking = false;
+                        self.status_msg = "Turn failed".into();
+                    }
+                    finished = true;
+                }
+                AgentEvent::Cancelled => {
+                    let s = &mut self.sessions[target];
+                    s.messages.push(ChatMessage::plain(
+                        "system",
+                        "[Interrupted by user (Ctrl+C)]".to_string(),
+                    ));
+                    if self.active_session == target {
+                        self.is_thinking = false;
+                        self.status_msg = "Cancelled".into();
+                    }
+                    finished = true;
+                }
+            }
+        }
+
+        // Restore the receiver unless this turn has ended (all channels dropped).
+        if !finished {
+            self.agent_events_rx = Some(rx);
+        } else {
+            // Turn completed: clear all agent runtime state.
+            self.steering_tx = None;
+            self.cancel_token = None;
+        }
     }
 
     fn build_settings(config: &CaCodeConfig) -> SettingsState {
@@ -783,8 +1033,14 @@ async fn event_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        app.drain_agent_events();
         terminal.draw(|f| ui(f, app))?;
-        if app.should_quit { return Ok(()); }
+        if app.should_quit {
+            if let Some(tok) = app.cancel_token.clone() {
+                tok.cancel();
+            }
+            return Ok(());
+        }
         if app.is_thinking {
             app.spinner_frame += 1;
         }
@@ -933,14 +1189,46 @@ async fn handle_chat_key(
             }
             _ => {}
         }
+    } else {
+        // Not in slash autocomplete: Tab switches agent (session).
+        if key.code == KeyCode::Tab {
+            app.next_session();
+            return Ok(());
+        }
     }
 
     // 3. Regular chat inputs & shortcuts
     match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+            if !app.session().input.starts_with('/') {
+                app.session_mut().input = "/".to_string();
+                let len = app.session().input.len();
+                app.session_mut().cursor_pos = len;
+                app.autocomplete_idx = 0;
+            }
+            return Ok(());
+        }
+        (_, KeyCode::Tab) => {
+            app.next_session();
+            return Ok(());
+        }
+        (_, KeyCode::BackTab) => {
+            app.prev_session();
+            return Ok(());
+        }
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
             if app.is_thinking {
+                app.cancel_turn();
                 app.is_thinking = false;
                 app.status_msg = "Cancelled".into();
+                let idx = app.agent_turn_session.min(app.sessions.len() - 1);
+                app.sessions[idx].messages.push(ChatMessage::plain(
+                    "system",
+                    "[Interrupted by user (Ctrl+C)]".to_string(),
+                ));
+                app.agent_events_rx = None;
+                app.steering_tx = None;
+                app.cancel_token = None;
             }
         }
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => {
@@ -968,6 +1256,19 @@ async fn handle_chat_key(
             app.session_mut().cursor_pos = 0;
             app.session_mut().show_welcome = false;
             app.autocomplete_idx = 0;
+
+            // Mid-turn steering: while a ReAct turn is in flight, a plain
+            // message is captured as a `[Steering / Mid-turn]` instruction
+            // that the background agent folds into its next reasoning step.
+            if app.is_thinking && !input.starts_with('/') {
+                app.session_mut()
+                    .messages
+                    .push(ChatMessage::plain("user", format!("[Steering / Mid-turn] {}", input)));
+                app.session_mut().scroll_offset = 0;
+                app.steer(input);
+                app.status_msg = "Steering instruction queued ✓".into();
+                return Ok(());
+            }
 
             if input.starts_with('/') {
                 let parts: Vec<&str> = input.splitn(2, ' ').collect();
@@ -1006,7 +1307,7 @@ async fn handle_chat_key(
                                 let inline_content = add_parts.get(1).copied().unwrap_or("").trim();
 
                                 if skill_name.is_empty() {
-                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "Usage: /skill add <name> [content]".into() });
+                                    app.session_mut().messages.push(ChatMessage::plain("system", "Usage: /skill add <name> [content]"));
                                 } else {
                                     let content_to_save = if !inline_content.is_empty() {
                                         inline_content.to_string()
@@ -1054,10 +1355,7 @@ async fn handle_chat_key(
                                 "analytical" | "2" => "Analytical",
                                 "deep" | "ultra" | "3" => "Deep",
                                 other => {
-                                    app.session_mut().messages.push(ChatMessage {
-                                        role: "system".into(),
-                                        content: format!("Unknown mode '{}'. Choose: fast, analytical, deep", other),
-                                    });
+                                    app.session_mut().messages.push(ChatMessage::plain("system", format!("Unknown mode '{}'. Choose: fast, analytical, deep", other)));
                                     return Ok(());
                                 }
                             };
@@ -1089,10 +1387,7 @@ async fn handle_chat_key(
                     "/provider" => {
                         let current_provider = app.provider_name().to_string();
                         if arg.is_empty() {
-                            app.session_mut().messages.push(ChatMessage {
-                                role: "system".into(),
-                                content: format!("Current provider: {}. Usage: /provider openai|anthropic|ollama|9router", current_provider),
-                            });
+                            app.session_mut().messages.push(ChatMessage::plain("system", format!("Current provider: {}. Usage: /provider openai|anthropic|ollama|9router", current_provider)));
                         } else {
                             let new_p = match arg.to_lowercase().as_str() {
                                 "openai" => Provider::OpenAI { model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()) },
@@ -1100,7 +1395,7 @@ async fn handle_chat_key(
                                 "ollama" => Provider::Ollama { model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".into()) },
                                 "9router" | "router9" => Provider::Router9 { model: std::env::var("ROUTER9_MODEL").unwrap_or_else(|_| "ZA126_PRO".into()) },
                                 other => {
-                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Unknown provider: {}", other) });
+                                    app.session_mut().messages.push(ChatMessage::plain("system", format!("Unknown provider: {}", other)));
                                     return Ok(());
                                 }
                             };
@@ -1110,10 +1405,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage {
-                            role: "system".into(),
-                            content: "Available Commands:\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.1)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)".into(),
-                        });
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.2)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
@@ -1132,11 +1424,11 @@ async fn handle_chat_key(
                         app.is_thinking = false;
                         match res {
                             Ok(msg) => {
-                                app.session_mut().messages.push(ChatMessage { role: "system".into(), content: msg });
+                                app.session_mut().messages.push(ChatMessage::plain("system", msg));
                                 app.status_msg = "Context compressed ✓".into();
                             }
                             Err(e) => {
-                                app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Compression failed: {}", e) });
+                                app.session_mut().messages.push(ChatMessage::plain("system", format!("Compression failed: {}", e)));
                                 app.status_msg = "Compression failed".into();
                             }
                         }
@@ -1151,7 +1443,7 @@ async fn handle_chat_key(
                             "Context Telemetry:\n  Active Model: {}\n  Last Prompt Tokens: {}\n  Last Completion Tokens: {}\n  Total Tokens Used: {}\n  Context Window Budget: {} tokens (~{:.1}% used)",
                             app.model_name(), last_u.prompt_tokens, last_u.completion_tokens, tot_u.total_tokens, limit, pct
                         );
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: info });
+                        app.session_mut().messages.push(ChatMessage::plain("system", info));
                         return Ok(());
                     }
                     "/dev" | "/prd" | "/audit" | "/refact" | "/update" | "/fix" | "/bughunt" | "/test" | "/qa" => {
@@ -1179,63 +1471,21 @@ async fn handle_chat_key(
                             app.status_msg = format!("Loaded skill template /{} into input", skill_name);
                             return Ok(());
                         } else {
-                            // Prepend skill instructions to the prompt
+                            // Prepend skill instructions to the prompt and dispatch
+                            // through the non-blocking agent runtime.
                             let full_prompt = format!("[Skill Directive: {}]\n\n{}\n\nTask:\n{}", skill_name.to_uppercase(), skill_body, arg);
-                            app.session_mut().messages.push(ChatMessage { role: "user".into(), content: full_prompt.clone() });
+                            app.session_mut()
+                                .messages
+                                .push(ChatMessage::plain("user", full_prompt.clone()));
                             app.session_mut().scroll_offset = 0;
-                            app.is_thinking = true;
-                            app.status_msg = format!("Executing /{}...", skill_name);
-                            terminal.draw(|f| ui(f, app))?;
-
-                            app.session_mut().agent.add_user(&full_prompt);
-                            let mut current_prompt = full_prompt;
-
-                            for _ in 0..5 {
-                                let resp = app.session_mut().agent.call_llm(&current_prompt).await;
-                                match resp {
-                                    Ok(resp) => {
-                                        let tools = app.session().agent.parse_tool_calls(&resp);
-                                        app.session_mut().agent.add_assistant(&resp);
-
-                                        if tools.is_empty() {
-                                            app.session_mut().messages.push(ChatMessage { role: "assistant".into(), content: resp });
-                                            break;
-                                        }
-
-                                        app.session_mut().messages.push(ChatMessage { role: "assistant".into(), content: resp });
-                                        let mut results = Vec::new();
-                                        for call in &tools {
-                                            let hdr = format!("[tool:{}]", call.tool);
-                                            match app.session().agent.exec_tool(call) {
-                                                Ok(res) => {
-                                                    let short = if res.len() > 500 { format!("{}…", &res[..500]) } else { res.clone() };
-                                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("{} {}", hdr, short) });
-                                                    results.push(format!("Tool '{}' output:\n{}", call.tool, res));
-                                                }
-                                                Err(e) => {
-                                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("{} error: {}", hdr, e) });
-                                                    results.push(format!("Tool '{}' error: {}", call.tool, e));
-                                                }
-                                            }
-                                        }
-                                        current_prompt = format!("Observation/Tool Results:\n{}", results.join("\n\n"));
-                                        terminal.draw(|f| ui(f, app))?;
-                                    }
-                                    Err(e) => {
-                                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Error: {}", e) });
-                                        break;
-                                    }
-                                }
-                            }
-                            app.is_thinking = false;
-                            app.status_msg.clear();
+                            app.start_turn(full_prompt);
                             return Ok(());
                         }
                     }
                     "/exit" => { app.should_quit = true; return Ok(()); }
                     "/rename" => {
                         if arg.is_empty() {
-                            app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "Usage: /rename <name>".into() });
+                            app.session_mut().messages.push(ChatMessage::plain("system", "Usage: /rename <name>"));
                         } else {
                             app.session_mut().name = arg.to_string();
                             app.status_msg = format!("Renamed to: {}", arg);
@@ -1249,7 +1499,7 @@ async fn handle_chat_key(
                             "Status:\n  Provider: {}\n  Model: {}\n  Thinking Mode: {}\n  Session Tokens: {}\n  Active Sessions: {}\n  CWD: {}\n  Config: {}",
                             app.provider_name(), app.model_name(), app.thinking_mode(), app.session().total_tokens, app.sessions.len(), cwd, cfg_path
                         );
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: info });
+                        app.session_mut().messages.push(ChatMessage::plain("system", info));
                         return Ok(());
                     }
                     "/sessions" => {
@@ -1258,7 +1508,7 @@ async fn handle_chat_key(
                             let active = if i == app.active_session { " (active)" } else { "" };
                             list.push_str(&format!("  {}. {}{} [{} messages]\n", i + 1, s.name, active, s.messages.len()));
                         }
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: list.trim().to_string() });
+                        app.session_mut().messages.push(ChatMessage::plain("system", list.trim().to_string()));
                         return Ok(());
                     }
                     "/export" => {
@@ -1280,7 +1530,7 @@ async fn handle_chat_key(
                     }
                     "/tokens" => {
                         let info = format!("Token Usage for session '{}': total ~{} tokens", app.session().name, app.session().total_tokens);
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: info });
+                        app.session_mut().messages.push(ChatMessage::plain("system", info));
                         return Ok(());
                     }
                     "/reset" => {
@@ -1291,7 +1541,7 @@ async fn handle_chat_key(
                     "/cd" => {
                         if arg.is_empty() {
                             let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
-                            app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("CWD: {}", cwd) });
+                            app.session_mut().messages.push(ChatMessage::plain("system", format!("CWD: {}", cwd)));
                         } else {
                             match std::env::set_current_dir(arg) {
                                 Ok(_) => {
@@ -1299,7 +1549,7 @@ async fn handle_chat_key(
                                     app.status_msg = format!("Changed CWD to {}", cwd);
                                 }
                                 Err(e) => {
-                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("cd error: {}", e) });
+                                    app.session_mut().messages.push(ChatMessage::plain("system", format!("cd error: {}", e)));
                                 }
                             }
                         }
@@ -1307,29 +1557,26 @@ async fn handle_chat_key(
                     }
                     "/pwd" => {
                         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "unknown".into());
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: cwd });
+                        app.session_mut().messages.push(ChatMessage::plain("system", cwd));
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: "CACode v1.0.1 (Sovereign Rust Agent)".into() });
+                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.2 (Sovereign Rust Agent)"));
                         return Ok(());
                     }
                     s => {
-                        app.session_mut().messages.push(ChatMessage {
-                            role: "system".into(),
-                            content: format!("Unknown command: {}. Type /help or / for suggestions.", s),
-                        });
+                        app.session_mut().messages.push(ChatMessage::plain("system", format!("Unknown command: {}. Type /help or / for suggestions.", s),
+                       ));
                         return Ok(());
                     }
                 }
             }
 
-            // Chat dispatch
-            app.session_mut().messages.push(ChatMessage { role: "user".into(), content: input.clone() });
+            // Chat dispatch — spawn a non-blocking background ReAct turn.
+            app.session_mut()
+                .messages
+                .push(ChatMessage::plain("user", input.clone()));
             app.session_mut().scroll_offset = 0;
-            app.is_thinking = true;
-            app.status_msg = "Thinking…".into();
-            terminal.draw(|f| ui(f, app))?;
 
             // Append thinking mode hint if active
             let prompt_to_send = match app.config.thinking_mode.as_str() {
@@ -1338,48 +1585,7 @@ async fn handle_chat_key(
                 _ => input.clone(),
             };
 
-            app.session_mut().agent.add_user(&prompt_to_send);
-            let mut current_prompt = prompt_to_send;
-
-            for _ in 0..5 {
-                let resp = app.session_mut().agent.call_llm(&current_prompt).await;
-                match resp {
-                    Ok(resp) => {
-                        let tools = app.session().agent.parse_tool_calls(&resp);
-                        app.session_mut().agent.add_assistant(&resp);
-
-                        if tools.is_empty() {
-                            app.session_mut().messages.push(ChatMessage { role: "assistant".into(), content: resp });
-                            break;
-                        }
-
-                        app.session_mut().messages.push(ChatMessage { role: "assistant".into(), content: resp });
-                        let mut results = Vec::new();
-                        for call in &tools {
-                            let hdr = format!("[tool:{}]", call.tool);
-                            match app.session().agent.exec_tool(call) {
-                                Ok(res) => {
-                                    let short = if res.len() > 500 { format!("{}…", &res[..500]) } else { res.clone() };
-                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("{} {}", hdr, short) });
-                                    results.push(format!("Tool '{}' output:\n{}", call.tool, res));
-                                }
-                                Err(e) => {
-                                    app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("{} error: {}", hdr, e) });
-                                    results.push(format!("Tool '{}' error: {}", call.tool, e));
-                                }
-                            }
-                        }
-                        current_prompt = format!("Observation/Tool Results:\n{}", results.join("\n\n"));
-                        terminal.draw(|f| ui(f, app))?;
-                    }
-                    Err(e) => {
-                        app.session_mut().messages.push(ChatMessage { role: "system".into(), content: format!("Error: {}", e) });
-                        break;
-                    }
-                }
-            }
-            app.is_thinking = false;
-            app.status_msg.clear();
+            app.start_turn(prompt_to_send);
         }
         (_, KeyCode::Backspace) => {
             let pos = app.session().cursor_pos;
@@ -1495,9 +1701,9 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent) {
 
 fn ui(f: &mut Frame, app: &App) {
     let size = f.area();
-    // 100% full black background
+    // Near-black background for the minimalist single-column layout.
     f.render_widget(Clear, size);
-    let bg = Paragraph::new("").style(Style::default().bg(BG_BLACK));
+    let bg = Paragraph::new("").style(Style::default().bg(BG_DARK));
     f.render_widget(bg, size);
 
     let outer = Layout::default()
@@ -1508,78 +1714,86 @@ fn ui(f: &mut Frame, app: &App) {
     let box_area = outer[0];
     let status_area = outer[1];
 
-    let input_height: u16 = 1;
-    let divider_y = box_area.height.saturating_sub(2 + input_height);
+    // Minimalist chat page: content + centered input pill.
+    // Pill is 3 rows tall (rounded border) when on the chat page, 1 row on
+    // secondary pages where it doubles as the hint line.
+    let input_height: u16 = if app.active_page == 0 { 3 } else { 1 };
+    let gap: u16 = 1;
+    let reserved = input_height + gap;
+    let content_h = box_area.height.saturating_sub(reserved);
 
-    let blayout = BorderlessLayout::new().with_divider(divider_y);
-    let inner = blayout.inner(box_area);
-    f.render_widget(blayout, box_area);
+    let (cursor, pill_area) = if app.active_page == 0 {
+        // Single-column minimalist layout:
+        //   top pixel-block logo (only when chat is empty)
+        //   chat messages / welcome
+        //   centered input pill with "Ask anything..." placeholder
+        let session = app.session();
+        let top_logo: u16 = if session.show_welcome && session.messages.is_empty() {
+            1 // logo + tagline (drawn inside content)
+        } else {
+            0
+        };
 
-    let mut content_y = inner.y;
+        let content_area = Rect {
+            x: box_area.x,
+            y: box_area.y + top_logo,
+            width: box_area.width,
+            height: content_h.saturating_sub(top_logo),
+        };
+        draw_chat_content(f, app, content_area);
 
-    // Only show page tabs if NOT on chat page (chat page is 100% clean borderless)
-    if app.active_page != 0 {
+        // Centered input pill
+        let pill_w = 80u16.min(box_area.width.saturating_sub(2));
+        let pill = Rect {
+            x: box_area.x + (box_area.width.saturating_sub(pill_w)) / 2,
+            y: box_area.y + box_area.height.saturating_sub(input_height + gap),
+            width: pill_w,
+            height: input_height,
+        };
+        let cur = draw_input(f, app, pill);
+        (cur, pill)
+    } else {
+        // Secondary pages keep their own tab bar + content; pill is a hint row.
+        let content_y = box_area.y;
         let page_tab_area = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
+            x: box_area.x,
+            y: content_y,
+            width: box_area.width,
             height: 1,
         };
         draw_page_tabs(f, app, page_tab_area);
-        content_y = inner.y + 2;
-        let sep_area = Rect {
-            x: inner.x,
-            y: inner.y + 1,
-            width: inner.width,
+        let content_area = Rect {
+            x: box_area.x,
+            y: content_y + 2,
+            width: box_area.width,
+            height: content_h.saturating_sub(2),
+        };
+        match app.active_page {
+            1 => draw_monitor_content(f, app, content_area),
+            2 => draw_report_content(f, app, content_area),
+            3 => draw_skills_content(f, app, content_area),
+            4 => draw_settings_content(f, app, content_area),
+            _ => {}
+        }
+        let pill = Rect {
+            x: box_area.x,
+            y: box_area.y + box_area.height.saturating_sub(1),
+            width: box_area.width,
             height: 1,
         };
-        let sep_str: String = "─".repeat(inner.width as usize);
-        f.render_widget(
-            Paragraph::new(Span::styled(sep_str, Style::default().fg(DIM))),
-            sep_area,
-        );
-    } else if app.sessions.len() > 1 {
-        // In chat, only show session tabs if there are 2 or more sessions
-        let session_tab_area = Rect {
-            x: inner.x,
-            y: content_y,
-            width: inner.width,
-            height: 1,
-        };
-        draw_session_tabs(f, app, session_tab_area);
-        content_y += 1;
-    }
-
-    let divider_abs_y = box_area.y + divider_y;
-    let content_area = Rect {
-        x: inner.x,
-        y: content_y,
-        width: inner.width,
-        height: divider_abs_y.saturating_sub(content_y),
+        let cur = draw_input(f, app, pill);
+        (cur, pill)
     };
 
-    let input_area = Rect {
-        x: inner.x,
-        y: divider_abs_y + 1,
-        width: inner.width,
-        height: input_height,
-    };
-
-    match app.active_page {
-        0 => draw_chat_content(f, app, content_area),
-        1 => draw_monitor_content(f, app, content_area),
-        2 => draw_report_content(f, app, content_area),
-        3 => draw_skills_content(f, app, content_area),
-        4 => draw_settings_content(f, app, content_area),
-        _ => {}
-    }
-
-    draw_input(f, app, input_area);
     draw_status(f, app, status_area);
+
+    if let Some((cx, cy)) = cursor {
+        f.set_cursor_position((cx, cy));
+    }
 
     // Draw autocomplete popup if user is typing a slash command
     if app.active_page == 0 && app.modal_picker == ModalPicker::Off {
-        draw_autocomplete_popup(f, app, input_area);
+        draw_autocomplete_popup(f, app, pill_area);
     }
 
     // Draw modal picker if active (Models or Thinking Mode)
@@ -1605,6 +1819,7 @@ fn draw_page_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
 }
 
+#[allow(dead_code)]
 fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
     spans.push(Span::styled(" ", Style::default()));
@@ -1626,41 +1841,60 @@ fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
 fn draw_chat_content(f: &mut Frame, app: &App, area: Rect) {
     let session = app.session();
     if session.show_welcome && session.messages.is_empty() {
-        draw_welcome(f, area);
+        draw_welcome(f, app, area);
     } else {
         draw_messages(f, session, area);
     }
 }
 
-fn draw_welcome(f: &mut Frame, area: Rect) {
+fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
+    let session = app.session();
+    if !(session.show_welcome && session.messages.is_empty()) {
+        // Non-empty conversation: compact logo + version header at the top.
+        let header = Line::from(vec![
+            Span::styled(
+                "CACode",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " v1.0.2 · sovereign Rust agent",
+                Style::default().fg(MUTED),
+            ),
+        ]);
+        f.render_widget(
+            Paragraph::new(header).style(Style::default().bg(BG_DARK)),
+            Rect {
+                height: 1,
+                ..area
+            },
+        );
+        return;
+    }
+
+    // Fresh conversation: centered pixel-block logo + minimalist hints.
     let mut lines: Vec<Line> = Vec::new();
-    let logo_height = LOGO.len() as u16 + WELCOME_LINES.len() as u16;
-    let pad = area.height.saturating_sub(logo_height) / 2;
-    for _ in 0..pad.min(4) {
+    let pad = area.height.saturating_sub(8) / 2;
+    for _ in 0..pad.min(2) {
         lines.push(Line::from(""));
     }
 
-    for row in LOGO {
+    for row in WELCOME_LINES {
         lines.push(Line::from(Span::styled(
             *row,
-            Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+            Style::default().fg(GRAY),
         )));
     }
 
-    for row in WELCOME_LINES {
-        let style = if row.starts_with("  •") {
-            Style::default().fg(GRAY)
-        } else if row.contains("Sovereign") {
-            Style::default().fg(BRAND)
-        } else if row.contains('/') {
-            Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(DIM)
-        };
-        lines.push(Line::from(Span::styled(*row, style)));
-    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Type a message to chat, or press / for command autocomplete",
+        Style::default().fg(DIM),
+    )));
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).style(Style::default().bg(BG_BLACK));
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(BG_DARK));
     f.render_widget(p, area);
 }
 
@@ -1681,6 +1915,21 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                     lines.push(Line::from(Span::styled(
                         line,
                         Style::default().fg(GRAY),
+                    )));
+                }
+                // Subtle per-turn token telemetry footer: e.g. [⚡ 1,240 tokens (980 in / 260 out) • 1.2s]
+                if let Some(ref u) = msg.tokens {
+                    let total_str = fmt_num(u.total_tokens);
+                    let in_str = fmt_num(u.prompt_tokens);
+                    let out_str = fmt_num(u.completion_tokens);
+                    let sec = msg.duration_ms.unwrap_or(0) as f64 / 1000.0;
+                    let tag = format!(
+                        "[⚡ {} tokens ({} in / {} out) • {:.1}s]",
+                        total_str, in_str, out_str, sec
+                    );
+                    lines.push(Line::from(Span::styled(
+                        tag,
+                        Style::default().fg(DIM).add_modifier(Modifier::DIM),
                     )));
                 }
                 lines.push(Line::from(""));
@@ -2175,7 +2424,7 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(help, help_area);
 }
 
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
     if app.active_page != 0 {
         let hint = match app.active_page {
             1 => "↑↓ scroll  r refresh  Esc back to chat",
@@ -2185,94 +2434,157 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
             _ => "",
         };
         let line = Line::from(Span::styled(hint, Style::default().fg(DIM)));
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(BG_BLACK)), area);
-        return;
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(BG_BLACK)),
+            area,
+        );
+        return None;
     }
 
     let session = app.session();
-    if app.is_thinking {
+    let text_col = if app.is_thinking { ACCENT_DIM } else { TEXT_SOFT };
+
+    if app.is_thinking && !session.input.is_empty() {
+        // Mid-turn steering: user is actively typing a steering instruction.
+        let steer_label = " ⚡ steer ";
+        let line = Line::from(vec![
+            Span::styled(
+                steer_label,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "> ",
+                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&*session.input, Style::default().fg(TEXT_SOFT)),
+        ]);
+        let steer_block = Block::default()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM))
+            .style(Style::default().bg(BG_PILL));
+        f.render_widget(steer_block, area);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(BG_PILL)),
+            Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
+        );
+        let cx = area.x + 1 + steer_label.len() as u16 + 2 + session.cursor_pos as u16;
+        Some((cx, area.y))
+    } else if app.is_thinking {
         let (frame, emot) = THINKING_FRAMES[app.spinner_frame % THINKING_FRAMES.len()];
         let line = Line::from(vec![
-            Span::styled("> ", Style::default().fg(BRAND)),
-            Span::styled(format!("{} ", frame), Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-            Span::styled(emot, Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
-            Span::styled("  …", Style::default().fg(DIM)),
+            Span::styled(
+                "> ",
+                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", frame),
+                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                emot,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+            ),
+            Span::styled(
+                "  type to steer · Ctrl+C to cancel",
+                Style::default().fg(MUTED),
+            ),
         ]);
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(BG_BLACK)), area);
+        let thinking_block = Block::default()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(BG_PILL));
+        f.render_widget(thinking_block, area);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(BG_PILL)),
+            Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
+        );
+        None
     } else {
+        // Idle input pill with placeholder when empty.
+        let show_placeholder = session.input.is_empty();
+        let content_style = if show_placeholder {
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(text_col)
+        };
         let line = Line::from(vec![
-            Span::styled("> ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-            Span::styled(&*session.input, Style::default().fg(TEXT)),
+            Span::styled(
+                "> ",
+                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
+            ),
+            if show_placeholder {
+                Span::styled("Ask anything…", content_style)
+            } else {
+                Span::styled(&*session.input, content_style)
+            },
         ]);
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(BG_BLACK)), area);
+        let input_block = Block::default()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM))
+            .style(Style::default().bg(BG_PILL));
+        f.render_widget(input_block, area);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(BG_PILL)),
+            Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
+        );
 
         let cx = area.x + 2 + session.cursor_pos as u16;
-        let cy = area.y;
-        if cx < area.x + area.width {
-            f.set_cursor_position((cx, cy));
-        }
+        Some((cx, area.y))
     }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let provider = app.provider_name();
     let model = app.model_name();
-    let thinking = app.thinking_mode();
-    let extra = if app.status_msg.is_empty() {
-        String::new()
+
+    // Left side: status indicator (Build/Idle), active model name, provider name.
+    let (status_dot, status_label, status_color) = if app.is_thinking {
+        ("●", "Build", Color::Yellow)
     } else {
-        format!("  {}", app.status_msg)
+        ("●", "Idle", Color::Green)
     };
 
-    let mut spans = vec![
-        Span::styled(" CACode v1.0.1 ", Style::default().fg(Color::Black).bg(BRAND).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {} ", provider), Style::default().fg(BRAND)),
-        Span::styled("│ ", Style::default().fg(DIM)),
-        Span::styled(format!("{} ", model), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled("│ ", Style::default().fg(DIM)),
-        Span::styled(format!("[{}] ", thinking), Style::default().fg(Color::Yellow)),
-        Span::styled("│ ", Style::default().fg(DIM)),
+    let mut left_spans = vec![
+        Span::styled(format!(" {} ", status_dot), Style::default().fg(status_color)),
+        Span::styled(format!("{} ", status_label), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+        Span::styled("· ", Style::default().fg(MUTED)),
+        Span::styled(format!("{} ", model), Style::default().fg(TEXT_SOFT).add_modifier(Modifier::BOLD)),
+        Span::styled("· ", Style::default().fg(MUTED)),
+        Span::styled(format!("{} ", provider), Style::default().fg(ACCENT_DIM)),
     ];
 
-    if app.active_page == 0 {
-        let tot = &app.session().agent.total_usage;
-        let limit = app.session().agent.context_window_limit;
-        let current_ctx = tot.total_tokens;
-        let pct = if limit > 0 {
-            (current_ctx as f64 / limit as f64) * 100.0
-        } else {
-            0.0
-        };
-        let ctx_style = if pct > 80.0 {
-            Style::default().fg(Color::Red)
-        } else if pct > 50.0 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(DIM)
-        };
-
-        spans.push(Span::styled(format!("ctx: {}k/{}k ({:.1}%) ", current_ctx / 1000, limit / 1000, pct), ctx_style));
-        spans.push(Span::styled("│ ", Style::default().fg(DIM)));
-        spans.push(Span::styled(
-            format!("🔗 {} calls  ", tot.total_tokens / 256),
-            Style::default().fg(DIM),
+    if app.sessions.len() > 1 {
+        left_spans.push(Span::styled("· ", Style::default().fg(MUTED)));
+        left_spans.push(Span::styled(
+            format!("agent {}/{} ", app.active_session + 1, app.sessions.len()),
+            Style::default().fg(MUTED),
         ));
-        spans.push(Span::styled("│ ", Style::default().fg(DIM)));
-        if app.sessions.len() > 1 {
-            spans.push(Span::styled(
-                format!("{}/{} sessions │ ", app.active_session + 1, app.sessions.len()),
-                Style::default().fg(DIM),
-            ));
-        }
-    } else {
-        let page_name = PAGE_NAMES.get(app.active_page).unwrap_or(&"?");
-        spans.push(Span::styled(format!("[{}] │ ", page_name), Style::default().fg(BRAND)));
     }
 
-    spans.push(Span::styled("Type / for commands  Esc quit", Style::default().fg(DIM)));
-    spans.push(Span::styled(extra, Style::default().fg(Color::Green)));
+    if !app.status_msg.is_empty() {
+        left_spans.push(Span::styled("· ", Style::default().fg(MUTED)));
+        left_spans.push(Span::styled(format!("{} ", app.status_msg), Style::default().fg(ACCENT_DIM)));
+    }
 
-    let line = Line::from(spans);
-    let p = Paragraph::new(line).style(Style::default().bg(BG_BLACK));
+    // Right side: bottom-right corner hints: 'tab switch agent' and 'ctrl+p commands'
+    let right_spans = vec![
+        Span::styled("tab", Style::default().fg(ACCENT_DIM)),
+        Span::styled(" switch agent  ·  ", Style::default().fg(MUTED)),
+        Span::styled("ctrl+p", Style::default().fg(ACCENT_DIM)),
+        Span::styled(" commands ", Style::default().fg(MUTED)),
+    ];
+
+    let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let right_len: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad_len = (area.width as usize).saturating_sub(left_len + right_len);
+
+    let mut all_spans = left_spans;
+    if pad_len > 0 {
+        all_spans.push(Span::raw(" ".repeat(pad_len)));
+    }
+    all_spans.extend(right_spans);
+
+    let line = Line::from(all_spans);
+    let p = Paragraph::new(line).style(Style::default().bg(BG_DARK));
     f.render_widget(p, area);
 }

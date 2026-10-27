@@ -5,8 +5,35 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::process::Command;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 use regex::Regex;
+
+pub const CA_VERSION: &str = "1.0.3";
+
+pub type AgentEvents = mpsc::UnboundedSender<AgentEvent>;
+
+/// Events streamed from the background ReAct worker back to the TUI,
+/// so the event loop never blocks on LLM calls or tool execution.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Thinking(String),
+    AssistantChunk(String),
+    ToolStart { tool: String, args: String },
+    ToolOutput { tool: String, output: String, is_error: bool },
+    TurnFinished {
+        usage: TokenUsage,
+        total_calls: usize,
+        duration_ms: u64,
+        history: Vec<Message>,
+        total_usage: TokenUsage,
+        last_usage: TokenUsage,
+    },
+    Error(String),
+    Cancelled,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
@@ -27,8 +54,15 @@ struct OpenAIResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,14 +76,17 @@ struct AnthropicContent {
 #[derive(Debug, Deserialize)]
 struct OllamaResponse {
     message: Message,
+    prompt_eval_count: Option<i64>,
+    eval_count: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolCall {
     pub tool: String,
     pub args: serde_json::Value,
 }
 
+#[derive(Clone, Debug)]
 pub enum Provider {
     OpenAI { model: String },
     Anthropic { model: String },
@@ -57,13 +94,14 @@ pub enum Provider {
     Router9 { model: String },
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
 }
 
+#[derive(Clone)]
 pub struct ReActAgent {
     client: Client,
     pub history: Vec<Message>,
@@ -74,6 +112,7 @@ pub struct ReActAgent {
     pub context_window_limit: u64,
     pub last_usage: TokenUsage,
     pub total_usage: TokenUsage,
+    pub total_calls: usize,
 }
 
 impl Default for ReActAgent {
@@ -112,6 +151,7 @@ impl ReActAgent {
             context_window_limit: 200_000,
             last_usage: TokenUsage::default(),
             total_usage: TokenUsage::default(),
+            total_calls: 0,
         }
     }
 
@@ -319,6 +359,7 @@ impl ReActAgent {
     }
 
     pub async fn call_llm(&mut self, user_input: &str) -> Result<String> {
+        self.total_calls += 1;
         let mut msgs = vec![self.system_prompt()];
         msgs.extend(self.history.clone());
         msgs.push(Message { role: "user".into(), content: user_input.into() });
@@ -380,10 +421,21 @@ impl ReActAgent {
                     .json::<AnthropicResponse>()
                     .await?;
                 let txt = resp.content.into_iter().filter_map(|c| c.text).collect::<Vec<_>>().join("\n");
-                let usage = TokenUsage {
-                    prompt_tokens: 100,
-                    completion_tokens: (txt.len() / 4).max(1) as i64,
-                    total_tokens: 100 + (txt.len() / 4).max(1) as i64,
+                let usage = if let Some(u) = resp.usage {
+                    let prompt = u.input_tokens.unwrap_or(0);
+                    let comp = u.output_tokens.unwrap_or(0);
+                    TokenUsage {
+                        prompt_tokens: prompt,
+                        completion_tokens: comp,
+                        total_tokens: prompt + comp,
+                    }
+                } else {
+                    let comp = (txt.len() / 4).max(1) as i64;
+                    TokenUsage {
+                        prompt_tokens: 50,
+                        completion_tokens: comp,
+                        total_tokens: 50 + comp,
+                    }
                 };
                 (txt, usage)
             }
@@ -402,10 +454,19 @@ impl ReActAgent {
                     .json::<OllamaResponse>()
                     .await?;
                 let txt = resp.message.content;
-                let usage = TokenUsage {
-                    prompt_tokens: 100,
-                    completion_tokens: (txt.len() / 4).max(1) as i64,
-                    total_tokens: 100 + (txt.len() / 4).max(1) as i64,
+                let usage = if let (Some(p), Some(c)) = (resp.prompt_eval_count, resp.eval_count) {
+                    TokenUsage {
+                        prompt_tokens: p,
+                        completion_tokens: c,
+                        total_tokens: p + c,
+                    }
+                } else {
+                    let comp = (txt.len() / 4).max(1) as i64;
+                    TokenUsage {
+                        prompt_tokens: 50,
+                        completion_tokens: comp,
+                        total_tokens: 50 + comp,
+                    }
                 };
                 (txt, usage)
             }
@@ -597,6 +658,143 @@ impl ReActAgent {
         }
 
         Ok(())
+    }
+
+    /// Non-blocking ReAct turn worker. Intended to be spawned on the Tokio
+    /// runtime so that the synchronous TUI event loop can keep rendering and
+    /// ingesting keys. Streams events through `events`, accepts mid-turn
+    /// steering instructions through `steering_rx`, and is aborted
+    /// immediately by `cancel`.
+    pub async fn run_turn(
+        &mut self,
+        prompt: String,
+        events: AgentEvents,
+        mut steering_rx: mpsc::UnboundedReceiver<String>,
+        cancel: CancellationToken,
+    ) {
+        let started = Instant::now();
+        self.add_user(&prompt);
+        let mut current_prompt = prompt;
+
+        for step in 0..5 {
+            if cancel.is_cancelled() {
+                let _ = events.send(AgentEvent::Cancelled);
+                return;
+            }
+
+            // Mid-run steering: fold any pending instruction into this step.
+            while let Ok(steer) = steering_rx.try_recv() {
+                self.add_user(&format!("[Steering / Mid-turn] {}", steer));
+                current_prompt = format!(
+                    "{}\n\n[Steering / Mid-turn] Incorporate this user instruction into your next reasoning step:\n{}",
+                    current_prompt, steer
+                );
+            }
+
+            let _ = events.send(AgentEvent::Thinking(format!("ReAct step {} / 5", step + 1)));
+
+            let call = async {
+                self.call_llm(&current_prompt).await
+            };
+            let response = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = events.send(AgentEvent::Cancelled);
+                    return;
+                }
+                res = call => res,
+            };
+
+            match response {
+                Ok(resp) => {
+                    let tool_calls = self.parse_tool_calls(&resp);
+
+                    if tool_calls.is_empty() {
+                        self.add_assistant(&resp);
+                        let _ = events.send(AgentEvent::AssistantChunk(resp));
+                        let _ = events.send(AgentEvent::TurnFinished {
+                            usage: self.last_usage.clone(),
+                            total_calls: self.total_calls,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            history: self.history.clone(),
+                            total_usage: self.total_usage.clone(),
+                            last_usage: self.last_usage.clone(),
+                        });
+                        return;
+                    }
+
+                    self.add_assistant(&resp);
+                    let _ = events.send(AgentEvent::AssistantChunk(resp));
+
+                    let mut tool_results = Vec::new();
+                    for call in &tool_calls {
+                        let args_str = serde_json::to_string(&call.args).unwrap_or_default();
+                        let _ = events.send(AgentEvent::ToolStart {
+                            tool: call.tool.clone(),
+                            args: args_str,
+                        });
+
+                        let tool = call.clone();
+                        let tool_cancel = cancel.clone();
+                        let tool_name = tool.tool.clone();
+                        let exec_result: Result<String> = tokio::select! {
+                            _ = tool_cancel.cancelled() => Err(anyhow!("Cancelled by user")),
+                            res = tokio::task::spawn_blocking(move || {
+                                // exec_tool is a sync fn; call it on the blocking pool.
+                                ReActAgent::exec_tool_static(&tool)
+                            }) => match res {
+                                Ok(inner) => inner,
+                                Err(join_err) => Err(anyhow!("Join error: {}", join_err)),
+                            },
+                        };
+
+                        match exec_result {
+                            Ok(out) => {
+                                let _ = events.send(AgentEvent::ToolOutput {
+                                    tool: tool_name.clone(),
+                                    output: out.clone(),
+                                    is_error: false,
+                                });
+                                tool_results.push(format!("Tool '{}' output:\n{}", tool_name, out));
+                            }
+                            Err(e) => {
+                                let _ = events.send(AgentEvent::ToolOutput {
+                                    tool: tool_name.clone(),
+                                    output: e.to_string(),
+                                    is_error: true,
+                                });
+                                tool_results.push(format!("Tool '{}' error: {}", tool_name, e));
+                            }
+                        }
+                    }
+
+                    current_prompt = format!("Observation/Tool Results:\n{}", tool_results.join("\n\n"));
+                }
+                Err(e) => {
+                    let _ = events.send(AgentEvent::Error(e.to_string()));
+                    return;
+                }
+            }
+        }
+
+        // Exhausted step budget: emit whatever we have.
+        let _ = events.send(AgentEvent::TurnFinished {
+            usage: self.last_usage.clone(),
+            total_calls: self.total_calls,
+            duration_ms: started.elapsed().as_millis() as u64,
+            history: self.history.clone(),
+            total_usage: self.total_usage.clone(),
+            last_usage: self.last_usage.clone(),
+        });
+    }
+
+    /// `exec_tool` runs on the blocking pool; a small static shim lets the
+    /// spawned task call it without needing a live `&self`.
+    fn exec_tool_static(call: &ToolCall) -> Result<String> {
+        let agent = Self {
+            client: Client::new(),
+            ..Default::default()
+        };
+        agent.exec_tool(call)
     }
 }
 

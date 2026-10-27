@@ -1,6 +1,6 @@
 [package]
 name = "cacode-core"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "CACode core library — commands logic, types, ReAct agent, monitor, report"
 authors = ["Cecep Saeful Azhar Hidayat, ST"]
@@ -19,6 +19,7 @@ axum = "0.7"
 hyper = "1"
 dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-util = "0.7"
 reedline = "0.51"
 toml = "0.8"
