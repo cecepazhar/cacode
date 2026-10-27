@@ -39,7 +39,6 @@ const ACCENT_DIM: Color = Color::Rgb(96, 165, 250); // brighter blue/cyan accent
 const TEXT_SOFT: Color = Color::Rgb(226, 232, 240); // soft lavender/white
 const MUTED: Color = Color::Rgb(100, 116, 139); // muted slate
 
-#[allow(dead_code)]
 const LOGO: &[&str] = &[
     r"  ██████╗ █████╗  ██████╗ ██████╗ ██████╗ ███████╗",
     r" ██╔════╝██╔══██╗██╔════╝██╔═══██╗██╔══██╗██╔════╝",
@@ -51,7 +50,7 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v1.0.3",
+    "  Sovereign Rust Development Agent  v1.0.4",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK & Free: Antigravity Zen, Ollama, 9Router, OpenAI, Anthropic",
@@ -91,7 +90,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.3)"),
+    ("/version", "Show CACode version (v1.0.4)"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -1513,7 +1512,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.3)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.4)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
@@ -1669,7 +1668,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.3 (Sovereign Rust Agent)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.4 (Sovereign Rust Agent)"));
                         return Ok(());
                     }
                     s => {
@@ -1965,7 +1964,7 @@ fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " v1.0.3 · sovereign Rust agent",
+                " v1.0.4 · sovereign Rust agent",
                 Style::default().fg(MUTED),
             ),
         ]);
@@ -1979,25 +1978,33 @@ fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Fresh conversation: centered pixel-block logo + minimalist hints.
+    // Fresh conversation: centered pixel-block logo + welcome details.
     let mut lines: Vec<Line> = Vec::new();
-    let pad = area.height.saturating_sub(8) / 2;
-    for _ in 0..pad.min(2) {
+    let total_content_height = (LOGO.len() + WELCOME_LINES.len()) as u16;
+    let pad = area.height.saturating_sub(total_content_height) / 2;
+    for _ in 0..pad.min(3) {
         lines.push(Line::from(""));
     }
 
-    for row in WELCOME_LINES {
+    for row in LOGO {
         lines.push(Line::from(Span::styled(
             *row,
-            Style::default().fg(GRAY),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Type a message to chat, or press / for command autocomplete",
-        Style::default().fg(DIM),
-    )));
+    for row in WELCOME_LINES {
+        let style = if row.starts_with("  •") {
+            Style::default().fg(GRAY)
+        } else if row.contains("Sovereign") {
+            Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD)
+        } else if row.contains('/') {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        lines.push(Line::from(Span::styled(*row, style)));
+    }
 
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
