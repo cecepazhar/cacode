@@ -50,7 +50,7 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v1.0.5",
+    "  Sovereign Rust Development Agent  v1.0.6",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK & Free: Antigravity Zen, Ollama, 9Router, OpenAI, Anthropic",
@@ -85,7 +85,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.5)"),
+    ("/version", "Show CACode version (v1.0.6)"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -97,17 +97,6 @@ const THINKING_MODES: &[(&str, &str)] = &[
     ("Fast", "⚡ Standard direct execution — lowest latency"),
     ("Analytical", "🔍 Multi-step analytical reasoning & verification"),
     ("Deep", "🧠 Deep cognitive reasoning & edge-case proofs"),
-];
-
-const THINKING_FRAMES: &[(&str, &str)] = &[
-    ("⠋", "( •‿• ) [CA] reasoning..."),
-    ("⠙", "( ⚆_⚆ ) [CA] inspecting..."),
-    ("⠹", "( ◉_◉ ) [CA] analyzing..."),
-    ("⠸", "( ◕‿◕ ) [CA] synthesizing..."),
-    ("⠼", "( ˘ᴗ˘ ) [CA] optimizing..."),
-    ("⠴", "( ◉‿◉ ) [CA] formulating..."),
-    ("⠦", "( •‿• ) [CA] verifying..."),
-    ("⠧", "( ⚆_⚆ ) [CA] concluding..."),
 ];
 
 #[allow(dead_code)]
@@ -805,6 +794,26 @@ impl App {
         }
     }
 
+    fn switch_page(&mut self, target: usize) {
+        self.active_page = target % 5;
+        if self.active_page == 1 || self.active_page == 2 {
+            self.refresh_usage_data();
+        }
+        if self.active_page == 3 {
+            self.refresh_skills();
+        }
+    }
+
+    fn next_page(&mut self) {
+        let next = (self.active_page + 1) % 5;
+        self.switch_page(next);
+    }
+
+    fn prev_page(&mut self) {
+        let prev = (self.active_page + 4) % 5;
+        self.switch_page(prev);
+    }
+
     fn db_path() -> Option<PathBuf> {
         dirs::home_dir().map(|h| h.join(".cacode").join("usage.db"))
     }
@@ -1231,7 +1240,7 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
 
     // Esc in any secondary page returns straight to Chat
     if app.active_page != 0 && key.code == KeyCode::Esc && !app.settings.editing {
-        app.active_page = 0;
+        app.switch_page(0);
         return true;
     }
 
@@ -1240,23 +1249,30 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('1')) | (_, KeyCode::F(1)) => { app.active_page = 0; true }
-        (KeyModifiers::CONTROL, KeyCode::Char('2')) | (_, KeyCode::F(2)) => { app.active_page = 1; app.refresh_usage_data(); true }
-        (KeyModifiers::CONTROL, KeyCode::Char('3')) | (_, KeyCode::F(3)) => { app.active_page = 2; app.refresh_usage_data(); true }
-        (KeyModifiers::CONTROL, KeyCode::Char('4')) | (_, KeyCode::F(4)) => { app.active_page = 3; app.refresh_skills(); true }
-        (KeyModifiers::CONTROL, KeyCode::Char('5')) | (_, KeyCode::F(5)) => { app.active_page = 4; true }
-        (KeyModifiers::SHIFT, KeyCode::Tab) | (_, KeyCode::F(6)) => {
-            app.active_page = (app.active_page + 4) % 5;
-            if app.active_page == 1 || app.active_page == 2 { app.refresh_usage_data(); }
-            if app.active_page == 3 { app.refresh_skills(); }
+        (KeyModifiers::CONTROL, KeyCode::Char('1')) | (_, KeyCode::F(1)) => { app.switch_page(0); true }
+        (KeyModifiers::CONTROL, KeyCode::Char('2')) | (_, KeyCode::F(2)) => { app.switch_page(1); true }
+        (KeyModifiers::CONTROL, KeyCode::Char('3')) | (_, KeyCode::F(3)) => { app.switch_page(2); true }
+        (KeyModifiers::CONTROL, KeyCode::Char('4')) | (_, KeyCode::F(4)) => { app.switch_page(3); true }
+        (KeyModifiers::CONTROL, KeyCode::Char('5')) | (_, KeyCode::F(5)) => { app.switch_page(4); true }
+        (KeyModifiers::SHIFT, KeyCode::Tab) | (_, KeyCode::BackTab) | (_, KeyCode::F(6)) => {
+            app.prev_page();
             true
         }
         (KeyModifiers::CONTROL, KeyCode::Tab) | (_, KeyCode::F(7)) => {
-            app.active_page = (app.active_page + 1) % 5;
-            if app.active_page == 1 || app.active_page == 2 { app.refresh_usage_data(); }
-            if app.active_page == 3 { app.refresh_skills(); }
+            app.next_page();
             true
         }
+        _ if app.active_page != 0 => match key.code {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                app.next_page();
+                true
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                app.prev_page();
+                true
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1647,7 +1663,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.5)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.6)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
@@ -1804,7 +1820,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.5 (Sovereign Rust Agent)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.6 (Sovereign Rust Agent)"));
                         return Ok(());
                     }
                     s => {
@@ -2009,11 +2025,10 @@ fn ui(f: &mut Frame, app: &App) {
             };
             draw_messages(f, session, chat_rect);
 
-            let pill_w = 80u16.min(left_pane.width.saturating_sub(2));
             let pill_rect = Rect {
-                x: left_pane.x + (left_pane.width.saturating_sub(pill_w)) / 2,
+                x: left_pane.x + 1,
                 y: left_pane.y + left_pane.height.saturating_sub(input_height + gap),
-                width: pill_w,
+                width: left_pane.width.saturating_sub(2),
                 height: input_height,
             };
             let cur = draw_input(f, app, pill_rect);
@@ -2032,11 +2047,10 @@ fn ui(f: &mut Frame, app: &App) {
             };
             draw_messages(f, session, chat_rect);
 
-            let pill_w = 80u16.min(box_area.width.saturating_sub(2));
             let pill_rect = Rect {
-                x: box_area.x + (box_area.width.saturating_sub(pill_w)) / 2,
+                x: box_area.x + 1,
                 y: box_area.y + box_area.height.saturating_sub(input_height + gap),
-                width: pill_w,
+                width: box_area.width.saturating_sub(2),
                 height: input_height,
             };
             let cur = draw_input(f, app, pill_rect);
@@ -2103,18 +2117,19 @@ fn ui(f: &mut Frame, app: &App) {
 
 fn draw_page_tabs(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
-    spans.push(Span::styled(" [Esc] Back to Chat  │  ", Style::default().fg(BRAND)));
+    spans.push(Span::styled(" [Esc] Back to Chat │ ", Style::default().fg(BRAND)));
     for (i, name) in PAGE_NAMES.iter().enumerate() {
         let style = if i == app.active_page {
             Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(DIM)
         };
-        spans.push(Span::styled(format!(" {} ", name), style));
+        spans.push(Span::styled(format!("{}:{} ", i + 1, name), style));
         if i < PAGE_NAMES.len() - 1 {
-            spans.push(Span::styled("┃", Style::default().fg(DIM)));
+            spans.push(Span::styled("┃ ", Style::default().fg(DIM)));
         }
     }
+    spans.push(Span::styled("│ [Ctrl+1..5 / F1..F5 / ⇆ Tab]", Style::default().fg(DIM)));
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
 }
 
@@ -3111,11 +3126,11 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
 fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
     if app.active_page != 0 {
         let hint = match app.active_page {
-            1 => "↑↓ scroll  r refresh  Esc back to chat",
-            2 => "↑↓ scroll  r refresh  Esc back to chat",
-            3 => "↑↓ select  Enter load skill  Esc back to chat",
-            4 => "↑↓ navigate  Enter edit  s save  Esc back to chat",
-            _ => "",
+            1 => "↑↓ scroll • r refresh • ⇆ Tab/F1-F5 switch page • Esc back to chat",
+            2 => "↑↓ scroll • r refresh • ⇆ Tab/F1-F5 switch page • Esc back to chat",
+            3 => "↑↓ select • Enter load skill • ⇆ Tab/F1-F5 switch page • Esc back to chat",
+            4 => "↑↓ navigate • Enter edit • s save • ⇆ Tab/F1-F5 switch page • Esc back to chat",
+            _ => "↑↓ navigate • ⇆ Tab/F1-F5 switch page • Esc back to chat",
         };
         let line = Line::from(Span::styled(hint, Style::default().fg(DIM)));
         f.render_widget(
@@ -3151,26 +3166,18 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
             Paragraph::new(line).style(Style::default().bg(BG_PILL)),
             Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
         );
-        let cx = area.x + 1 + steer_label.len() as u16 + 2 + session.cursor_pos as u16;
+        let cx = area.x + 1 + 9 + 2 + session.cursor_pos as u16;
         Some((cx, area.y))
     } else if app.is_thinking {
-        let (frame, emot) = THINKING_FRAMES[app.spinner_frame % THINKING_FRAMES.len()];
+        // Clean, quiet thinking indicator without kaomoji face animations.
         let line = Line::from(vec![
             Span::styled(
                 "> ",
                 Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{} ", frame),
-                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                emot,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
-            ),
-            Span::styled(
-                "  type to steer · Ctrl+C to cancel",
-                Style::default().fg(MUTED),
+                "● Thinking... · Type to steer · Ctrl+C to cancel",
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
             ),
         ]);
         let thinking_block = Block::default()
@@ -3182,7 +3189,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
             Paragraph::new(line).style(Style::default().bg(BG_PILL)),
             Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
         );
-        None
+        let cx = area.x + 1 + 2 + session.cursor_pos as u16;
+        Some((cx, area.y))
     } else {
         // Idle input pill with placeholder when empty.
         let show_placeholder = session.input.is_empty();
@@ -3212,7 +3220,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
             Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
         );
 
-        let cx = area.x + 2 + session.cursor_pos as u16;
+        let cx = area.x + 1 + 2 + session.cursor_pos as u16;
         Some((cx, area.y))
     }
 }
@@ -3265,7 +3273,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let right_spans = vec![
         Span::styled("/status", Style::default().fg(ACCENT_DIM)),
         Span::styled("  ·  ", Style::default().fg(MUTED)),
-        Span::styled("v1.0.5 ", Style::default().fg(MUTED)),
+        Span::styled("v1.0.6 ", Style::default().fg(MUTED)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -3357,5 +3365,42 @@ mod tests {
             *last = format!("✓ {}", last.trim_start_matches("● ").trim());
         }
         assert_eq!(session.react_steps[0], "✓ read_file src/lib.rs");
+    }
+
+    #[test]
+    fn test_tab_page_navigation() {
+        let cfg = CaCodeConfig::default();
+        let mut app = App::new(cfg);
+        assert_eq!(app.active_page, 0);
+
+        // F2 switches to page 1 (Monitor)
+        let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+        assert!(handle_global_key(&mut app, f2));
+        assert_eq!(app.active_page, 1);
+
+        // F3 switches to page 2 (Report)
+        let f3 = KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE);
+        assert!(handle_global_key(&mut app, f3));
+        assert_eq!(app.active_page, 2);
+
+        // In secondary page, Right or Tab moves to page 3 (Skills)
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert!(handle_global_key(&mut app, right));
+        assert_eq!(app.active_page, 3);
+
+        // 'l' moves to page 4 (Settings)
+        let l_key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(handle_global_key(&mut app, l_key));
+        assert_eq!(app.active_page, 4);
+
+        // 'h' moves back to page 3 (Skills)
+        let h_key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(handle_global_key(&mut app, h_key));
+        assert_eq!(app.active_page, 3);
+
+        // Esc returns straight to chat (page 0)
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(handle_global_key(&mut app, esc));
+        assert_eq!(app.active_page, 0);
     }
 }

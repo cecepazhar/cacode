@@ -1,6 +1,6 @@
 [package]
 name = "cacode-core"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 description = "CACode core library — commands logic, types, ReAct agent, monitor, report"
 authors = ["Cecep Saeful Azhar Hidayat, ST"]
