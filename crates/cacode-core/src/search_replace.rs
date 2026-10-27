@@ -76,11 +76,9 @@ fn extract_file_path(line: &str) -> Option<String> {
     s = s.trim_end_matches(':').trim();
 
     // Strip surrounding quotes
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        if s.len() >= 2 {
-            s = &s[1..s.len() - 1];
-            s = s.trim();
-        }
+    if ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\''))) && s.len() >= 2 {
+        s = &s[1..s.len() - 1];
+        s = s.trim();
     }
 
     // Re-check backticks

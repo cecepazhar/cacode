@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(parsed.models[1].name, "llama3:latest");
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn test_probe_ollama_offline() {
@@ -353,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auto_detect_best_free_provider_fallback() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         env::remove_var("ANTIGRAVITY_API_KEY");
         env::remove_var("ANTIGRAVITY_ZEN_API_KEY");
         env::remove_var("ANTIGRAVITY_ZEN_MODEL");
@@ -370,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auto_detect_best_free_provider_with_zen_key() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         env::set_var("ANTIGRAVITY_API_KEY", "zen-key");
         env::set_var("ANTIGRAVITY_ZEN_MODEL", "minimax-m2.5-free");
         let provider = auto_detect_best_free_provider(None).await;

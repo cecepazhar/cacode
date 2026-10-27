@@ -232,9 +232,11 @@ mod tests {
 
     #[test]
     fn test_apply_to_env_antigravity() {
-        let mut cfg = CaCodeConfig::default();
-        cfg.antigravity_zen_api_key = Some("test-key-apply".to_string());
-        cfg.antigravity_zen_model = Some("mimo-v2.5-free".to_string());
+        let cfg = CaCodeConfig {
+            antigravity_zen_api_key: Some("test-key-apply".to_string()),
+            antigravity_zen_model: Some("mimo-v2.5-free".to_string()),
+            ..Default::default()
+        };
         cfg.apply_to_env();
 
         assert_eq!(env::var("ANTIGRAVITY_API_KEY").unwrap(), "test-key-apply");
