@@ -86,12 +86,13 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Provider {
     OpenAI { model: String },
     Anthropic { model: String },
     Ollama { model: String },
     Router9 { model: String },
+    AntigravityZen { model: String },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +130,11 @@ impl ReActAgent {
         } else if env::var("OPENAI_API_KEY").is_ok() {
             let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into());
             Provider::OpenAI { model }
+        } else if env::var("ANTIGRAVITY_API_KEY").is_ok() || env::var("ANTIGRAVITY_ZEN_API_KEY").is_ok() {
+            let model = env::var("ANTIGRAVITY_ZEN_MODEL")
+                .or_else(|_| env::var("ANTIGRAVITY_MODEL"))
+                .unwrap_or_else(|_| "deepseek-v4-flash-free".into());
+            Provider::AntigravityZen { model }
         } else if env::var("OLLAMA_MODEL").is_ok() || env::var("OLLAMA_URL").is_ok() {
             let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".into());
             Provider::Ollama { model }
@@ -502,6 +508,34 @@ impl ReActAgent {
                 }
                 Self::extract_response_content(&text)?
             }
+            Provider::AntigravityZen { model } => {
+                let api_key = env::var("ANTIGRAVITY_API_KEY")
+                    .or_else(|_| env::var("ANTIGRAVITY_ZEN_API_KEY"))
+                    .unwrap_or_else(|_| "dummy".into());
+                let endpoint = "https://antigravity.ai/zen/v1/chat/completions";
+                let resp = self.client
+                    .post(endpoint)
+                    .bearer_auth(api_key)
+                    .json(&serde_json::json!({
+                        "model": model,
+                        "messages": msgs,
+                        "stream": false
+                    }))
+                    .send()
+                    .await?;
+                let status = resp.status();
+                let bytes = resp.bytes().await?;
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if !status.is_success() {
+                    return Err(anyhow!(
+                        "Antigravity Zen HTTP {} (endpoint: {}) — {}",
+                        status,
+                        endpoint,
+                        text.chars().take(500).collect::<String>()
+                    ));
+                }
+                Self::extract_response_content(&text)?
+            }
         };
 
         // Record metrics
@@ -512,7 +546,8 @@ impl ReActAgent {
 
         let model_name = match &self.provider {
             Provider::OpenAI { model } | Provider::Anthropic { model }
-            | Provider::Ollama { model } | Provider::Router9 { model } => model.clone(),
+            | Provider::Ollama { model } | Provider::Router9 { model }
+            | Provider::AntigravityZen { model } => model.clone(),
         };
         Self::record_usage_to_sqlite(&model_name, &usage);
 
@@ -830,4 +865,54 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_provider_antigravity() {
+        env::remove_var("ANTHROPIC_API_KEY");
+        env::remove_var("OPENAI_API_KEY");
+        env::set_var("ANTIGRAVITY_API_KEY", "zen-test-key");
+        env::set_var("ANTIGRAVITY_ZEN_MODEL", "mimo-v2.5-free");
+
+        let p = ReActAgent::detect_provider();
+        match p {
+            Provider::AntigravityZen { model } => {
+                assert_eq!(model, "mimo-v2.5-free");
+            }
+            _ => panic!("Expected Provider::AntigravityZen, got {:?}", p),
+        }
+
+        env::remove_var("ANTIGRAVITY_API_KEY");
+        env::remove_var("ANTIGRAVITY_ZEN_MODEL");
+    }
+
+    #[test]
+    fn test_extract_response_content_openai_format() {
+        let json_body = r#"{
+            "id": "chatcmpl-test",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello from Zen model!"
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 8,
+                "total_tokens": 20
+            }
+        }"#;
+
+        let (content, usage) = ReActAgent::extract_response_content(json_body).unwrap();
+        assert_eq!(content, "Hello from Zen model!");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 8);
+        assert_eq!(usage.total_tokens, 20);
+    }
 }

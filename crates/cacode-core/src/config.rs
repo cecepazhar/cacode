@@ -22,6 +22,10 @@ pub struct CaCodeConfig {
     pub router9_api_key: Option<String>,
     #[serde(default)]
     pub router9_model: Option<String>,
+    #[serde(default)]
+    pub antigravity_zen_api_key: Option<String>,
+    #[serde(default = "default_antigravity_zen_model")]
+    pub antigravity_zen_model: Option<String>,
     #[serde(default = "default_user_name")]
     pub user_name: String,
     #[serde(default = "default_persona")]
@@ -39,6 +43,7 @@ pub struct CaCodeConfig {
 fn default_theme() -> String { "teal".into() }
 fn default_app_name() -> String { "CACode — Sovereign Dev Agent".into() }
 fn default_user_name() -> String { "Prof. Cecep".into() }
+fn default_antigravity_zen_model() -> Option<String> { Some("deepseek-v4-flash-free".into()) }
 fn default_persona() -> String {
     "You are CACode, a sovereign Rust-focused development agent. The user is Prof. Cecep (Cecep Saeful Azhar Hidayat, ST). Always greet and address him respectfully as 'Prof. Cecep' (e.g. 'Hi Prof. Cecep', 'Siap, Prof. Cecep.'). Be direct, technically precise, and concise. Provide working code and verified architecture solutions.".into()
 }
@@ -54,6 +59,8 @@ impl Default for CaCodeConfig {
             router9_url: None,
             router9_api_key: None,
             router9_model: Some("ZA126_PRO".into()),
+            antigravity_zen_api_key: None,
+            antigravity_zen_model: default_antigravity_zen_model(),
             user_name: default_user_name(),
             system_persona: default_persona(),
             thinking_mode: "Fast".into(),
@@ -101,6 +108,9 @@ impl CaCodeConfig {
             ("ROUTER9_URL", &self.router9_url),
             ("ROUTER9_API_KEY", &self.router9_api_key),
             ("ROUTER9_MODEL", &self.router9_model),
+            ("ANTIGRAVITY_API_KEY", &self.antigravity_zen_api_key),
+            ("ANTIGRAVITY_ZEN_API_KEY", &self.antigravity_zen_api_key),
+            ("ANTIGRAVITY_ZEN_MODEL", &self.antigravity_zen_model),
         ];
         for (var, val) in mappings {
             if let Some(v) = val {
@@ -113,6 +123,22 @@ impl CaCodeConfig {
 
     pub fn effective(&self, env_name: &str, config_val: &Option<String>) -> String {
         config_val.clone().unwrap_or_else(|| env::var(env_name).unwrap_or_default())
+    }
+
+    pub fn effective_antigravity_api_key(&self) -> String {
+        self.antigravity_zen_api_key
+            .clone()
+            .or_else(|| env::var("ANTIGRAVITY_API_KEY").ok())
+            .or_else(|| env::var("ANTIGRAVITY_ZEN_API_KEY").ok())
+            .unwrap_or_default()
+    }
+
+    pub fn effective_antigravity_model(&self) -> String {
+        self.antigravity_zen_model
+            .clone()
+            .or_else(|| env::var("ANTIGRAVITY_ZEN_MODEL").ok())
+            .or_else(|| env::var("ANTIGRAVITY_MODEL").ok())
+            .unwrap_or_else(|| "deepseek-v4-flash-free".into())
     }
 
     pub fn display_fields(&self) -> Vec<(&'static str, &'static str, &'static str, String)> {
@@ -130,6 +156,8 @@ impl CaCodeConfig {
             ("9Router URL", "ROUTER9_URL", "router9_url", self.effective("ROUTER9_URL", &self.router9_url)),
             ("9Router API Key", "ROUTER9_API_KEY", "router9_api_key", Self::mask(&self.effective("ROUTER9_API_KEY", &self.router9_api_key))),
             ("9Router Model", "ROUTER9_MODEL", "router9_model", self.effective("ROUTER9_MODEL", &self.router9_model)),
+            ("Antigravity Zen Key", "ANTIGRAVITY_API_KEY", "antigravity_zen_api_key", Self::mask(&self.effective_antigravity_api_key())),
+            ("Antigravity Zen Model", "ANTIGRAVITY_ZEN_MODEL", "antigravity_zen_model", self.effective_antigravity_model()),
         ]
     }
 
@@ -160,7 +188,61 @@ impl CaCodeConfig {
             "router9_url" => self.router9_url = val,
             "router9_api_key" => self.router9_api_key = val,
             "router9_model" => self.router9_model = val,
+            "antigravity_zen_api_key" => self.antigravity_zen_api_key = val,
+            "antigravity_zen_model" => self.antigravity_zen_model = val,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let cfg = CaCodeConfig::default();
+        assert_eq!(cfg.antigravity_zen_api_key, None);
+        assert_eq!(cfg.antigravity_zen_model, Some("deepseek-v4-flash-free".to_string()));
+        assert_eq!(cfg.effective_antigravity_model(), "deepseek-v4-flash-free");
+    }
+
+    #[test]
+    fn test_set_field_antigravity() {
+        let mut cfg = CaCodeConfig::default();
+        cfg.set_field("antigravity_zen_api_key", "ag-secret-key-12345".to_string());
+        cfg.set_field("antigravity_zen_model", "minimax-m2.5-free".to_string());
+
+        assert_eq!(cfg.antigravity_zen_api_key.as_deref(), Some("ag-secret-key-12345"));
+        assert_eq!(cfg.antigravity_zen_model.as_deref(), Some("minimax-m2.5-free"));
+        assert_eq!(cfg.effective_antigravity_api_key(), "ag-secret-key-12345");
+        assert_eq!(cfg.effective_antigravity_model(), "minimax-m2.5-free");
+    }
+
+    #[test]
+    fn test_display_fields_contains_antigravity() {
+        let cfg = CaCodeConfig::default();
+        let fields = cfg.display_fields();
+        let zen_key_field = fields.iter().find(|(_, _, k, _)| *k == "antigravity_zen_api_key");
+        assert!(zen_key_field.is_some());
+        let zen_model_field = fields.iter().find(|(_, _, k, _)| *k == "antigravity_zen_model");
+        assert!(zen_model_field.is_some());
+        assert_eq!(zen_model_field.unwrap().3, "deepseek-v4-flash-free");
+    }
+
+    #[test]
+    fn test_apply_to_env_antigravity() {
+        let mut cfg = CaCodeConfig::default();
+        cfg.antigravity_zen_api_key = Some("test-key-apply".to_string());
+        cfg.antigravity_zen_model = Some("mimo-v2.5-free".to_string());
+        cfg.apply_to_env();
+
+        assert_eq!(env::var("ANTIGRAVITY_API_KEY").unwrap(), "test-key-apply");
+        assert_eq!(env::var("ANTIGRAVITY_ZEN_API_KEY").unwrap(), "test-key-apply");
+        assert_eq!(env::var("ANTIGRAVITY_ZEN_MODEL").unwrap(), "mimo-v2.5-free");
+
+        env::remove_var("ANTIGRAVITY_API_KEY");
+        env::remove_var("ANTIGRAVITY_ZEN_API_KEY");
+        env::remove_var("ANTIGRAVITY_ZEN_MODEL");
     }
 }

@@ -54,12 +54,12 @@ const WELCOME_LINES: &[&str] = &[
     "  Sovereign Rust Development Agent  v1.0.2",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
-    "  • Multi-provider BYOK: OpenAI, Anthropic, Ollama, 9Router",
+    "  • Multi-provider BYOK & Free: Antigravity Zen, Ollama, 9Router, OpenAI, Anthropic",
     "  • Local token usage monitor & cost estimator, Skill System",
     "  • Zero telemetry — your keys, your machine, your data",
     "",
     "  Type a message to chat, or '/' for command autocomplete",
-    "    /models   /mode   /settings   /monitor   /report   /skills",
+    "    /providers   /provider   /models   /mode   /settings   /skills",
     "",
 ];
 
@@ -68,6 +68,8 @@ const MAX_SESSIONS: usize = 9;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/models", "Interactive AI model picker"),
+    ("/providers", "Probe & display local & free providers (Ollama, Zen)"),
+    ("/provider", "Switch active provider (/provider <name>)"),
     ("/mode", "Select thinking level: Fast, Analytical, Deep"),
     ("/settings", "Open BYOK settings & provider configuration"),
     ("/monitor", "View real-time token telemetry & proxy log"),
@@ -571,13 +573,15 @@ impl App {
             Provider::Anthropic { .. } => "Anthropic",
             Provider::Ollama { .. } => "Ollama",
             Provider::Router9 { .. } => "9Router",
+            Provider::AntigravityZen { .. } => "Antigravity Zen",
         }
     }
 
     fn model_name(&self) -> String {
         match &self.session().agent.provider {
             Provider::OpenAI { model } | Provider::Anthropic { model }
-            | Provider::Ollama { model } | Provider::Router9 { model } => model.clone(),
+            | Provider::Ollama { model } | Provider::Router9 { model }
+            | Provider::AntigravityZen { model } => model.clone(),
         }
     }
 
@@ -902,6 +906,34 @@ impl App {
                     Err(e) => Err(format!("Cannot reach Ollama at {}: {} (is Ollama running?)", base_url, e)),
                 }
             }
+            "Antigravity Zen" | "AntigravityZen" | "Antigravity" | "Zen" => {
+                let endpoint = "https://antigravity.ai/zen/v1/chat/completions";
+                let api_key = env::var("ANTIGRAVITY_API_KEY")
+                    .or_else(|_| env::var("ANTIGRAVITY_ZEN_API_KEY"))
+                    .unwrap_or_else(|_| "dummy".into());
+                let body = serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1
+                });
+                match reqwest::Client::new().post(endpoint)
+                    .bearer_auth(api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            Ok(())
+                        } else {
+                            let text = resp.text().await.unwrap_or_default();
+                            Err(format!("Antigravity Zen HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
+                        }
+                    }
+                    Err(e) => Err(format!("Cannot reach Antigravity Zen: {}", e)),
+                }
+            }
             _ => Ok(()),
         };
 
@@ -912,8 +944,12 @@ impl App {
     }
 
     fn refresh_models_cache(&mut self) {
-        // Preset high-value models available across 9router and providers
+        // Preset high-value models available across free providers, 9router and BYOK
         self.models_cache = vec![
+            "deepseek-v4-flash-free".into(),
+            "mimo-v2.5-free".into(),
+            "big-pickle".into(),
+            "minimax-m2.5-free".into(),
             "ZA126_PRO".into(),
             "ZA126_OPUS".into(),
             "ZA126".into(),
@@ -1129,8 +1165,15 @@ async fn handle_chat_key(
                                 Provider::Anthropic { model } => *model = m.clone(),
                                 Provider::Ollama { model } => *model = m.clone(),
                                 Provider::Router9 { model } => *model = m.clone(),
+                                Provider::AntigravityZen { model } => *model = m.clone(),
                             }
-                            app.config.router9_model = Some(m.clone());
+                            if matches!(app.session().agent.provider, Provider::AntigravityZen { .. }) {
+                                app.config.antigravity_zen_model = Some(m.clone());
+                            } else if matches!(app.session().agent.provider, Provider::Ollama { .. }) {
+                                app.config.ollama_model = Some(m.clone());
+                            } else {
+                                app.config.router9_model = Some(m.clone());
+                            }
                             let _ = app.config.save();
                             app.status_msg = format!("Model switched to {} ✓", m);
                         }
@@ -1377,35 +1420,100 @@ async fn handle_chat_key(
                                 Provider::Anthropic { model } => *model = arg.to_string(),
                                 Provider::Ollama { model } => *model = arg.to_string(),
                                 Provider::Router9 { model } => *model = arg.to_string(),
+                                Provider::AntigravityZen { model } => *model = arg.to_string(),
                             }
-                            app.config.router9_model = Some(arg.to_string());
+                            if matches!(app.session().agent.provider, Provider::AntigravityZen { .. }) {
+                                app.config.antigravity_zen_model = Some(arg.to_string());
+                            } else if matches!(app.session().agent.provider, Provider::Ollama { .. }) {
+                                app.config.ollama_model = Some(arg.to_string());
+                            } else {
+                                app.config.router9_model = Some(arg.to_string());
+                            }
                             let _ = app.config.save();
                             app.status_msg = format!("Model changed to {}", arg);
                         }
                         return Ok(());
                     }
+                    "/providers" => {
+                        app.is_thinking = true;
+                        app.status_msg = "Probing local & free providers...".into();
+                        terminal.draw(|f| ui(f, app))?;
+
+                        let providers = cacode_core::provider_registry::list_free_providers(
+                            app.config.ollama_url.as_deref()
+                        ).await;
+
+                        app.is_thinking = false;
+                        let cur_p = app.provider_name();
+                        let cur_m = app.model_name();
+
+                        let mut output = String::from("=== Sovereign Free & Local Provider Registry ===\n\n");
+                        for (idx, p) in providers.iter().enumerate() {
+                            let is_active = (p.id == "antigravity_zen" && cur_p == "Antigravity Zen")
+                                || (p.id == "ollama" && cur_p == "Ollama");
+                            let marker = if is_active { " [ACTIVE]" } else { "" };
+                            output.push_str(&format!("[{}] {}{}\n", idx + 1, p.name, marker));
+                            output.push_str(&format!("    Endpoint: {}\n", p.endpoint_or_url));
+                            output.push_str(&format!("    Status:   {}\n", p.note));
+                            output.push_str(&format!("    Default:  {}\n", p.default_model));
+                            if !p.models.is_empty() {
+                                output.push_str(&format!("    Models:   {}\n", p.models.join(", ")));
+                            } else {
+                                output.push_str("    Models:   (none discovered)\n");
+                            }
+                            if p.id == "antigravity_zen" {
+                                output.push_str("    Switch:   /provider antigravity  or  /provider zen\n");
+                            } else if p.id == "ollama" {
+                                output.push_str("    Switch:   /provider ollama\n");
+                            }
+                            output.push('\n');
+                        }
+                        output.push_str(&format!("Current Active Provider: {} (model: {})\n", cur_p, cur_m));
+                        output.push_str("Switch provider: `/provider <name>` (antigravity, zen, ollama, 9router, openai, anthropic)");
+
+                        app.session_mut().messages.push(ChatMessage::plain("system", output));
+                        app.status_msg = "Probed free providers ✓".into();
+                        return Ok(());
+                    }
                     "/provider" => {
                         let current_provider = app.provider_name().to_string();
                         if arg.is_empty() {
-                            app.session_mut().messages.push(ChatMessage::plain("system", format!("Current provider: {}. Usage: /provider openai|anthropic|ollama|9router", current_provider)));
+                            app.session_mut().messages.push(ChatMessage::plain("system", format!("Current provider: {}. Usage: /provider antigravity|zen|ollama|9router|openai|anthropic\nType /providers to probe local & free provider status.", current_provider)));
                         } else {
                             let new_p = match arg.to_lowercase().as_str() {
                                 "openai" => Provider::OpenAI { model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()) },
                                 "anthropic" => Provider::Anthropic { model: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-20240620".into()) },
-                                "ollama" => Provider::Ollama { model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".into()) },
+                                "ollama" => {
+                                    let model = app.config.ollama_model.clone()
+                                        .or_else(|| std::env::var("OLLAMA_MODEL").ok())
+                                        .unwrap_or_else(|| "llama3".into());
+                                    Provider::Ollama { model }
+                                }
                                 "9router" | "router9" => Provider::Router9 { model: std::env::var("ROUTER9_MODEL").unwrap_or_else(|_| "ZA126_PRO".into()) },
+                                "antigravity" | "antigravityzen" | "zen" => {
+                                    let model = app.config.effective_antigravity_model();
+                                    Provider::AntigravityZen { model }
+                                }
                                 other => {
-                                    app.session_mut().messages.push(ChatMessage::plain("system", format!("Unknown provider: {}", other)));
+                                    app.session_mut().messages.push(ChatMessage::plain("system", format!("Unknown provider: {}. Available: antigravity (or zen), ollama, 9router, openai, anthropic", other)));
                                     return Ok(());
                                 }
                             };
+                            let (name, m) = match &new_p {
+                                Provider::AntigravityZen { model } => ("Antigravity Zen", model.clone()),
+                                Provider::Ollama { model } => ("Ollama", model.clone()),
+                                Provider::OpenAI { model } => ("OpenAI", model.clone()),
+                                Provider::Anthropic { model } => ("Anthropic", model.clone()),
+                                Provider::Router9 { model } => ("9Router", model.clone()),
+                            };
                             app.session_mut().agent.provider = new_p;
-                            app.status_msg = format!("Provider switched to {}", arg);
+                            app.status_msg = format!("Provider switched to {} ({}) ✓", name, m);
+                            app.session_mut().messages.push(ChatMessage::plain("system", format!("Active provider switched to {} (model: {})", name, m)));
                         }
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.2)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.2)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
