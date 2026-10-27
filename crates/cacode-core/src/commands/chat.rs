@@ -189,11 +189,19 @@ impl ReActAgent {
             "{}{}\n\nAvailable tools:\n\
             1. read_file: {{\"tool\": \"read_file\", \"args\": {{\"path\": \"...\", \"offset\": 1, \"limit\": 200}}}}\n\
             2. patch_file: {{\"tool\": \"patch_file\", \"args\": {{\"path\": \"...\", \"old_string\": \"...\", \"new_string\": \"...\"}}}}\n\
-            3. write_file: {{\"tool\": \"write_file\", \"args\": {{\"path\": \"...\", \"content\": \"...\"}}}}\n\
-            4. bash: {{\"tool\": \"bash\", \"args\": {{\"command\": \"...\"}}}}\n\
-            5. search_files: {{\"tool\": \"search_files\", \"args\": {{\"pattern\": \"...\", \"dir\": \".\"}}}}\n\n\
+            3. search_replace: {{\"tool\": \"search_replace\", \"args\": {{\"path\": \"...\", \"search\": \"...\", \"replace\": \"...\"}}}}\n\
+            4. write_file: {{\"tool\": \"write_file\", \"args\": {{\"path\": \"...\", \"content\": \"...\"}}}}\n\
+            5. bash: {{\"tool\": \"bash\", \"args\": {{\"command\": \"...\"}}}}\n\
+            6. search_files: {{\"tool\": \"search_files\", \"args\": {{\"pattern\": \"...\", \"dir\": \".\"}}}}\n\n\
             When you need to act, output a JSON array of tool calls strictly wrapped in ```json ... ``` codeblock:\n\
             ```json\n[\n  {{\"tool\": \"read_file\", \"args\": {{\"path\": \"src/main.rs\"}}}}\n]\n```\n\
+            You can also provide edits using standard Aider search/replace blocks:\n\
+            path/to/file.rs\n\
+            <<<<<<< SEARCH\n\
+            [old code]\n\
+            =======\n\
+            [new code]\n\
+            >>>>>>> REPLACE\n\n\
             If no tool action is needed, reply normally with natural language.",
             persona_intro, thinking_hint
         );
@@ -566,6 +574,30 @@ impl ReActAgent {
         if let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(content.trim()) {
             return calls;
         }
+
+        // Auto-detection of Aider-style Search/Replace blocks:
+        // If LLM outputs <<<<<<< SEARCH blocks with file paths without strict JSON,
+        // parse and convert them to search_replace ToolCalls.
+        let sr_blocks = crate::search_replace::parse_search_replace_blocks(content);
+        if !sr_blocks.is_empty() {
+            let mut calls = Vec::new();
+            for block in sr_blocks {
+                if let Some(path) = block.file_path {
+                    calls.push(ToolCall {
+                        tool: "search_replace".to_string(),
+                        args: serde_json::json!({
+                            "path": path,
+                            "search": block.search,
+                            "replace": block.replace,
+                        }),
+                    });
+                }
+            }
+            if !calls.is_empty() {
+                return calls;
+            }
+        }
+
         Vec::new()
     }
 
@@ -593,12 +625,18 @@ impl ReActAgent {
                 let old_str = call.args.get("old_string").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing old_string"))?;
                 let new_str = call.args.get("new_string").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing new_string"))?;
                 let content = fs::read_to_string(path)?;
-                if !content.contains(old_str) {
-                    return Err(anyhow!("Target old_string not found in {}", path));
-                }
-                let patched = content.replacen(old_str, new_str, 1);
+                let patched = crate::search_replace::apply_search_replace(&content, old_str, new_str)?;
                 fs::write(path, patched)?;
                 Ok(format!("Successfully patched {}", path))
+            }
+            "search_replace" => {
+                let path = call.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing path"))?;
+                let search = call.args.get("search").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing search"))?;
+                let replace = call.args.get("replace").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing replace"))?;
+                let content = fs::read_to_string(path)?;
+                let patched = crate::search_replace::apply_search_replace(&content, search, replace)?;
+                fs::write(path, patched)?;
+                Ok(format!("Successfully applied search/replace to {}", path))
             }
             "bash" => {
                 let cmd = call.args.get("command").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing command"))?;
@@ -914,5 +952,74 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 12);
         assert_eq!(usage.completion_tokens, 8);
         assert_eq!(usage.total_tokens, 20);
+    }
+
+    #[test]
+    fn test_parse_tool_calls_json() {
+        let agent = ReActAgent::new();
+        let content = "```json\n[\n  {\"tool\": \"read_file\", \"args\": {\"path\": \"src/main.rs\"}}\n]\n```";
+        let calls = agent.parse_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].args["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_aider_search_replace_autodetect() {
+        let agent = ReActAgent::new();
+        let content = r#"
+Here is the patch you requested:
+
+crates/cacode-core/src/lib.rs
+<<<<<<< SEARCH
+pub mod commands;
+=======
+pub mod commands;
+pub mod search_replace;
+>>>>>>> REPLACE
+"#;
+        let calls = agent.parse_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "search_replace");
+        assert_eq!(calls[0].args["path"], "crates/cacode-core/src/lib.rs");
+        assert_eq!(calls[0].args["search"], "pub mod commands;\n");
+        assert_eq!(calls[0].args["replace"], "pub mod commands;\npub mod search_replace;\n");
+    }
+
+    #[test]
+    fn test_exec_tool_search_replace_and_patch_file() {
+        let agent = ReActAgent::new();
+        let temp_dir = std::env::temp_dir().join(format!("cacode_chat_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("test.txt");
+        fs::write(&test_file, "hello   \nworld\n").unwrap();
+
+        // Test patch_file with whitespace tolerance (content has trailing spaces on hello)
+        let patch_call = ToolCall {
+            tool: "patch_file".into(),
+            args: serde_json::json!({
+                "path": test_file.to_string_lossy(),
+                "old_string": "hello\nworld\n",
+                "new_string": "greetings\nworld\n",
+            }),
+        };
+        let res = agent.exec_tool(&patch_call).unwrap();
+        assert!(res.contains("Successfully patched"));
+        assert_eq!(fs::read_to_string(&test_file).unwrap(), "greetings\nworld\n");
+
+        // Test search_replace tool
+        let sr_call = ToolCall {
+            tool: "search_replace".into(),
+            args: serde_json::json!({
+                "path": test_file.to_string_lossy(),
+                "search": "greetings",
+                "replace": "welcome",
+            }),
+        };
+        let res2 = agent.exec_tool(&sr_call).unwrap();
+        assert!(res2.contains("Successfully applied search/replace"));
+        assert_eq!(fs::read_to_string(&test_file).unwrap(), "welcome\nworld\n");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
