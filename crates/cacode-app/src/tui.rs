@@ -50,7 +50,7 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v1.0.6",
+    "  Sovereign Rust Development Agent  v1.0.7",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK & Free: Antigravity Zen, Ollama, 9Router, OpenAI, Anthropic",
@@ -85,7 +85,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.6)"),
+    ("/version", "Show CACode version (v1.0.7)"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -759,8 +759,11 @@ impl App {
             self.status_msg = format!("Max {} sessions", MAX_SESSIONS);
             return;
         }
+        self.session_mut().show_welcome = false;
         let n = self.sessions.len() + 1;
-        self.sessions.push(ChatSession::new(format!("Session {}", n), &self.config));
+        let mut session = ChatSession::new(format!("Session {}", n), &self.config);
+        session.show_welcome = false;
+        self.sessions.push(session);
         self.active_session = self.sessions.len() - 1;
         self.status_msg = format!("New session: {}", self.session().name);
     }
@@ -1254,7 +1257,16 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
         (KeyModifiers::CONTROL, KeyCode::Char('3')) | (_, KeyCode::F(3)) => { app.switch_page(2); true }
         (KeyModifiers::CONTROL, KeyCode::Char('4')) | (_, KeyCode::F(4)) => { app.switch_page(3); true }
         (KeyModifiers::CONTROL, KeyCode::Char('5')) | (_, KeyCode::F(5)) => { app.switch_page(4); true }
-        (KeyModifiers::SHIFT, KeyCode::Tab) | (_, KeyCode::BackTab) | (_, KeyCode::F(6)) => {
+        (KeyModifiers::CONTROL, KeyCode::Char('t')) | (_, KeyCode::F(10)) => {
+            app.new_session();
+            app.switch_page(0);
+            true
+        }
+        (KeyModifiers::SHIFT, KeyCode::Tab) | (_, KeyCode::BackTab) if app.active_page != 0 => {
+            app.prev_page();
+            true
+        }
+        (_, KeyCode::F(6)) => {
             app.prev_page();
             true
         }
@@ -1379,9 +1391,13 @@ async fn handle_chat_key(
             _ => {}
         }
     } else {
-        // Not in slash autocomplete: Tab switches agent (session).
-        if key.code == KeyCode::Tab {
-            app.next_session();
+        // Not in slash autocomplete: Tab and Shift+Tab cycle sessions.
+        if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+            if key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::BackTab {
+                app.prev_session();
+            } else {
+                app.next_session();
+            }
             return Ok(());
         }
     }
@@ -1397,12 +1413,12 @@ async fn handle_chat_key(
             }
             return Ok(());
         }
-        (_, KeyCode::Tab) => {
-            app.next_session();
+        (KeyModifiers::SHIFT, KeyCode::Tab) | (_, KeyCode::BackTab) => {
+            app.prev_session();
             return Ok(());
         }
-        (_, KeyCode::BackTab) => {
-            app.prev_session();
+        (_, KeyCode::Tab) => {
+            app.next_session();
             return Ok(());
         }
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
@@ -1432,9 +1448,11 @@ async fn handle_chat_key(
         }
         (KeyModifiers::CONTROL, KeyCode::Char('t')) | (_, KeyCode::F(10)) => {
             app.new_session();
+            return Ok(());
         }
         (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
             app.close_session();
+            return Ok(());
         }
         (KeyModifiers::CONTROL, KeyCode::Right) | (_, KeyCode::F(9)) => {
             app.next_session();
@@ -1663,7 +1681,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.6)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.7)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
@@ -1820,7 +1838,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.6 (Sovereign Rust Agent)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.7 (Sovereign Rust Agent)"));
                         return Ok(());
                     }
                     s => {
@@ -1974,7 +1992,7 @@ fn ui(f: &mut Frame, app: &App) {
     let status_area = outer[1];
 
     let session = app.session();
-    let is_welcome = app.active_page == 0 && session.show_welcome && session.messages.is_empty();
+    let is_welcome = app.active_page == 0 && session.show_welcome && session.messages.is_empty() && app.sessions.len() == 1;
 
     let (cursor, pill_area) = if is_welcome {
         // Welcome Screen: Centered Logo + Centered Input Card
@@ -2016,10 +2034,18 @@ fn ui(f: &mut Frame, app: &App) {
             let left_pane = chunks[0];
             let right_pane = chunks[1];
 
-            let chat_h = left_pane.height.saturating_sub(input_height + gap);
-            let chat_rect = Rect {
+            let session_tab_rect = Rect {
                 x: left_pane.x,
                 y: left_pane.y,
+                width: left_pane.width,
+                height: 1,
+            };
+            draw_session_tabs(f, app, session_tab_rect);
+
+            let chat_h = left_pane.height.saturating_sub(input_height + gap + 1);
+            let chat_rect = Rect {
+                x: left_pane.x,
+                y: left_pane.y + 1,
                 width: left_pane.width,
                 height: chat_h,
             };
@@ -2038,10 +2064,18 @@ fn ui(f: &mut Frame, app: &App) {
             (cur, pill_rect)
         } else {
             // Narrow screen: Single column workspace
-            let chat_h = box_area.height.saturating_sub(input_height + gap);
-            let chat_rect = Rect {
+            let session_tab_rect = Rect {
                 x: box_area.x,
                 y: box_area.y,
+                width: box_area.width,
+                height: 1,
+            };
+            draw_session_tabs(f, app, session_tab_rect);
+
+            let chat_h = box_area.height.saturating_sub(input_height + gap + 1);
+            let chat_rect = Rect {
+                x: box_area.x,
+                y: box_area.y + 1,
                 width: box_area.width,
                 height: chat_h,
             };
@@ -2133,23 +2167,49 @@ fn draw_page_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
 }
 
-#[allow(dead_code)]
-fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = Vec::new();
-    spans.push(Span::styled(" ", Style::default()));
+fn format_session_tabs_spans<'a>(app: &'a App, width: u16) -> Vec<Span<'a>> {
+    let mut left_spans = Vec::new();
+    left_spans.push(Span::raw(" "));
     for (i, session) in app.sessions.iter().enumerate() {
-        let style = if i == app.active_session {
-            Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+        if i == app.active_session {
+            left_spans.push(Span::styled(
+                format!("● {} ", session.name),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
         } else {
-            Style::default().fg(DIM)
-        };
-        spans.push(Span::styled(format!(" {} ", session.name), style));
-        spans.push(Span::styled("┃", Style::default().fg(DIM)));
+            left_spans.push(Span::styled(
+                format!("{} ", session.name),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if i < app.sessions.len() - 1 || app.sessions.len() < MAX_SESSIONS {
+            left_spans.push(Span::styled("│ ", Style::default().fg(DIM)));
+        }
     }
     if app.sessions.len() < MAX_SESSIONS {
-        spans.push(Span::styled(" + (Ctrl+T) ", Style::default().fg(DIM)));
+        left_spans.push(Span::styled("+ (Ctrl+T) ", Style::default().fg(ACCENT_DIM)));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
+
+    let right_spans = vec![
+        Span::styled("[Tab / ⇆ Switch · Ctrl+W Close] ", Style::default().fg(MUTED)),
+    ];
+
+    let left_len: usize = left_spans.iter().map(|s| s.width()).sum();
+    let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
+
+    let mut all_spans = left_spans;
+    if (width as usize) > left_len + right_len {
+        let pad_len = (width as usize) - left_len - right_len;
+        all_spans.push(Span::raw(" ".repeat(pad_len)));
+        all_spans.extend(right_spans);
+    }
+
+    all_spans
+}
+
+fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let spans = format_session_tabs_spans(app, area.width);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_DARK)), area);
 }
 
 #[allow(dead_code)]
@@ -3273,7 +3333,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let right_spans = vec![
         Span::styled("/status", Style::default().fg(ACCENT_DIM)),
         Span::styled("  ·  ", Style::default().fg(MUTED)),
-        Span::styled("v1.0.6 ", Style::default().fg(MUTED)),
+        Span::styled("v1.0.7 ", Style::default().fg(MUTED)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -3402,5 +3462,66 @@ mod tests {
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert!(handle_global_key(&mut app, esc));
         assert_eq!(app.active_page, 0);
+    }
+
+    #[test]
+    fn test_session_tabs_bar_formatting() {
+        let cfg = CaCodeConfig::default();
+        let mut app = App::new(cfg);
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.active_session, 0);
+
+        // 1. Initial single session formatting
+        let spans = format_session_tabs_spans(&app, 100);
+        let text_content: String = spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(text_content.contains("● Session 1"));
+        assert!(text_content.contains("│"));
+        assert!(text_content.contains("+ (Ctrl+T)"));
+        assert!(text_content.contains("[Tab / ⇆ Switch · Ctrl+W Close]"));
+
+        // Verify active session styling
+        let active_span = spans.iter().find(|s| s.content.contains("Session 1")).unwrap();
+        assert_eq!(active_span.style.fg, Some(ACCENT));
+        assert!(active_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // 2. Multi-session formatting
+        app.new_session(); // creates Session 2, active_session = 1
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.active_session, 1);
+
+        let spans2 = format_session_tabs_spans(&app, 120);
+        let s1_span = spans2.iter().find(|s| s.content.contains("Session 1")).unwrap();
+        assert_eq!(s1_span.style.fg, Some(MUTED));
+        assert!(!s1_span.style.add_modifier.contains(Modifier::BOLD));
+
+        let s2_span = spans2.iter().find(|s| s.content.contains("Session 2")).unwrap();
+        assert_eq!(s2_span.style.fg, Some(ACCENT));
+        assert!(s2_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // 3. Tab cycling
+        app.next_session();
+        assert_eq!(app.active_session, 0);
+        app.prev_session();
+        assert_eq!(app.active_session, 1);
+
+        // 4. Max sessions boundary
+        for _ in 2..MAX_SESSIONS {
+            app.new_session();
+        }
+        assert_eq!(app.sessions.len(), MAX_SESSIONS);
+
+        let spans_max = format_session_tabs_spans(&app, 160);
+        let max_text: String = spans_max.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!max_text.contains("+ (Ctrl+T)"));
+
+        // 5. Session closing & minimum boundary
+        while app.sessions.len() > 1 {
+            app.close_session();
+        }
+        assert_eq!(app.sessions.len(), 1);
+        app.close_session(); // should not close last session
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.status_msg, "Cannot close last session");
     }
 }
