@@ -1,6 +1,6 @@
 [package]
 name = "cacode-app"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "CACode CLI binary — entry point, clap, TUI"
 authors = ["Cecep Saeful Azhar Hidayat, ST"]

@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
     Frame, Terminal,
 };
 use rusqlite::Connection;
@@ -50,16 +50,11 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v1.0.4",
+    "  Sovereign Rust Development Agent  v1.0.5",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK & Free: Antigravity Zen, Ollama, 9Router, OpenAI, Anthropic",
-    "  • Local token usage monitor & cost estimator, Skill System",
     "  • Zero telemetry — your keys, your machine, your data",
-    "",
-    "  Type a message to chat, or '/' for command autocomplete",
-    "    /providers   /provider   /models   /mode   /settings   /skills",
-    "",
 ];
 
 const PAGE_NAMES: &[&str] = &["Chat", "Monitor", "Report", "Skills", "Settings"];
@@ -90,7 +85,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.4)"),
+    ("/version", "Show CACode version (v1.0.5)"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -204,6 +199,80 @@ fn fmt_num(n: i64) -> String {
     }
 }
 
+fn unescape_newlines(s: &str) -> String {
+    if s.contains("\\n") || s.contains("\\r\\n") || s.contains("\\t") || s.contains("\\\"") {
+        s.replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .replace("\\t", "    ")
+            .replace("\\\"", "\"")
+    } else {
+        s.to_string()
+    }
+}
+
+fn format_tool_action(tool: &str, args_raw: &str) -> (String, String) {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(args_raw).ok();
+    match tool {
+        "read_file" => {
+            let path = parsed
+                .as_ref()
+                .and_then(|v| v.get("path").or_else(|| v.get("file")).or_else(|| v.get("filename")))
+                .and_then(|v| v.as_str())
+                .unwrap_or(args_raw);
+            ("Reading file".to_string(), path.to_string())
+        }
+        "write_file" => {
+            let path = parsed
+                .as_ref()
+                .and_then(|v| v.get("path").or_else(|| v.get("file")))
+                .and_then(|v| v.as_str())
+                .unwrap_or(args_raw);
+            ("Writing file".to_string(), path.to_string())
+        }
+        "patch_file" | "search_replace" => {
+            let path = parsed
+                .as_ref()
+                .and_then(|v| v.get("path").or_else(|| v.get("file")))
+                .and_then(|v| v.as_str())
+                .unwrap_or(args_raw);
+            ("Patching file".to_string(), path.to_string())
+        }
+        "search_files" | "grep" => {
+            let pat = parsed
+                .as_ref()
+                .and_then(|v| v.get("pattern").or_else(|| v.get("query")))
+                .and_then(|v| v.as_str())
+                .unwrap_or(args_raw);
+            ("Searching files".to_string(), pat.to_string())
+        }
+        "exec_command" | "bash" | "sh" | "terminal" => {
+            let cmd = parsed
+                .as_ref()
+                .and_then(|v| v.get("command").or_else(|| v.get("cmd")))
+                .and_then(|v| v.as_str())
+                .unwrap_or(args_raw);
+            ("Running command".to_string(), cmd.to_string())
+        }
+        _ => {
+            let short = if args_raw.len() > 60 {
+                format!("{}…", &args_raw[..60])
+            } else {
+                args_raw.to_string()
+            };
+            (format!("Tool: {}", tool), short)
+        }
+    }
+}
+
+fn est_token_cost(provider: &str, prompt: i64, completion: i64) -> f64 {
+    let p_lower = provider.to_lowercase();
+    if p_lower.contains("zen") || p_lower.contains("ollama") {
+        0.0
+    } else {
+        (prompt as f64 * 2.50 + completion as f64 * 10.0) / 1_000_000.0
+    }
+}
+
 struct SettingsField {
     label: &'static str,
     key: &'static str,
@@ -226,6 +295,7 @@ struct ChatSession {
     scroll_offset: u16,
     total_tokens: u64,
     show_welcome: bool,
+    pub react_steps: Vec<String>,
 }
 
 impl ChatSession {
@@ -243,6 +313,7 @@ impl ChatSession {
             scroll_offset: 0,
             total_tokens: 0,
             show_welcome: true,
+            react_steps: Vec::new(),
         }
     }
 }
@@ -295,6 +366,7 @@ struct App {
     status_msg: String,
     is_thinking: bool,
     should_quit: bool,
+    pub show_exit_confirmation: bool,
     usage_rows: Vec<UsageRow>,
     report_rows: Vec<ReportRow>,
     daily_rows: Vec<DailyTrafficRow>,
@@ -329,6 +401,7 @@ impl App {
             status_msg: String::new(),
             is_thinking: false,
             should_quit: false,
+            show_exit_confirmation: false,
             usage_rows: Vec::new(),
             report_rows: Vec::new(),
             daily_rows: Vec::new(),
@@ -438,6 +511,14 @@ impl App {
             match ev {
                 AgentEvent::Thinking(stage) => {
                     self.sessions[target].show_welcome = false;
+                    let step_label = format!("● {}", stage);
+                    if self.sessions[target].react_steps.last().map(|s| s.as_str()) != Some(&step_label) {
+                        self.sessions[target].react_steps.push(step_label);
+                    }
+                    if self.sessions[target].react_steps.len() > 50 {
+                        let excess = self.sessions[target].react_steps.len() - 50;
+                        self.sessions[target].react_steps.drain(0..excess);
+                    }
                     if self.active_session == target {
                         self.status_msg = format!("{} — {}", self.sessions[target].name, stage);
                     }
@@ -449,28 +530,53 @@ impl App {
                     self.sessions[target].scroll_offset = 0;
                 }
                 AgentEvent::ToolStart { tool, args } => {
-                    let short_args = if args.len() > 120 {
-                        format!("{}…", &args[..120])
+                    let (action, target_str) = format_tool_action(&tool, &args);
+                    let step_item = if target_str.is_empty() {
+                        format!("● {}", action)
                     } else {
-                        args
+                        format!("● {} {}", tool, target_str)
+                    };
+                    self.sessions[target].react_steps.push(step_item);
+                    if self.sessions[target].react_steps.len() > 50 {
+                        let excess = self.sessions[target].react_steps.len() - 50;
+                        self.sessions[target].react_steps.drain(0..excess);
+                    }
+
+                    let disp_action = if target_str.is_empty() {
+                        action
+                    } else {
+                        format!("{} {}", action, target_str)
                     };
                     self.sessions[target].messages.push(ChatMessage::plain(
-                        "system",
-                        format!("[tool:{}] {}", tool, short_args),
+                        "tool_start",
+                        format!("● {}", disp_action),
                     ));
                 }
                 AgentEvent::ToolOutput { tool, output, is_error } => {
-                    let short = if output.len() > 500 {
-                        format!("{}…", &output[..500])
+                    let mark = if is_error { "✗" } else { "✓" };
+                    if let Some(pos) = self.sessions[target].react_steps.iter().rposition(|s| s.starts_with("●") && s.contains(&tool)) {
+                        let old = &self.sessions[target].react_steps[pos];
+                        let replaced = format!("{} {}", mark, old.trim_start_matches("● ").trim());
+                        self.sessions[target].react_steps[pos] = replaced;
+                    } else if let Some(last) = self.sessions[target].react_steps.last_mut() {
+                        if last.starts_with("●") {
+                            *last = format!("{} {}", mark, last.trim_start_matches("● ").trim());
+                        }
+                    }
+
+                    let clean_out = unescape_newlines(&output);
+                    let short = if clean_out.len() > 600 {
+                        format!("{}…", &clean_out[..600])
                     } else {
-                        output
+                        clean_out
                     };
-                    let line = if is_error {
-                        format!("[tool:{}] error: {}", tool, short)
+
+                    let (role, content) = if is_error {
+                        ("tool_result_error", format!("[Error: {}]\n{}", tool, short))
                     } else {
-                        format!("[tool:{}] {}", tool, short)
+                        ("tool_result", format!("[Result: {}]\n{}", tool, short))
                     };
-                    self.sessions[target].messages.push(ChatMessage::plain("system", line));
+                    self.sessions[target].messages.push(ChatMessage::plain(role, content));
                 }
                 AgentEvent::TurnFinished {
                     usage,
@@ -486,6 +592,11 @@ impl App {
                     s.agent.total_calls = total_calls;
                     s.total_tokens = total_usage.total_tokens as u64;
                     s.agent.total_usage = total_usage.clone();
+                    for step in s.react_steps.iter_mut().rev() {
+                        if step.starts_with("●") {
+                            *step = format!("✓ {}", step.trim_start_matches("● ").trim());
+                        }
+                    }
                     // Attach the token/duration metadata to the last assistant
                     // message so draw_messages can render the telemetry footer.
                     if let Some(msg) = s.messages.iter_mut().rev().find(|m| m.role == "assistant") {
@@ -1098,6 +1209,26 @@ async fn event_loop(
 }
 
 fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
+    // If exit confirmation modal is active, capture all keystrokes
+    if app.show_exit_confirmation {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                app.should_quit = true;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.show_exit_confirmation = false;
+            }
+            _ => {}
+        }
+        return true;
+    }
+
+    // Ctrl+D anywhere requests exit confirmation (unless editing setting value)
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') && !app.settings.editing {
+        app.show_exit_confirmation = true;
+        return true;
+    }
+
     // Esc in any secondary page returns straight to Chat
     if app.active_page != 0 && key.code == KeyCode::Esc && !app.settings.editing {
         app.active_page = 0;
@@ -1271,10 +1402,14 @@ async fn handle_chat_key(
                 app.agent_events_rx = None;
                 app.steering_tx = None;
                 app.cancel_token = None;
+            } else {
+                app.show_exit_confirmation = true;
             }
+            return Ok(());
         }
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Esc) => {
-            app.should_quit = true;
+            app.show_exit_confirmation = true;
+            return Ok(());
         }
         (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
             app.active_page = 4;
@@ -1512,7 +1647,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.4)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.5)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
@@ -1520,6 +1655,7 @@ async fn handle_chat_key(
                         app.session_mut().agent.history.clear();
                         app.session_mut().total_tokens = 0;
                         app.session_mut().show_welcome = true;
+                        app.session_mut().react_steps.clear();
                         app.status_msg = "Cleared".into();
                         return Ok(());
                     }
@@ -1589,7 +1725,7 @@ async fn handle_chat_key(
                             return Ok(());
                         }
                     }
-                    "/exit" => { app.should_quit = true; return Ok(()); }
+                    "/exit" => { app.show_exit_confirmation = true; return Ok(()); }
                     "/rename" => {
                         if arg.is_empty() {
                             app.session_mut().messages.push(ChatMessage::plain("system", "Usage: /rename <name>"));
@@ -1668,7 +1804,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.4 (Sovereign Rust Agent)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.5 (Sovereign Rust Agent)"));
                         return Ok(());
                     }
                     s => {
@@ -1801,7 +1937,7 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent) {
             app.save_settings();
             app.test_connection().await;
         }
-        (KeyModifiers::CONTROL, KeyCode::Char('d')) => { app.should_quit = true; }
+        (KeyModifiers::CONTROL, KeyCode::Char('d')) => { app.show_exit_confirmation = true; }
         _ => {}
     }
 }
@@ -1821,44 +1957,92 @@ fn ui(f: &mut Frame, app: &App) {
     let box_area = outer[0];
     let status_area = outer[1];
 
-    // Minimalist chat page: content + centered input pill.
-    // Pill is 3 rows tall (rounded border) when on the chat page, 1 row on
-    // secondary pages where it doubles as the hint line.
-    let input_height: u16 = if app.active_page == 0 { 3 } else { 1 };
-    let gap: u16 = 1;
-    let reserved = input_height + gap;
-    let content_h = box_area.height.saturating_sub(reserved);
+    let session = app.session();
+    let is_welcome = app.active_page == 0 && session.show_welcome && session.messages.is_empty();
 
-    let (cursor, pill_area) = if app.active_page == 0 {
-        // Single-column minimalist layout:
-        //   top pixel-block logo (only when chat is empty)
-        //   chat messages / welcome
-        //   centered input pill with "Ask anything..." placeholder
-        let session = app.session();
-        let top_logo: u16 = if session.show_welcome && session.messages.is_empty() {
-            1 // logo + tagline (drawn inside content)
-        } else {
-            0
-        };
-
-        let content_area = Rect {
+    let (cursor, pill_area) = if is_welcome {
+        // Welcome Screen: Centered Logo + Centered Input Card
+        let total_welcome_h = 16u16; // 10 lines for logo & tagline, 1 gap, 5 for input card
+        let pad_y = box_area.height.saturating_sub(total_welcome_h) / 2;
+        let welcome_h = 10u16.min(box_area.height.saturating_sub(6));
+        let welcome_rect = Rect {
             x: box_area.x,
-            y: box_area.y + top_logo,
+            y: box_area.y + pad_y,
             width: box_area.width,
-            height: content_h.saturating_sub(top_logo),
+            height: welcome_h,
         };
-        draw_chat_content(f, app, content_area);
+        draw_welcome(f, app, welcome_rect);
 
-        // Centered input pill
-        let pill_w = 80u16.min(box_area.width.saturating_sub(2));
-        let pill = Rect {
-            x: box_area.x + (box_area.width.saturating_sub(pill_w)) / 2,
-            y: box_area.y + box_area.height.saturating_sub(input_height + gap),
-            width: pill_w,
-            height: input_height,
+        let card_w = 82u16.min(box_area.width.saturating_sub(4));
+        let card_x = box_area.x + (box_area.width.saturating_sub(card_w)) / 2;
+        let card_y = (welcome_rect.y + welcome_h + 1).min(box_area.y + box_area.height.saturating_sub(5));
+        let card_rect = Rect {
+            x: card_x,
+            y: card_y,
+            width: card_w,
+            height: 5,
         };
-        let cur = draw_input(f, app, pill);
-        (cur, pill)
+        let cur = draw_welcome_input_card(f, app, card_rect);
+        (cur, card_rect)
+    } else if app.active_page == 0 {
+        // Active Chat View: Workspace + Input Docked
+        let is_wide = box_area.width >= 100;
+        let input_height: u16 = 3;
+        let gap: u16 = 1;
+
+        if is_wide {
+            // Split horizontally: Left Workspace (Min(60)) + Right Sidebar (Length(40))
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(60), Constraint::Length(40)])
+                .split(box_area);
+
+            let left_pane = chunks[0];
+            let right_pane = chunks[1];
+
+            let chat_h = left_pane.height.saturating_sub(input_height + gap);
+            let chat_rect = Rect {
+                x: left_pane.x,
+                y: left_pane.y,
+                width: left_pane.width,
+                height: chat_h,
+            };
+            draw_messages(f, session, chat_rect);
+
+            let pill_w = 80u16.min(left_pane.width.saturating_sub(2));
+            let pill_rect = Rect {
+                x: left_pane.x + (left_pane.width.saturating_sub(pill_w)) / 2,
+                y: left_pane.y + left_pane.height.saturating_sub(input_height + gap),
+                width: pill_w,
+                height: input_height,
+            };
+            let cur = draw_input(f, app, pill_rect);
+
+            draw_sidebar_inspector(f, app, right_pane);
+
+            (cur, pill_rect)
+        } else {
+            // Narrow screen: Single column workspace
+            let chat_h = box_area.height.saturating_sub(input_height + gap);
+            let chat_rect = Rect {
+                x: box_area.x,
+                y: box_area.y,
+                width: box_area.width,
+                height: chat_h,
+            };
+            draw_messages(f, session, chat_rect);
+
+            let pill_w = 80u16.min(box_area.width.saturating_sub(2));
+            let pill_rect = Rect {
+                x: box_area.x + (box_area.width.saturating_sub(pill_w)) / 2,
+                y: box_area.y + box_area.height.saturating_sub(input_height + gap),
+                width: pill_w,
+                height: input_height,
+            };
+            let cur = draw_input(f, app, pill_rect);
+
+            (cur, pill_rect)
+        }
     } else {
         // Secondary pages keep their own tab bar + content; pill is a hint row.
         let content_y = box_area.y;
@@ -1869,11 +2053,12 @@ fn ui(f: &mut Frame, app: &App) {
             height: 1,
         };
         draw_page_tabs(f, app, page_tab_area);
+        let content_h = box_area.height.saturating_sub(3);
         let content_area = Rect {
             x: box_area.x,
             y: content_y + 2,
             width: box_area.width,
-            height: content_h.saturating_sub(2),
+            height: content_h,
         };
         match app.active_page {
             1 => draw_monitor_content(f, app, content_area),
@@ -1894,18 +2079,25 @@ fn ui(f: &mut Frame, app: &App) {
 
     draw_status(f, app, status_area);
 
-    if let Some((cx, cy)) = cursor {
-        f.set_cursor_position((cx, cy));
+    if !app.show_exit_confirmation {
+        if let Some((cx, cy)) = cursor {
+            f.set_cursor_position((cx, cy));
+        }
     }
 
     // Draw autocomplete popup if user is typing a slash command
-    if app.active_page == 0 && app.modal_picker == ModalPicker::Off {
+    if app.active_page == 0 && app.modal_picker == ModalPicker::Off && !app.show_exit_confirmation {
         draw_autocomplete_popup(f, app, pill_area);
     }
 
     // Draw modal picker if active (Models or Thinking Mode)
-    if app.modal_picker != ModalPicker::Off {
+    if app.modal_picker != ModalPicker::Off && !app.show_exit_confirmation {
         draw_modal_picker(f, app, size);
+    }
+
+    // Draw exit confirmation modal if requested
+    if app.show_exit_confirmation {
+        draw_exit_confirmation(f, size);
     }
 }
 
@@ -1945,6 +2137,7 @@ fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
 }
 
+#[allow(dead_code)]
 fn draw_chat_content(f: &mut Frame, app: &App, area: Rect) {
     let session = app.session();
     if session.show_welcome && session.messages.is_empty() {
@@ -1954,52 +2147,19 @@ fn draw_chat_content(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
-    let session = app.session();
-    if !(session.show_welcome && session.messages.is_empty()) {
-        // Non-empty conversation: compact logo + version header at the top.
-        let header = Line::from(vec![
-            Span::styled(
-                "CACode",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " v1.0.4 · sovereign Rust agent",
-                Style::default().fg(MUTED),
-            ),
-        ]);
-        f.render_widget(
-            Paragraph::new(header).style(Style::default().bg(BG_DARK)),
-            Rect {
-                height: 1,
-                ..area
-            },
-        );
-        return;
-    }
-
-    // Fresh conversation: centered pixel-block logo + welcome details.
+fn draw_welcome(f: &mut Frame, _app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    let total_content_height = (LOGO.len() + WELCOME_LINES.len()) as u16;
-    let pad = area.height.saturating_sub(total_content_height) / 2;
-    for _ in 0..pad.min(3) {
-        lines.push(Line::from(""));
-    }
-
     for row in LOGO {
         lines.push(Line::from(Span::styled(
             *row,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
     }
-
     for row in WELCOME_LINES {
         let style = if row.starts_with("  •") {
             Style::default().fg(GRAY)
         } else if row.contains("Sovereign") {
             Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD)
-        } else if row.contains('/') {
-            Style::default().fg(ACCENT)
         } else {
             Style::default().fg(MUTED)
         };
@@ -2013,24 +2173,432 @@ fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
+    let session = app.session();
+
+    let card_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT_DIM))
+        .style(Style::default().bg(BG_PILL));
+    f.render_widget(card_block, area);
+
+    if area.height < 5 || area.width < 10 {
+        return None;
+    }
+
+    let inner_width = area.width.saturating_sub(4) as usize;
+
+    // Line 1: Input text or placeholder
+    let show_placeholder = session.input.is_empty();
+    let content_style = if show_placeholder {
+        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(TEXT_SOFT)
+    };
+
+    let line1 = Line::from(vec![
+        Span::styled("> ", Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD)),
+        if show_placeholder {
+            Span::styled("Ask anything... \"fix broken tests\"", content_style)
+        } else {
+            Span::styled(&*session.input, content_style)
+        },
+    ]);
+    f.render_widget(
+        Paragraph::new(line1).style(Style::default().bg(BG_PILL)),
+        Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+
+    // Line 2: Divider
+    let divider = "─".repeat(inner_width);
+    let line2 = Line::from(Span::styled(divider, Style::default().fg(Color::Rgb(38, 45, 56))));
+    f.render_widget(
+        Paragraph::new(line2).style(Style::default().bg(BG_PILL)),
+        Rect {
+            x: area.x + 2,
+            y: area.y + 2,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+
+    // Line 3: Footer line
+    let mode = app.thinking_mode();
+    let model = app.model_name();
+    let provider = app.provider_name();
+
+    let left_spans = vec![
+        Span::styled("⚡ ", Style::default().fg(Color::Yellow)),
+        Span::styled(format!("{} ", mode), Style::default().fg(TEXT_SOFT).add_modifier(Modifier::BOLD)),
+        Span::styled(" ", Style::default()),
+        Span::styled(format!("{} ", model), Style::default().fg(TEXT_SOFT)),
+        Span::styled(" ", Style::default()),
+        Span::styled(provider, Style::default().fg(ACCENT_DIM)),
+    ];
+
+    let right_spans = vec![
+        Span::styled("tab", Style::default().fg(ACCENT_DIM)),
+        Span::styled(" switch agent · ", Style::default().fg(MUTED)),
+        Span::styled("ctrl+p", Style::default().fg(ACCENT_DIM)),
+        Span::styled(" commands", Style::default().fg(MUTED)),
+    ];
+
+    let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let right_len: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad_len = inner_width.saturating_sub(left_len + right_len);
+
+    let mut footer_spans = left_spans;
+    if pad_len > 0 {
+        footer_spans.push(Span::raw(" ".repeat(pad_len)));
+    }
+    footer_spans.extend(right_spans);
+
+    let line3 = Line::from(footer_spans);
+    f.render_widget(
+        Paragraph::new(line3).style(Style::default().bg(BG_PILL)),
+        Rect {
+            x: area.x + 2,
+            y: area.y + 3,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+
+    let cx = area.x + 4 + session.cursor_pos as u16;
+    let cy = area.y + 1;
+    Some((cx, cy))
+}
+
+fn draw_exit_confirmation(f: &mut Frame, screen: Rect) {
+    let modal_w = 54u16.min(screen.width.saturating_sub(2));
+    let modal_h = 7u16.min(screen.height);
+    let x = screen.x + (screen.width.saturating_sub(modal_w)) / 2;
+    let y = screen.y + (screen.height.saturating_sub(modal_h)) / 2;
+    let modal_rect = Rect { x, y, width: modal_w, height: modal_h };
+
+    f.render_widget(Clear, modal_rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .title(" Exit Confirmation ")
+        .title_alignment(Alignment::Center)
+        .style(Style::default().bg(BG_PILL));
+    f.render_widget(block, modal_rect);
+
+    let inner_area = Rect {
+        x: modal_rect.x + 1,
+        y: modal_rect.y + 1,
+        width: modal_rect.width.saturating_sub(2),
+        height: modal_rect.height.saturating_sub(2),
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Are you sure you want to quit CACode?",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )).alignment(Alignment::Center),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Y] Yes, Exit", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw("        "),
+            Span::styled("[N] Cancel", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]).alignment(Alignment::Center),
+    ];
+
+    let p = Paragraph::new(lines).style(Style::default().bg(BG_PILL));
+    f.render_widget(p, inner_area);
+}
+
+fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(" [ ⚡ RUNTIME & TELEMETRY ] ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
+        .title_alignment(Alignment::Center)
+        .style(Style::default().bg(BG_DARK));
+    f.render_widget(block, area);
+
+    if area.width < 10 || area.height < 10 {
+        return;
+    }
+
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+
+    let session = app.session();
+
+    // 1. Task Title
+    let task_title = session.messages.iter()
+        .find(|m| m.role == "user")
+        .map(|m| {
+            let first_line = m.content.lines().next().unwrap_or(&m.content).trim();
+            let clean = first_line.trim_start_matches("> ").trim();
+            let max_len = (inner.width as usize).saturating_sub(8);
+            if clean.chars().count() > max_len {
+                let s: String = clean.chars().take(max_len.saturating_sub(3)).collect();
+                format!("{}...", s)
+            } else {
+                clean.to_string()
+            }
+        })
+        .unwrap_or_else(|| "Active Task".to_string());
+
+    // 2. Tokens & Cost
+    let total_tok = session.agent.total_usage.total_tokens.max(session.total_tokens as i64);
+    let prompt_tok = session.agent.total_usage.prompt_tokens;
+    let compl_tok = session.agent.total_usage.completion_tokens;
+    let cost = est_token_cost(app.provider_name(), prompt_tok, compl_tok);
+    let cost_str = if cost == 0.0 { "$0.00".to_string() } else { format!("${:.2}", cost) };
+
+    // 3. Context Window
+    let limit = if session.agent.context_window_limit > 0 { session.agent.context_window_limit } else { 200_000 };
+    let pct = ((total_tok as f64 / limit as f64) * 100.0).min(100.0);
+    let ctx_bar_w = (inner.width as usize).saturating_sub(4).clamp(6, 20);
+    let filled = ((pct / 100.0) * ctx_bar_w as f64).round() as usize;
+    let bar = format!("[{}{}]", "█".repeat(filled.min(ctx_bar_w)), "░".repeat(ctx_bar_w.saturating_sub(filled)));
+
+    // 4. Runtime / Status
+    let (status_label, status_col) = if app.is_thinking {
+        ("Thinking...", Color::Yellow)
+    } else {
+        ("Idle", Color::Green)
+    };
+
+    // 5. CWD & Environment
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd_str = if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = cwd.strip_prefix(&home) {
+            format!("~/{}", rel.display())
+        } else {
+            cwd.display().to_string()
+        }
+    } else {
+        cwd.display().to_string()
+    };
+    let short_cwd = if cwd_str.chars().count() > (inner.width as usize).saturating_sub(6) {
+        let max_c = (inner.width as usize).saturating_sub(9);
+        let s: String = cwd_str.chars().take(max_c).collect();
+        format!("{}...", s)
+    } else {
+        cwd_str
+    };
+
+    let turns_count = session.messages.iter().filter(|m| m.role == "user").count();
+
+    let div_str = "─".repeat(inner.width as usize);
+    let div_style = Style::default().fg(Color::Rgb(38, 45, 56));
+
+    let mut lines = Vec::new();
+
+    // Section: Active Task
+    lines.push(Line::from(vec![
+        Span::styled("Task: ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("\"{}\"", task_title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(Span::styled(&div_str, div_style)));
+
+    // Section: Tokens & Cost banner
+    lines.push(Line::from(vec![
+        Span::styled("⚡ ", Style::default().fg(Color::Yellow)),
+        Span::styled(format!("{} tokens ({})", fmt_num(total_tok), cost_str), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  • In:  ", Style::default().fg(MUTED)),
+        Span::styled(fmt_num(prompt_tok), Style::default().fg(TEXT_SOFT)),
+        Span::styled("  • Out: ", Style::default().fg(MUTED)),
+        Span::styled(fmt_num(compl_tok), Style::default().fg(TEXT_SOFT)),
+    ]));
+    lines.push(Line::from(Span::styled(&div_str, div_style)));
+
+    // Section: Step Tracker
+    lines.push(Line::from(Span::styled("Step Tracker:", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))));
+    if session.react_steps.is_empty() {
+        lines.push(Line::from(Span::styled("  • No tool steps yet", Style::default().fg(MUTED))));
+    } else {
+        let avail_steps = (inner.height as usize).saturating_sub(20).clamp(2, 8);
+        for step in session.react_steps.iter().rev().take(avail_steps).rev() {
+            let max_w = (inner.width as usize).saturating_sub(4);
+            let display_step = if step.chars().count() > max_w {
+                let s: String = step.chars().take(max_w.saturating_sub(3)).collect();
+                format!("{}...", s)
+            } else {
+                step.clone()
+            };
+
+            if display_step.starts_with("✓ ") {
+                lines.push(Line::from(vec![
+                    Span::styled("✓ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(display_step.trim_start_matches("✓ ").to_string(), Style::default().fg(GRAY)),
+                ]));
+            } else if display_step.starts_with("● ") {
+                lines.push(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(display_step.trim_start_matches("● ").to_string(), Style::default().fg(Color::Yellow)),
+                ]));
+            } else if display_step.starts_with("✗ ") {
+                lines.push(Line::from(vec![
+                    Span::styled("✗ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(display_step.trim_start_matches("✗ ").to_string(), Style::default().fg(Color::Red)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(display_step, Style::default().fg(GRAY))));
+            }
+        }
+    }
+    lines.push(Line::from(Span::styled(&div_str, div_style)));
+
+    // Section: Context Window
+    lines.push(Line::from(vec![
+        Span::styled("Context: ", Style::default().fg(ACCENT)),
+        Span::styled(format!("{:.1}k / {}k ({:.1}%)", total_tok as f64 / 1000.0, limit / 1000, pct), Style::default().fg(TEXT_SOFT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {} ", bar), Style::default().fg(Color::Cyan)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Provider: ", Style::default().fg(MUTED)),
+        Span::styled(app.provider_name(), Style::default().fg(ACCENT_DIM)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Model:    ", Style::default().fg(MUTED)),
+        Span::styled(app.model_name(), Style::default().fg(TEXT_SOFT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Mode:     ", Style::default().fg(MUTED)),
+        Span::styled(app.thinking_mode(), Style::default().fg(TEXT_SOFT)),
+        Span::styled(" · ", Style::default().fg(DIM)),
+        Span::styled(status_label, Style::default().fg(status_col)),
+    ]));
+    lines.push(Line::from(Span::styled(&div_str, div_style)));
+
+    // Section: Environment
+    lines.push(Line::from(vec![
+        Span::styled("CWD:     ", Style::default().fg(MUTED)),
+        Span::styled(short_cwd, Style::default().fg(TEXT_SOFT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Session: ", Style::default().fg(MUTED)),
+        Span::styled(&session.name, Style::default().fg(TEXT_SOFT)),
+        Span::styled(format!(" ({} turns)", turns_count), Style::default().fg(MUTED)),
+    ]));
+    lines.push(Line::from(Span::styled(&div_str, div_style)));
+
+    // Section: Shortcuts
+    lines.push(Line::from(vec![
+        Span::styled("^C", Style::default().fg(ACCENT_DIM)),
+        Span::styled(" cancel · ", Style::default().fg(MUTED)),
+        Span::styled("Tab", Style::default().fg(ACCENT_DIM)),
+        Span::styled(" session · ", Style::default().fg(MUTED)),
+        Span::styled("Esc", Style::default().fg(ACCENT_DIM)),
+        Span::styled(" exit", Style::default().fg(MUTED)),
+    ]));
+
+    let p = Paragraph::new(lines).style(Style::default().bg(BG_DARK));
+    f.render_widget(p, inner);
+}
+
 fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &session.messages {
         match msg.role.as_str() {
             "user" => {
+                let unescaped = unescape_newlines(&msg.content);
                 lines.push(Line::from(vec![
                     Span::styled("> ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-                    Span::styled(&*msg.content, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(unescaped, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 ]));
                 lines.push(Line::from(""));
             }
+            "tool_start" => {
+                let unescaped = unescape_newlines(&msg.content);
+                let parts: Vec<&str> = unescaped.splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{} ", parts[0]), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(parts[1].to_string(), Style::default().fg(TEXT_SOFT).add_modifier(Modifier::BOLD)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(unescaped, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+                }
+            }
+            "tool_result" => {
+                let unescaped = unescape_newlines(&msg.content);
+                let mut msg_lines = unescaped.lines();
+                if let Some(badge) = msg_lines.next() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ↳ ", Style::default().fg(MUTED)),
+                        Span::styled(badge.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+                for l in msg_lines {
+                    lines.push(Line::from(vec![
+                        Span::styled("    │ ", Style::default().fg(DIM)),
+                        Span::styled(l.to_string(), Style::default().fg(MUTED)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
+            "tool_result_error" => {
+                let unescaped = unescape_newlines(&msg.content);
+                let mut msg_lines = unescaped.lines();
+                if let Some(badge) = msg_lines.next() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ↳ ", Style::default().fg(MUTED)),
+                        Span::styled(badge.to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+                for l in msg_lines {
+                    lines.push(Line::from(vec![
+                        Span::styled("    │ ", Style::default().fg(DIM)),
+                        Span::styled(l.to_string(), Style::default().fg(Color::Rgb(248, 113, 113))),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
             "assistant" => {
-                for line in msg.content.lines() {
-                    lines.push(Line::from(Span::styled(
-                        line,
-                        Style::default().fg(GRAY),
-                    )));
+                let unescaped = unescape_newlines(&msg.content);
+                let mut in_code_block = false;
+                for line in unescaped.lines() {
+                    if line.trim_start().starts_with("```") {
+                        if !in_code_block {
+                            in_code_block = true;
+                            let lang = line.trim_start().trim_start_matches('`').trim();
+                            let lang_tag = if lang.is_empty() { "code" } else { lang };
+                            lines.push(Line::from(vec![
+                                Span::styled("  ╭── ", Style::default().fg(ACCENT_DIM)),
+                                Span::styled(lang_tag.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                                Span::styled(" ────────────────────", Style::default().fg(ACCENT_DIM)),
+                            ]));
+                        } else {
+                            in_code_block = false;
+                            lines.push(Line::from(Span::styled("  ╰────────────────────────────", Style::default().fg(ACCENT_DIM))));
+                        }
+                    } else if in_code_block {
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(ACCENT_DIM)),
+                            Span::styled(line.to_string(), Style::default().fg(Color::Rgb(226, 232, 240))),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(GRAY),
+                        )));
+                    }
                 }
                 // Subtle per-turn token telemetry footer: e.g. [⚡ 1,240 tokens (980 in / 260 out) • 1.2s]
                 if let Some(ref u) = msg.tokens {
@@ -2050,9 +2618,10 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                 lines.push(Line::from(""));
             }
             _ => {
-                for line in msg.content.lines() {
+                let unescaped = unescape_newlines(&msg.content);
+                for line in unescaped.lines() {
                     lines.push(Line::from(Span::styled(
-                        line,
+                        line.to_string(),
                         Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
                     )));
                 }
@@ -2652,15 +3221,27 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let provider = app.provider_name();
     let model = app.model_name();
 
-    // Left side: status indicator (Build/Idle), active model name, provider name.
     let (status_dot, status_label, status_color) = if app.is_thinking {
         ("●", "Build", Color::Yellow)
     } else {
         ("●", "Idle", Color::Green)
     };
 
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd_str = if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = cwd.strip_prefix(&home) {
+            format!("~/{}", rel.display())
+        } else {
+            cwd.display().to_string()
+        }
+    } else {
+        cwd.display().to_string()
+    };
+
     let mut left_spans = vec![
-        Span::styled(format!(" {} ", status_dot), Style::default().fg(status_color)),
+        Span::styled(format!(" {} ", cwd_str), Style::default().fg(TEXT_SOFT)),
+        Span::styled("· ", Style::default().fg(MUTED)),
+        Span::styled(format!("{} ", status_dot), Style::default().fg(status_color)),
         Span::styled(format!("{} ", status_label), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
         Span::styled("· ", Style::default().fg(MUTED)),
         Span::styled(format!("{} ", model), Style::default().fg(TEXT_SOFT).add_modifier(Modifier::BOLD)),
@@ -2681,12 +3262,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         left_spans.push(Span::styled(format!("{} ", app.status_msg), Style::default().fg(ACCENT_DIM)));
     }
 
-    // Right side: bottom-right corner hints: 'tab switch agent' and 'ctrl+p commands'
     let right_spans = vec![
-        Span::styled("tab", Style::default().fg(ACCENT_DIM)),
-        Span::styled(" switch agent  ·  ", Style::default().fg(MUTED)),
-        Span::styled("ctrl+p", Style::default().fg(ACCENT_DIM)),
-        Span::styled(" commands ", Style::default().fg(MUTED)),
+        Span::styled("/status", Style::default().fg(ACCENT_DIM)),
+        Span::styled("  ·  ", Style::default().fg(MUTED)),
+        Span::styled("v1.0.5 ", Style::default().fg(MUTED)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -2702,4 +3281,81 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(all_spans);
     let p = Paragraph::new(line).style(Style::default().bg(BG_DARK));
     f.render_widget(p, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unescape_newlines() {
+        let input = "hello\\nworld\\r\\nfoo\\tbar\\\"baz\\\"";
+        let output = unescape_newlines(input);
+        assert_eq!(output, "hello\nworld\nfoo    bar\"baz\"");
+    }
+
+    #[test]
+    fn test_format_tool_action() {
+        let (verb, target) = format_tool_action("read_file", r#"{"path":"src/main.rs"}"#);
+        assert_eq!(verb, "Reading file");
+        assert_eq!(target, "src/main.rs");
+
+        let (verb, cmd) = format_tool_action("exec_command", r#"{"command":"cargo test"}"#);
+        assert_eq!(verb, "Running command");
+        assert_eq!(cmd, "cargo test");
+
+        let (verb, pat) = format_tool_action("search_files", r#"{"pattern":"TODO"}"#);
+        assert_eq!(verb, "Searching files");
+        assert_eq!(pat, "TODO");
+    }
+
+    #[test]
+    fn test_est_token_cost() {
+        let zen_cost = est_token_cost("Antigravity Zen", 1000, 1000);
+        assert_eq!(zen_cost, 0.0);
+
+        let paid_cost = est_token_cost("OpenAI", 1_000_000, 1_000_000);
+        assert!((paid_cost - 12.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_exit_confirmation_flow() {
+        let cfg = CaCodeConfig::default();
+        let mut app = App::new(cfg);
+        assert!(!app.show_exit_confirmation);
+        assert!(!app.should_quit);
+
+        // Open exit confirmation
+        app.show_exit_confirmation = true;
+
+        // Cancel with 'n'
+        let cancel_key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        let captured = handle_global_key(&mut app, cancel_key);
+        assert!(captured);
+        assert!(!app.show_exit_confirmation);
+        assert!(!app.should_quit);
+
+        // Open again and confirm with 'y'
+        app.show_exit_confirmation = true;
+        let confirm_key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let captured = handle_global_key(&mut app, confirm_key);
+        assert!(captured);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_react_steps_tracking() {
+        let cfg = CaCodeConfig::default();
+        let mut session = ChatSession::new("Test".into(), &cfg);
+        assert!(session.react_steps.is_empty());
+
+        session.react_steps.push("● read_file src/lib.rs".to_string());
+        assert_eq!(session.react_steps.len(), 1);
+
+        // Simulate tool completion
+        if let Some(last) = session.react_steps.last_mut() {
+            *last = format!("✓ {}", last.trim_start_matches("● ").trim());
+        }
+        assert_eq!(session.react_steps[0], "✓ read_file src/lib.rs");
+    }
 }
