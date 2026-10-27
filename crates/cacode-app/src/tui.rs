@@ -50,7 +50,7 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v1.0.7",
+    "  Sovereign Rust Development Agent  v1.0.8",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK & Free: Antigravity Zen, Ollama, 9Router, OpenAI, Anthropic",
@@ -59,6 +59,8 @@ const WELCOME_LINES: &[&str] = &[
 
 const PAGE_NAMES: &[&str] = &["Chat", "Monitor", "Report", "Skills", "Settings"];
 const MAX_SESSIONS: usize = 9;
+
+const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/models", "Interactive AI model picker"),
@@ -69,6 +71,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/monitor", "View real-time token telemetry & proxy log"),
     ("/report", "View token usage summary, heatmap & model analytics"),
     ("/skills", "Manage custom skills & reusable prompts"),
+    ("/todo", "Manage task checklist (/todo add|done|list|clear)"),
     ("/dev", "⚡ Feature development & implementation protocol"),
     ("/prd", "📋 Product Requirements Document drafting workflow"),
     ("/audit", "🛡️ Security & architecture whitebox audit"),
@@ -85,7 +88,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.7)"),
+    ("/version", "Show CACode version (v1.0.8)"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -275,7 +278,13 @@ struct SettingsState {
     editing: bool,
 }
 
-struct ChatSession {
+#[derive(Clone, Debug, PartialEq)]
+pub struct TodoItem {
+    pub text: String,
+    pub done: bool,
+}
+
+pub struct ChatSession {
     name: String,
     messages: Vec<ChatMessage>,
     agent: ReActAgent,
@@ -285,6 +294,7 @@ struct ChatSession {
     total_tokens: u64,
     show_welcome: bool,
     pub react_steps: Vec<String>,
+    pub todos: Vec<TodoItem>,
 }
 
 impl ChatSession {
@@ -303,8 +313,233 @@ impl ChatSession {
             total_tokens: 0,
             show_welcome: true,
             react_steps: Vec::new(),
+            todos: Vec::new(),
         }
     }
+
+    pub fn update_todos_from_text(&mut self, text: &str) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let rest = if let Some(r) = trimmed.strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .or_else(|| trimmed.strip_prefix("+ "))
+            {
+                r.trim()
+            } else if let Some(dot_idx) = trimmed.find(". ") {
+                if trimmed[..dot_idx].chars().all(|c| c.is_ascii_digit()) {
+                    trimmed[dot_idx + 2..].trim()
+                } else {
+                    trimmed
+                }
+            } else {
+                trimmed
+            };
+
+            let (is_todo, done, todo_text) = if let Some(item_text) = rest.strip_prefix("[ ] ") {
+                (true, false, item_text.trim())
+            } else if let Some(item_text) = rest.strip_prefix("[x] ").or_else(|| rest.strip_prefix("[X] ")) {
+                (true, true, item_text.trim())
+            } else if rest.starts_with("[ ]") {
+                (true, false, rest.trim_start_matches("[ ]").trim())
+            } else if rest.starts_with("[x]") || rest.starts_with("[X]") {
+                (true, true, rest[3..].trim())
+            } else {
+                (false, false, "")
+            };
+
+            if is_todo && !todo_text.is_empty() {
+                if let Some(existing) = self.todos.iter_mut().find(|t| t.text == todo_text) {
+                    existing.done = done;
+                } else {
+                    self.todos.push(TodoItem {
+                        text: todo_text.to_string(),
+                        done,
+                    });
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn sync_todos_from_steps(&mut self) {
+        if self.todos.is_empty() {
+            for step in &self.react_steps {
+                let clean = step.trim();
+                let (done, text) = if let Some(s) = clean.strip_prefix("✓ ") {
+                    (true, s.trim())
+                } else if let Some(s) = clean.strip_prefix("● ") {
+                    (false, s.trim())
+                } else if let Some(s) = clean.strip_prefix("✗ ") {
+                    (false, s.trim())
+                } else {
+                    (false, clean)
+                };
+                if !text.is_empty() {
+                    self.todos.push(TodoItem {
+                        text: text.to_string(),
+                        done,
+                    });
+                }
+            }
+        }
+    }
+}
+
+pub fn get_cursor_coords(input: &str, cursor_pos: usize) -> (usize, usize) {
+    let mut current_pos = 0;
+    let lines: Vec<&str> = input.split('\n').collect();
+    for (row, line) in lines.iter().enumerate() {
+        let line_len = line.len();
+        if cursor_pos <= current_pos + line_len {
+            let offset_bytes = cursor_pos.saturating_sub(current_pos);
+            let sub = if offset_bytes >= line_len {
+                *line
+            } else if line.is_char_boundary(offset_bytes) {
+                &line[..offset_bytes]
+            } else {
+                let safe_end = line
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|&i| i < offset_bytes)
+                    .last()
+                    .unwrap_or(0);
+                &line[..safe_end]
+            };
+            let col = sub.chars().count();
+            return (row, col);
+        }
+        current_pos += line_len + 1;
+    }
+    let last_row = lines.len().saturating_sub(1);
+    let last_col = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+    (last_row, last_col)
+}
+
+pub fn detect_image_reference(text: &str) -> Option<String> {
+    for word in text.split_whitespace() {
+        if let Some(rest) = word.strip_prefix("@img:").or_else(|| word.strip_prefix("@image:")) {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    if let Some(start) = text.find("![") {
+        if let Some(mid) = text[start..].find("](") {
+            let after_mid = start + mid + 2;
+            if let Some(end) = text[after_mid..].find(')') {
+                let target = &text[after_mid..after_mid + end];
+                return Some(target.to_string());
+            }
+        }
+    }
+    const IMG_EXTS: &[&str] = &[".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"];
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c| c == '(' || c == ')' || c == '"' || c == '\'' || c == '<' || c == '>');
+        let lower = clean.to_lowercase();
+        for ext in IMG_EXTS {
+            if lower.ends_with(ext) {
+                return Some(clean.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn render_styled_line(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    let len = text.len();
+
+    const IMG_EXTS: &[&str] = &[".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"];
+
+    fn extract_filename(target: &str) -> String {
+        let clean = target.trim_matches(|c| c == '(' || c == ')' || c == '"' || c == '\'' || c == '<' || c == '>');
+        clean.rsplit('/').next().unwrap_or(clean).to_string()
+    }
+
+    while cursor < len {
+        if text[cursor..].starts_with("![") {
+            if let Some(mid) = text[cursor..].find("](") {
+                let url_start = cursor + mid + 2;
+                if let Some(end) = text[url_start..].find(')') {
+                    let url = &text[url_start..url_start + end];
+                    let filename = extract_filename(url);
+                    spans.push(Span::styled(
+                        format!("[🖼️ Image: {}]", filename),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ));
+                    cursor = url_start + end + 1;
+                    continue;
+                }
+            }
+        }
+
+        let next_space = text[cursor..].find(char::is_whitespace).map(|i| cursor + i).unwrap_or(len);
+        let token = &text[cursor..next_space];
+
+        if let Some(rest) = token.strip_prefix("@img:").or_else(|| token.strip_prefix("@image:")) {
+            let filename = extract_filename(rest);
+            spans.push(Span::styled(
+                format!("[🖼️ Image: {}]", filename),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+            cursor = next_space;
+            let ws_end = text[cursor..].find(|c: char| !c.is_whitespace()).map(|i| cursor + i).unwrap_or(len);
+            if ws_end > cursor {
+                spans.push(Span::styled(text[cursor..ws_end].to_string(), base_style));
+                cursor = ws_end;
+            }
+            continue;
+        }
+
+        let clean = token.trim_matches(|c| c == '(' || c == ')' || c == '"' || c == '\'' || c == '<' || c == '>' || c == ',' || c == '.');
+        let lower = clean.to_lowercase();
+        let is_img = IMG_EXTS.iter().any(|ext| lower.ends_with(ext));
+
+        if is_img && !clean.is_empty() {
+            let pfx_len = token.find(clean).unwrap_or(0);
+            if pfx_len > 0 {
+                spans.push(Span::styled(token[..pfx_len].to_string(), base_style));
+            }
+            let filename = extract_filename(clean);
+            spans.push(Span::styled(
+                format!("[🖼️ Image: {}]", filename),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+            let sfx_start = pfx_len + clean.len();
+            if sfx_start < token.len() {
+                spans.push(Span::styled(token[sfx_start..].to_string(), base_style));
+            }
+        } else if clean.starts_with("http://") || clean.starts_with("https://") || clean.starts_with("git@") {
+            let pfx_len = token.find(clean).unwrap_or(0);
+            if pfx_len > 0 {
+                spans.push(Span::styled(token[..pfx_len].to_string(), base_style));
+            }
+            spans.push(Span::styled(
+                clean.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+            ));
+            let sfx_start = pfx_len + clean.len();
+            if sfx_start < token.len() {
+                spans.push(Span::styled(token[sfx_start..].to_string(), base_style));
+            }
+        } else {
+            spans.push(Span::styled(token.to_string(), base_style));
+        }
+
+        cursor = next_space;
+        let ws_end = text[cursor..].find(|c: char| !c.is_whitespace()).map(|i| cursor + i).unwrap_or(len);
+        if ws_end > cursor {
+            spans.push(Span::styled(text[cursor..ws_end].to_string(), base_style));
+            cursor = ws_end;
+        }
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+
+    spans
 }
 
 struct UsageRow {
@@ -536,6 +771,12 @@ impl App {
                     } else {
                         format!("{} {}", action, target_str)
                     };
+                    if self.sessions[target].todos.is_empty() || self.sessions[target].todos.iter().all(|t| t.done) {
+                        self.sessions[target].todos.push(TodoItem {
+                            text: disp_action.clone(),
+                            done: false,
+                        });
+                    }
                     self.sessions[target].messages.push(ChatMessage::plain(
                         "tool_start",
                         format!("● {}", disp_action),
@@ -550,6 +791,12 @@ impl App {
                     } else if let Some(last) = self.sessions[target].react_steps.last_mut() {
                         if last.starts_with("●") {
                             *last = format!("{} {}", mark, last.trim_start_matches("● ").trim());
+                        }
+                    }
+
+                    if !is_error {
+                        if let Some(t) = self.sessions[target].todos.iter_mut().rfind(|t| !t.done && (t.text.contains(&tool) || tool.contains(&t.text))) {
+                            t.done = true;
                         }
                     }
 
@@ -591,6 +838,8 @@ impl App {
                     if let Some(msg) = s.messages.iter_mut().rev().find(|m| m.role == "assistant") {
                         msg.tokens = Some(usage);
                         msg.duration_ms = Some(duration_ms);
+                        let content = msg.content.clone();
+                        s.update_todos_from_text(&content);
                     }
                     if self.active_session == target {
                         self.is_thinking = false;
@@ -1460,6 +1709,22 @@ async fn handle_chat_key(
         (KeyModifiers::CONTROL, KeyCode::Left) | (_, KeyCode::F(8)) => {
             app.prev_session();
         }
+        (mods, KeyCode::Enter) if mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT) => {
+            let pos = app.session().cursor_pos;
+            let valid_pos = if app.session().input.is_char_boundary(pos) { pos } else { app.session().input.len() };
+            app.session_mut().input.insert(valid_pos, '\n');
+            app.session_mut().cursor_pos = valid_pos + 1;
+            app.session_mut().show_welcome = false;
+            return Ok(());
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+            let pos = app.session().cursor_pos;
+            let valid_pos = if app.session().input.is_char_boundary(pos) { pos } else { app.session().input.len() };
+            app.session_mut().input.insert(valid_pos, '\n');
+            app.session_mut().cursor_pos = valid_pos + 1;
+            app.session_mut().show_welcome = false;
+            return Ok(());
+        }
         (_, KeyCode::Enter) => {
             let input = app.session().input.trim().to_string();
             if input.is_empty() { return Ok(()); }
@@ -1487,6 +1752,63 @@ async fn handle_chat_key(
                 let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
                 match cmd {
+                    "/todo" => {
+                        let sub_parts: Vec<&str> = arg.splitn(2, ' ').collect();
+                        let sub = sub_parts.first().copied().unwrap_or("").trim();
+                        let sub_arg = sub_parts.get(1).copied().unwrap_or("").trim();
+                        match sub {
+                            "add" => {
+                                if sub_arg.is_empty() {
+                                    app.session_mut().messages.push(ChatMessage::plain("system", "Usage: /todo add <task text>"));
+                                } else {
+                                    app.session_mut().todos.push(TodoItem {
+                                        text: sub_arg.to_string(),
+                                        done: false,
+                                    });
+                                    app.status_msg = format!("Added task: {}", sub_arg);
+                                    app.session_mut().messages.push(ChatMessage::plain("system", format!("Task added: [ ] {}", sub_arg)));
+                                }
+                            }
+                            "done" => {
+                                if let Ok(idx) = sub_arg.parse::<usize>() {
+                                    if idx >= 1 && idx <= app.session().todos.len() {
+                                        app.session_mut().todos[idx - 1].done = true;
+                                        let text = app.session().todos[idx - 1].text.clone();
+                                        app.status_msg = format!("Task {} completed ✓", idx);
+                                        app.session_mut().messages.push(ChatMessage::plain("system", format!("Task completed: [✓] {}", text)));
+                                    } else {
+                                        app.session_mut().messages.push(ChatMessage::plain("system", format!("Invalid task index {}. Use /todo list to check indices.", idx)));
+                                    }
+                                } else {
+                                    app.session_mut().messages.push(ChatMessage::plain("system", "Usage: /todo done <1-based index>"));
+                                }
+                            }
+                            "list" => {
+                                if app.session().todos.is_empty() {
+                                    app.session_mut().messages.push(ChatMessage::plain("system", "Task Checklist is empty. Add tasks with `/todo add <text>` or use `- [ ]` in messages."));
+                                } else {
+                                    let mut out = String::from("Task Checklist:\n");
+                                    for (i, item) in app.session().todos.iter().enumerate() {
+                                        let mark = if item.done { "[✓]" } else { "[ ]" };
+                                        out.push_str(&format!("  {}. {} {}\n", i + 1, mark, item.text));
+                                    }
+                                    app.session_mut().messages.push(ChatMessage::plain("system", out.trim().to_string()));
+                                }
+                            }
+                            "clear" => {
+                                app.session_mut().todos.clear();
+                                app.status_msg = "Task checklist cleared".into();
+                                app.session_mut().messages.push(ChatMessage::plain("system", "Task checklist cleared."));
+                            }
+                            _ => {
+                                app.session_mut().messages.push(ChatMessage::plain(
+                                    "system",
+                                    "Task Checklist Commands:\n  /todo add <text>   - Add pending task\n  /todo done <index> - Mark task as done (1-based)\n  /todo list         - Display checklist\n  /todo clear        - Clear all tasks",
+                                ));
+                            }
+                        }
+                        return Ok(());
+                    }
                     "/settings" | "/setting" | "/set" | "/config" | "/cfg" => {
                         app.active_page = 4;
                         return Ok(());
@@ -1681,7 +2003,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.7)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /todo <args>       - Task checklist (/todo add|done|list|clear)\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.8)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
@@ -1690,6 +2012,7 @@ async fn handle_chat_key(
                         app.session_mut().total_tokens = 0;
                         app.session_mut().show_welcome = true;
                         app.session_mut().react_steps.clear();
+                        app.session_mut().todos.clear();
                         app.status_msg = "Cleared".into();
                         return Ok(());
                     }
@@ -1838,7 +2161,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.7 (Sovereign Rust Agent)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.8 (Sovereign Rust Agent)"));
                         return Ok(());
                     }
                     s => {
@@ -1854,6 +2177,7 @@ async fn handle_chat_key(
                 .messages
                 .push(ChatMessage::plain("user", input.clone()));
             app.session_mut().scroll_offset = 0;
+            app.session_mut().update_todos_from_text(&input);
 
             // Append thinking mode hint if active
             let prompt_to_send = match app.config.thinking_mode.as_str() {
@@ -1867,26 +2191,114 @@ async fn handle_chat_key(
         (_, KeyCode::Backspace) => {
             let pos = app.session().cursor_pos;
             if pos > 0 {
-                app.session_mut().cursor_pos -= 1;
-                let cp = app.session().cursor_pos;
-                app.session_mut().input.remove(cp);
+                let prev = app.session().input[..pos].char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
+                app.session_mut().input.remove(prev);
+                app.session_mut().cursor_pos = prev;
             }
         }
         (_, KeyCode::Delete) => {
             let pos = app.session().cursor_pos;
             let len = app.session().input.len();
-            if pos < len { app.session_mut().input.remove(pos); }
+            if pos < len && app.session().input.is_char_boundary(pos) {
+                app.session_mut().input.remove(pos);
+            }
         }
-        (_, KeyCode::Left)  => { if app.session().cursor_pos > 0 { app.session_mut().cursor_pos -= 1; } }
-        (_, KeyCode::Right) => { if app.session().cursor_pos < app.session().input.len() { app.session_mut().cursor_pos += 1; } }
-        (_, KeyCode::Home)  => { app.session_mut().cursor_pos = 0; }
-        (_, KeyCode::End)   => { let len = app.session().input.len(); app.session_mut().cursor_pos = len; }
-        (_, KeyCode::Up)    => { let v = app.session().scroll_offset.saturating_add(1); app.session_mut().scroll_offset = v; }
-        (_, KeyCode::Down)  => { let v = app.session().scroll_offset.saturating_sub(1); app.session_mut().scroll_offset = v; }
+        (_, KeyCode::Left)  => {
+            let pos = app.session().cursor_pos;
+            if pos > 0 {
+                let prev = app.session().input[..pos].char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
+                app.session_mut().cursor_pos = prev;
+            }
+        }
+        (_, KeyCode::Right) => {
+            let pos = app.session().cursor_pos;
+            let len = app.session().input.len();
+            if pos < len {
+                let next = app.session().input[pos..].chars().next().map(|c| pos + c.len_utf8()).unwrap_or(len);
+                app.session_mut().cursor_pos = next;
+            }
+        }
+        (_, KeyCode::Home)  => {
+            let pos = app.session().cursor_pos;
+            if pos > 0 {
+                if let Some(nl) = app.session().input[..pos].rfind('\n') {
+                    if pos == nl + 1 {
+                        app.session_mut().cursor_pos = 0;
+                    } else {
+                        app.session_mut().cursor_pos = nl + 1;
+                    }
+                } else {
+                    app.session_mut().cursor_pos = 0;
+                }
+            }
+        }
+        (_, KeyCode::End)   => {
+            let pos = app.session().cursor_pos;
+            let len = app.session().input.len();
+            if pos < len {
+                if let Some(nl) = app.session().input[pos..].find('\n') {
+                    let line_end = pos + nl;
+                    if pos == line_end {
+                        app.session_mut().cursor_pos = len;
+                    } else {
+                        app.session_mut().cursor_pos = line_end;
+                    }
+                } else {
+                    app.session_mut().cursor_pos = len;
+                }
+            }
+        }
+        (_, KeyCode::Up)    => {
+            if app.session().input.contains('\n') {
+                let (row, col) = get_cursor_coords(&app.session().input, app.session().cursor_pos);
+                if row > 0 {
+                    let lines: Vec<&str> = app.session().input.split('\n').collect();
+                    let target_row = row - 1;
+                    let target_line = lines[target_row];
+                    let target_col = col.min(target_line.chars().count());
+                    let byte_offset: usize = target_line.chars().take(target_col).map(|c| c.len_utf8()).sum();
+                    let mut prev_lines_len = 0;
+                    for l in lines.iter().take(target_row) {
+                        prev_lines_len += l.len() + 1;
+                    }
+                    app.session_mut().cursor_pos = prev_lines_len + byte_offset;
+                } else {
+                    let v = app.session().scroll_offset.saturating_add(1);
+                    app.session_mut().scroll_offset = v;
+                }
+            } else {
+                let v = app.session().scroll_offset.saturating_add(1);
+                app.session_mut().scroll_offset = v;
+            }
+        }
+        (_, KeyCode::Down)  => {
+            if app.session().input.contains('\n') {
+                let (row, col) = get_cursor_coords(&app.session().input, app.session().cursor_pos);
+                let lines: Vec<&str> = app.session().input.split('\n').collect();
+                if row + 1 < lines.len() {
+                    let target_row = row + 1;
+                    let target_line = lines[target_row];
+                    let target_col = col.min(target_line.chars().count());
+                    let byte_offset: usize = target_line.chars().take(target_col).map(|c| c.len_utf8()).sum();
+                    let mut prev_lines_len = 0;
+                    for l in lines.iter().take(target_row) {
+                        prev_lines_len += l.len() + 1;
+                    }
+                    app.session_mut().cursor_pos = prev_lines_len + byte_offset;
+                } else {
+                    let v = app.session().scroll_offset.saturating_sub(1);
+                    app.session_mut().scroll_offset = v;
+                }
+            } else {
+                let v = app.session().scroll_offset.saturating_sub(1);
+                app.session_mut().scroll_offset = v;
+            }
+        }
         (_, KeyCode::Char(c)) => {
             let pos = app.session().cursor_pos;
-            app.session_mut().input.insert(pos, c);
-            app.session_mut().cursor_pos += 1;
+            let valid_pos = if app.session().input.is_char_boundary(pos) { pos } else { app.session().input.len() };
+            app.session_mut().input.insert(valid_pos, c);
+            app.session_mut().cursor_pos = valid_pos + c.len_utf8();
             app.session_mut().show_welcome = false;
         }
         _ => {}
@@ -2021,7 +2433,12 @@ fn ui(f: &mut Frame, app: &App) {
     } else if app.active_page == 0 {
         // Active Chat View: Workspace + Input Docked
         let is_wide = box_area.width >= 100;
-        let input_height: u16 = 3;
+        let line_breaks = session.input.chars().filter(|&c| c == '\n').count();
+        let input_height: u16 = if session.input.contains('\n') {
+            ((line_breaks as u16) + 3).clamp(3, 6)
+        } else {
+            3
+        };
         let gap: u16 = 1;
 
         if is_wide {
@@ -2273,7 +2690,6 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     };
 
     let line1 = Line::from(vec![
-        Span::styled("> ", Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD)),
         if show_placeholder {
             Span::styled("Ask anything... \"fix broken tests\"", content_style)
         } else {
@@ -2345,7 +2761,7 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
         },
     );
 
-    let cx = area.x + 4 + session.cursor_pos as u16;
+    let cx = area.x + 2 + session.cursor_pos as u16;
     let cy = area.y + 1;
     Some((cx, cy))
 }
@@ -2442,9 +2858,6 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     // 3. Context Window
     let limit = if session.agent.context_window_limit > 0 { session.agent.context_window_limit } else { 200_000 };
     let pct = ((total_tok as f64 / limit as f64) * 100.0).min(100.0);
-    let ctx_bar_w = (inner.width as usize).saturating_sub(4).clamp(6, 20);
-    let filled = ((pct / 100.0) * ctx_bar_w as f64).round() as usize;
-    let bar = format!("[{}{}]", "█".repeat(filled.min(ctx_bar_w)), "░".repeat(ctx_bar_w.saturating_sub(filled)));
 
     // 4. Runtime / Status
     let (status_label, status_col) = if app.is_thinking {
@@ -2479,94 +2892,143 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines = Vec::new();
 
-    // Section: Active Task
+    // Section: Task Title
     lines.push(Line::from(vec![
         Span::styled("Task: ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("\"{}\"", task_title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("\"{}\"", task_title), Style::default().fg(Color::White)),
     ]));
     lines.push(Line::from(Span::styled(&div_str, div_style)));
 
     // Section: Tokens & Cost banner
     lines.push(Line::from(vec![
-        Span::styled("⚡ ", Style::default().fg(Color::Yellow)),
-        Span::styled(format!("{} tokens ({})", fmt_num(total_tok), cost_str), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("Tokens: ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(fmt_num(total_tok), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  Cost: ", Style::default().fg(MUTED)),
+        Span::styled(cost_str, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  • In:  ", Style::default().fg(MUTED)),
-        Span::styled(fmt_num(prompt_tok), Style::default().fg(TEXT_SOFT)),
-        Span::styled("  • Out: ", Style::default().fg(MUTED)),
+        Span::styled("  ↳ In: ", Style::default().fg(MUTED)),
+        Span::styled(format!("{:<8}", fmt_num(prompt_tok)), Style::default().fg(TEXT_SOFT)),
+        Span::styled(" Out: ", Style::default().fg(MUTED)),
         Span::styled(fmt_num(compl_tok), Style::default().fg(TEXT_SOFT)),
     ]));
     lines.push(Line::from(Span::styled(&div_str, div_style)));
 
-    // Section: Step Tracker
-    lines.push(Line::from(Span::styled("Step Tracker:", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))));
-    if session.react_steps.is_empty() {
-        lines.push(Line::from(Span::styled("  • No tool steps yet", Style::default().fg(MUTED))));
+    // Section: Context Window & Visual Progress Bar
+    let ctx_bar_w = (inner.width as usize).saturating_sub(6).clamp(8, 22);
+    let filled = ((pct / 100.0) * ctx_bar_w as f64).round() as usize;
+    lines.push(Line::from(vec![
+        Span::styled("Context: ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:.1}k / {}k", total_tok as f64 / 1000.0, limit / 1000), Style::default().fg(TEXT_SOFT)),
+        Span::styled(format!(" ({:.1}%)", pct), Style::default().fg(if pct > 80.0 { Color::Red } else { Color::Cyan })),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  [", Style::default().fg(DIM)),
+        Span::styled("█".repeat(filled.min(ctx_bar_w)), Style::default().fg(if pct > 80.0 { Color::Red } else { Color::Cyan })),
+        Span::styled("░".repeat(ctx_bar_w.saturating_sub(filled)), Style::default().fg(Color::Rgb(51, 65, 85))),
+        Span::styled("]", Style::default().fg(DIM)),
+    ]));
+    lines.push(Line::from(Span::styled(&div_str, div_style)));
+
+    // Section: Task Checklist
+    lines.push(Line::from(Span::styled(
+        "[ 📋 TASK CHECKLIST ]",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+
+    let mut items_to_display: Vec<TodoItem> = session.todos.clone();
+    if items_to_display.is_empty() && !session.react_steps.is_empty() {
+        for step in &session.react_steps {
+            let clean = step.trim();
+            let (done, text) = if let Some(s) = clean.strip_prefix("✓ ") {
+                (true, s.trim())
+            } else if let Some(s) = clean.strip_prefix("● ") {
+                (false, s.trim())
+            } else if let Some(s) = clean.strip_prefix("✗ ") {
+                (false, s.trim())
+            } else {
+                (false, clean)
+            };
+            if !text.is_empty() {
+                items_to_display.push(TodoItem {
+                    text: text.to_string(),
+                    done,
+                });
+            }
+        }
+    }
+
+    if items_to_display.is_empty() {
+        lines.push(Line::from(Span::styled("  • No active tasks", Style::default().fg(MUTED))));
     } else {
-        let avail_steps = (inner.height as usize).saturating_sub(20).clamp(2, 8);
-        for step in session.react_steps.iter().rev().take(avail_steps).rev() {
-            let max_w = (inner.width as usize).saturating_sub(4);
-            let display_step = if step.chars().count() > max_w {
-                let s: String = step.chars().take(max_w.saturating_sub(3)).collect();
+        let max_items = (inner.height as usize).saturating_sub(18).clamp(3, 10);
+        let first_active_idx = items_to_display.iter().position(|t| !t.done);
+        let spinner = SPINNER_CHARS[app.spinner_frame % SPINNER_CHARS.len()];
+
+        for (i, item) in items_to_display.iter().take(max_items).enumerate() {
+            let max_w = (inner.width as usize).saturating_sub(6);
+            let display_text = if item.text.chars().count() > max_w {
+                let s: String = item.text.chars().take(max_w.saturating_sub(3)).collect();
                 format!("{}...", s)
             } else {
-                step.clone()
+                item.text.clone()
             };
 
-            if display_step.starts_with("✓ ") {
+            if item.done {
+                // Completed items: [✓] in Color::Green + Modifier::CROSSED_OUT in #64748b (MUTED)
                 lines.push(Line::from(vec![
-                    Span::styled("✓ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                    Span::styled(display_step.trim_start_matches("✓ ").to_string(), Style::default().fg(GRAY)),
+                    Span::styled("[✓] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        display_text,
+                        Style::default().fg(MUTED).add_modifier(Modifier::CROSSED_OUT),
+                    ),
                 ]));
-            } else if display_step.starts_with("● ") {
+            } else if Some(i) == first_active_idx {
+                // Active item: [●] with rotating spinner or yellow bullet + highlighted text
+                let bullet = if app.is_thinking {
+                    format!("[{}] ", spinner)
+                } else {
+                    "[●] ".to_string()
+                };
                 lines.push(Line::from(vec![
-                    Span::styled("● ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(display_step.trim_start_matches("● ").to_string(), Style::default().fg(Color::Yellow)),
-                ]));
-            } else if display_step.starts_with("✗ ") {
-                lines.push(Line::from(vec![
-                    Span::styled("✗ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                    Span::styled(display_step.trim_start_matches("✗ ").to_string(), Style::default().fg(Color::Red)),
+                    Span::styled(bullet, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        display_text,
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
                 ]));
             } else {
-                lines.push(Line::from(Span::styled(display_step, Style::default().fg(GRAY))));
+                // Pending items: [ ] in MUTED with plain text
+                lines.push(Line::from(vec![
+                    Span::styled("[ ] ", Style::default().fg(MUTED)),
+                    Span::styled(display_text, Style::default().fg(TEXT_SOFT)),
+                ]));
             }
         }
     }
     lines.push(Line::from(Span::styled(&div_str, div_style)));
 
-    // Section: Context Window
+    // Section: Runtime & Environment
     lines.push(Line::from(vec![
-        Span::styled("Context: ", Style::default().fg(ACCENT)),
-        Span::styled(format!("{:.1}k / {}k ({:.1}%)", total_tok as f64 / 1000.0, limit / 1000, pct), Style::default().fg(TEXT_SOFT)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(format!("  {} ", bar), Style::default().fg(Color::Cyan)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Provider: ", Style::default().fg(MUTED)),
+        Span::styled("Provider:  ", Style::default().fg(MUTED)),
         Span::styled(app.provider_name(), Style::default().fg(ACCENT_DIM)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Model:    ", Style::default().fg(MUTED)),
+        Span::styled("Model:     ", Style::default().fg(MUTED)),
         Span::styled(app.model_name(), Style::default().fg(TEXT_SOFT)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Mode:     ", Style::default().fg(MUTED)),
+        Span::styled("Mode:      ", Style::default().fg(MUTED)),
         Span::styled(app.thinking_mode(), Style::default().fg(TEXT_SOFT)),
         Span::styled(" · ", Style::default().fg(DIM)),
         Span::styled(status_label, Style::default().fg(status_col)),
     ]));
-    lines.push(Line::from(Span::styled(&div_str, div_style)));
-
-    // Section: Environment
     lines.push(Line::from(vec![
-        Span::styled("CWD:     ", Style::default().fg(MUTED)),
+        Span::styled("CWD:       ", Style::default().fg(MUTED)),
         Span::styled(short_cwd, Style::default().fg(TEXT_SOFT)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Session: ", Style::default().fg(MUTED)),
+        Span::styled("Session:   ", Style::default().fg(MUTED)),
         Span::styled(&session.name, Style::default().fg(TEXT_SOFT)),
         Span::styled(format!(" ({} turns)", turns_count), Style::default().fg(MUTED)),
     ]));
@@ -2593,10 +3055,21 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
         match msg.role.as_str() {
             "user" => {
                 let unescaped = unescape_newlines(&msg.content);
-                lines.push(Line::from(vec![
-                    Span::styled("> ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-                    Span::styled(unescaped, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                ]));
+                for (idx, line) in unescaped.lines().enumerate() {
+                    let mut spans = Vec::new();
+                    if idx == 0 {
+                        spans.push(Span::styled("● ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)));
+                    } else {
+                        spans.push(Span::raw("  "));
+                    }
+                    spans.extend(render_styled_line(line, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                    lines.push(Line::from(spans));
+                }
+                if unescaped.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("● ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
                 lines.push(Line::from(""));
             }
             "tool_start" => {
@@ -2621,10 +3094,11 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                     ]));
                 }
                 for l in msg_lines {
-                    lines.push(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled("    │ ", Style::default().fg(DIM)),
-                        Span::styled(l.to_string(), Style::default().fg(MUTED)),
-                    ]));
+                    ];
+                    spans.extend(render_styled_line(l, Style::default().fg(MUTED)));
+                    lines.push(Line::from(spans));
                 }
                 lines.push(Line::from(""));
             }
@@ -2669,10 +3143,8 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                             Span::styled(line.to_string(), Style::default().fg(Color::Rgb(226, 232, 240))),
                         ]));
                     } else {
-                        lines.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(GRAY),
-                        )));
+                        let styled_spans = render_styled_line(line, Style::default().fg(GRAY));
+                        lines.push(Line::from(styled_spans));
                     }
                 }
                 // Subtle per-turn token telemetry footer: e.g. [⚡ 1,240 tokens (980 in / 260 out) • 1.2s]
@@ -2695,10 +3167,8 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
             _ => {
                 let unescaped = unescape_newlines(&msg.content);
                 for line in unescaped.lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-                    )));
+                    let styled_spans = render_styled_line(line, Style::default().fg(DIM).add_modifier(Modifier::ITALIC));
+                    lines.push(Line::from(styled_spans));
                 }
                 lines.push(Line::from(""));
             }
@@ -3202,86 +3672,139 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
 
     let session = app.session();
     let text_col = if app.is_thinking { ACCENT_DIM } else { TEXT_SOFT };
+    let has_image = detect_image_reference(&session.input).is_some();
 
     if app.is_thinking && !session.input.is_empty() {
         // Mid-turn steering: user is actively typing a steering instruction.
-        let steer_label = " ⚡ steer ";
-        let line = Line::from(vec![
-            Span::styled(
-                steer_label,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "> ",
-                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(&*session.input, Style::default().fg(TEXT_SOFT)),
-        ]);
-        let steer_block = Block::default()
+        let steer_label = "⚡ steer ";
+        let (row, col) = get_cursor_coords(&session.input, session.cursor_pos);
+        let inner_y = area.y + 1;
+        let inner_h = area.height.saturating_sub(2);
+        let scroll_top = if row >= inner_h as usize { row - inner_h as usize + 1 } else { 0 };
+
+        let mut steer_block = Block::default()
+            .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT_DIM))
+            .border_style(Style::default().fg(ACCENT))
             .style(Style::default().bg(BG_PILL));
+
+        if has_image {
+            steer_block = steer_block.title(
+                Line::from(vec![
+                    Span::styled(" [🖼️ Image] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                ]).alignment(Alignment::Right)
+            );
+        }
         f.render_widget(steer_block, area);
+
+        let lines_raw: Vec<&str> = session.input.split('\n').collect();
+        let mut rendered_lines = Vec::new();
+        for (idx, line_str) in lines_raw.iter().enumerate().skip(scroll_top).take(inner_h as usize) {
+            let mut spans = Vec::new();
+            if idx == 0 {
+                spans.push(Span::styled(steer_label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            } else {
+                spans.push(Span::raw(" ".repeat(steer_label.chars().count())));
+            }
+            spans.push(Span::styled(*line_str, Style::default().fg(TEXT_SOFT)));
+            rendered_lines.push(Line::from(spans));
+        }
+
         f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(BG_PILL)),
-            Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
+            Paragraph::new(rendered_lines).style(Style::default().bg(BG_PILL)),
+            Rect {
+                x: area.x + 2,
+                y: inner_y,
+                width: area.width.saturating_sub(4),
+                height: inner_h,
+            },
         );
-        let cx = area.x + 1 + 9 + 2 + session.cursor_pos as u16;
-        Some((cx, area.y))
+
+        let pfx_w = steer_label.chars().count() as u16;
+        let cx = area.x + 2 + pfx_w + col as u16;
+        let cy = inner_y + (row - scroll_top) as u16;
+        Some((cx.min(area.x + area.width.saturating_sub(2)), cy))
     } else if app.is_thinking {
-        // Clean, quiet thinking indicator without kaomoji face animations.
+        // Rotating braille spinner without leading '>'
+        let spinner = SPINNER_CHARS[app.spinner_frame % SPINNER_CHARS.len()];
         let line = Line::from(vec![
             Span::styled(
-                "> ",
-                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
+                format!("{} ", spinner),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "● Thinking... · Type to steer · Ctrl+C to cancel",
+                "Thinking... · Type to steer · Ctrl+C to cancel",
                 Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
             ),
         ]);
         let thinking_block = Block::default()
+            .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
             .style(Style::default().bg(BG_PILL));
         f.render_widget(thinking_block, area);
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(BG_PILL)),
-            Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
+            Rect {
+                x: area.x + 2,
+                y: area.y + 1,
+                width: area.width.saturating_sub(4),
+                height: 1,
+            },
         );
-        let cx = area.x + 1 + 2 + session.cursor_pos as u16;
-        Some((cx, area.y))
+        None
     } else {
-        // Idle input pill with placeholder when empty.
+        // Idle input pill with placeholder when empty — NO leading '> ' prompt.
+        let (row, col) = get_cursor_coords(&session.input, session.cursor_pos);
         let show_placeholder = session.input.is_empty();
         let content_style = if show_placeholder {
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC)
         } else {
             Style::default().fg(text_col)
         };
-        let line = Line::from(vec![
-            Span::styled(
-                "> ",
-                Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD),
-            ),
-            if show_placeholder {
-                Span::styled("Ask anything…", content_style)
-            } else {
-                Span::styled(&*session.input, content_style)
-            },
-        ]);
-        let input_block = Block::default()
+
+        let mut input_block = Block::default()
+            .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT_DIM))
             .style(Style::default().bg(BG_PILL));
+
+        if has_image {
+            input_block = input_block.title(
+                Line::from(vec![
+                    Span::styled(" [🖼️ Image] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                ]).alignment(Alignment::Right)
+            );
+        }
         f.render_widget(input_block, area);
+
+        let inner_y = area.y + 1;
+        let inner_h = area.height.saturating_sub(2);
+        let scroll_top = if row >= inner_h as usize { row - inner_h as usize + 1 } else { 0 };
+
+        let rendered_lines: Vec<Line> = if show_placeholder {
+            vec![Line::from(Span::styled("Ask anything...", content_style))]
+        } else {
+            session.input.split('\n')
+                .skip(scroll_top)
+                .take(inner_h as usize)
+                .map(|line_str| Line::from(Span::styled(line_str, content_style)))
+                .collect()
+        };
+
         f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(BG_PILL)),
-            Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height },
+            Paragraph::new(rendered_lines).style(Style::default().bg(BG_PILL)),
+            Rect {
+                x: area.x + 2,
+                y: inner_y,
+                width: area.width.saturating_sub(4),
+                height: inner_h,
+            },
         );
 
-        let cx = area.x + 1 + 2 + session.cursor_pos as u16;
-        Some((cx, area.y))
+        let cx = area.x + 2 + col as u16;
+        let cy = inner_y + (row - scroll_top) as u16;
+        Some((cx.min(area.x + area.width.saturating_sub(2)), cy))
     }
 }
 
@@ -3333,7 +3856,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let right_spans = vec![
         Span::styled("/status", Style::default().fg(ACCENT_DIM)),
         Span::styled("  ·  ", Style::default().fg(MUTED)),
-        Span::styled("v1.0.7 ", Style::default().fg(MUTED)),
+        Span::styled("v1.0.8 ", Style::default().fg(MUTED)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -3523,5 +4046,93 @@ mod tests {
         app.close_session(); // should not close last session
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.status_msg, "Cannot close last session");
+    }
+
+    #[test]
+    fn test_multiline_cursor_calculation() {
+        let input = "hello\nworld\nfoo";
+
+        // Cursor at 0 ('h' in "hello") -> line 0, col 0
+        assert_eq!(get_cursor_coords(input, 0), (0, 0));
+        // Cursor at 3 ('l' in "hello") -> line 0, col 3
+        assert_eq!(get_cursor_coords(input, 3), (0, 3));
+        // Cursor at 5 (end of "hello", right before '\n') -> line 0, col 5
+        assert_eq!(get_cursor_coords(input, 5), (0, 5));
+        // Cursor at 6 ('w' in "world") -> line 1, col 0
+        assert_eq!(get_cursor_coords(input, 6), (1, 0));
+        // Cursor at 9 ('l' in "world") -> line 1, col 3
+        assert_eq!(get_cursor_coords(input, 9), (1, 3));
+        // Cursor at 11 (end of "world") -> line 1, col 5
+        assert_eq!(get_cursor_coords(input, 11), (1, 5));
+        // Cursor at 12 ('f' in "foo") -> line 2, col 0
+        assert_eq!(get_cursor_coords(input, 12), (2, 0));
+        // Cursor at 15 (end of "foo") -> line 2, col 3
+        assert_eq!(get_cursor_coords(input, 15), (2, 3));
+
+        // Trailing newline
+        let input2 = "abc\n";
+        assert_eq!(get_cursor_coords(input2, 3), (0, 3));
+        assert_eq!(get_cursor_coords(input2, 4), (1, 0));
+    }
+
+    #[test]
+    fn test_image_and_link_styling() {
+        // Image detection helper
+        assert_eq!(detect_image_reference("look at preview.png now"), Some("preview.png".to_string()));
+        assert_eq!(detect_image_reference("check ![Architecture](docs/arch.svg)"), Some("docs/arch.svg".to_string()));
+        assert_eq!(detect_image_reference("@img:screenshot.jpg is attached"), Some("screenshot.jpg".to_string()));
+        assert_eq!(detect_image_reference("plain text without images"), None);
+
+        // Link & Image styled line rendering
+        let line = "Visit https://github.com/cecepazhar/cacode and see ![Mockup](assets/ui.png) or git@github.com:repo.git";
+        let spans = render_styled_line(line, Style::default().fg(Color::White));
+
+        // Verify link styling: Cyan + UNDERLINED
+        let link_span = spans.iter().find(|s| s.content.contains("https://github.com/cecepazhar/cacode")).unwrap();
+        assert_eq!(link_span.style.fg, Some(Color::Cyan));
+        assert!(link_span.style.add_modifier.contains(Modifier::UNDERLINED));
+
+        let git_span = spans.iter().find(|s| s.content.contains("git@github.com:repo.git")).unwrap();
+        assert_eq!(git_span.style.fg, Some(Color::Cyan));
+        assert!(git_span.style.add_modifier.contains(Modifier::UNDERLINED));
+
+        // Verify image badge: [🖼️ Image: ui.png] in Cyan + BOLD
+        let img_span = spans.iter().find(|s| s.content.contains("[🖼️ Image: ui.png]")).unwrap();
+        assert_eq!(img_span.style.fg, Some(Color::Cyan));
+        assert!(img_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn test_todo_extraction_and_strikethrough() {
+        let cfg = CaCodeConfig::default();
+        let mut session = ChatSession::new("TodoSession".into(), &cfg);
+        assert!(session.todos.is_empty());
+
+        let markdown = "Here is our plan:\n- [ ] First pending task\n- [x] Completed task\n* [X] Another finished task\n1. [ ] Numbered pending";
+        session.update_todos_from_text(markdown);
+
+        assert_eq!(session.todos.len(), 4);
+        assert_eq!(session.todos[0], TodoItem { text: "First pending task".into(), done: false });
+        assert_eq!(session.todos[1], TodoItem { text: "Completed task".into(), done: true });
+        assert_eq!(session.todos[2], TodoItem { text: "Another finished task".into(), done: true });
+        assert_eq!(session.todos[3], TodoItem { text: "Numbered pending".into(), done: false });
+
+        // Update existing task state
+        session.update_todos_from_text("- [x] First pending task");
+        assert!(session.todos[0].done);
+
+        // Verify fallback to react_steps auto-generation
+        let mut session_steps = ChatSession::new("StepSession".into(), &cfg);
+        session_steps.react_steps.push("✓ read_file src/lib.rs".into());
+        session_steps.react_steps.push("● write_file src/main.rs".into());
+        session_steps.sync_todos_from_steps();
+        assert_eq!(session_steps.todos.len(), 2);
+        assert_eq!(session_steps.todos[0], TodoItem { text: "read_file src/lib.rs".into(), done: true });
+        assert_eq!(session_steps.todos[1], TodoItem { text: "write_file src/main.rs".into(), done: false });
+
+        // Verify strikethrough styling logic
+        let completed_style = Style::default().fg(MUTED).add_modifier(Modifier::CROSSED_OUT);
+        assert_eq!(completed_style.fg, Some(Color::Rgb(100, 116, 139))); // #64748b
+        assert!(completed_style.add_modifier.contains(Modifier::CROSSED_OUT));
     }
 }
