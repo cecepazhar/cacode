@@ -4,6 +4,15 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomProviderConfig {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaCodeConfig {
     #[serde(default)]
@@ -38,8 +47,19 @@ pub struct CaCodeConfig {
     pub app_name: String,
     #[serde(default)]
     pub pro_license_key: Option<String>,
+    #[serde(default)]
+    pub custom_providers: Vec<CustomProviderConfig>,
+    #[serde(default)]
+    pub fallback_1: Option<String>,
+    #[serde(default)]
+    pub fallback_2: Option<String>,
+    #[serde(default)]
+    pub fallback_3: Option<String>,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
 }
 
+fn default_max_retries() -> usize { 3 }
 fn default_theme() -> String { "teal".into() }
 fn default_app_name() -> String { "CACode — Sovereign Dev Agent".into() }
 fn default_user_name() -> String { "Prof. Cecep".into() }
@@ -67,11 +87,23 @@ impl Default for CaCodeConfig {
             theme: default_theme(),
             app_name: default_app_name(),
             pro_license_key: None,
+            custom_providers: Vec::new(),
+            fallback_1: None,
+            fallback_2: None,
+            fallback_3: None,
+            max_retries: default_max_retries(),
         }
     }
 }
 
 impl CaCodeConfig {
+    pub fn is_pro(&self) -> bool {
+        self.pro_license_key
+            .as_ref()
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn config_path() -> Result<PathBuf> {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;
         Ok(home.join(".cacode").join("config.toml"))
@@ -148,6 +180,11 @@ impl CaCodeConfig {
             ("Thinking Mode", "CACODE_THINKING_MODE", "thinking_mode", self.thinking_mode.clone()),
             ("User Name (Greeting)", "CACODE_USER_NAME", "user_name", self.user_name.clone()),
             ("Pro License Key", "CACODE_PRO_LICENSE", "pro_license_key", Self::mask(&self.pro_license_key.clone().unwrap_or_default())),
+            ("Fallback Tier 1", "CACODE_FALLBACK_1", "fallback_1", self.fallback_1.clone().unwrap_or_else(|| "(none)".into())),
+            ("Fallback Tier 2", "CACODE_FALLBACK_2", "fallback_2", self.fallback_2.clone().unwrap_or_else(|| "(none)".into())),
+            ("Fallback Tier 3", "CACODE_FALLBACK_3", "fallback_3", self.fallback_3.clone().unwrap_or_else(|| "(none)".into())),
+            ("Max Retries", "CACODE_MAX_RETRIES", "max_retries", self.max_retries.to_string()),
+            ("Custom Providers", "CACODE_CUSTOM_PROVIDERS", "custom_providers", format!("{} configured", self.custom_providers.len())),
             ("OpenAI API Key", "OPENAI_API_KEY", "openai_api_key", Self::mask(&self.effective("OPENAI_API_KEY", &self.openai_api_key))),
             ("OpenAI Base URL", "OPENAI_BASE_URL", "openai_base_url", self.effective("OPENAI_BASE_URL", &self.openai_base_url)),
             ("Anthropic API Key", "ANTHROPIC_API_KEY", "anthropic_api_key", Self::mask(&self.effective("ANTHROPIC_API_KEY", &self.anthropic_api_key))),
@@ -180,6 +217,16 @@ impl CaCodeConfig {
             "user_name" => { if let Some(v) = val { self.user_name = v; } }
             "system_persona" => { if let Some(v) = val { self.system_persona = v; } }
             "pro_license_key" => self.pro_license_key = val,
+            "fallback_1" => self.fallback_1 = val,
+            "fallback_2" => self.fallback_2 = val,
+            "fallback_3" => self.fallback_3 = val,
+            "max_retries" => {
+                if let Some(v) = val {
+                    if let Ok(n) = v.parse::<usize>() {
+                        self.max_retries = n;
+                    }
+                }
+            }
             "openai_api_key" => self.openai_api_key = val,
             "openai_base_url" => self.openai_base_url = val,
             "anthropic_api_key" => self.anthropic_api_key = val,
@@ -246,5 +293,41 @@ mod tests {
         env::remove_var("ANTIGRAVITY_API_KEY");
         env::remove_var("ANTIGRAVITY_ZEN_API_KEY");
         env::remove_var("ANTIGRAVITY_ZEN_MODEL");
+    }
+
+    #[test]
+    fn test_custom_provider_config_serialization() {
+        let mut cfg = CaCodeConfig::default();
+        cfg.custom_providers.push(CustomProviderConfig {
+            id: "groq-llama".to_string(),
+            name: "Groq Llama 3".to_string(),
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            api_key: "gsk-mock-key".to_string(),
+            model: "llama-3.3-70b-versatile".to_string(),
+        });
+        cfg.fallback_1 = Some("groq-llama".to_string());
+        cfg.fallback_2 = Some("ollama".to_string());
+        cfg.max_retries = 3;
+
+        let toml_str = toml::to_string(&cfg).expect("failed to serialize toml");
+        let parsed: CaCodeConfig = toml::from_str(&toml_str).expect("failed to deserialize toml");
+
+        assert_eq!(parsed.custom_providers.len(), 1);
+        assert_eq!(parsed.custom_providers[0].name, "Groq Llama 3");
+        assert_eq!(parsed.fallback_1.as_deref(), Some("groq-llama"));
+        assert_eq!(parsed.fallback_2.as_deref(), Some("ollama"));
+        assert_eq!(parsed.max_retries, 3);
+    }
+
+    #[test]
+    fn test_pro_license_detection() {
+        let mut cfg = CaCodeConfig::default();
+        assert!(!cfg.is_pro());
+
+        cfg.pro_license_key = Some("   ".to_string());
+        assert!(!cfg.is_pro());
+
+        cfg.pro_license_key = Some("CACODE-PRO-KEY-2026".to_string());
+        assert!(cfg.is_pro());
     }
 }

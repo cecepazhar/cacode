@@ -1,1 +1,1 @@
-pub use cacode_core::config::CaCodeConfig;
+pub use cacode_core::config::{CaCodeConfig, CustomProviderConfig};

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 use regex::Regex;
 
-pub const CA_VERSION: &str = "1.0.8";
+pub const CA_VERSION: &str = "1.0.9";
 
 pub type AgentEvents = mpsc::UnboundedSender<AgentEvent>;
 
@@ -86,13 +86,42 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provider {
     OpenAI { model: String },
     Anthropic { model: String },
     Ollama { model: String },
     Router9 { model: String },
     AntigravityZen { model: String },
+    Custom { name: String, base_url: String, api_key: String, model: String },
+}
+
+impl Provider {
+    pub fn name(&self) -> &str {
+        match self {
+            Provider::OpenAI { .. } => "OpenAI",
+            Provider::Anthropic { .. } => "Anthropic",
+            Provider::Ollama { .. } => "Ollama",
+            Provider::Router9 { .. } => "9Router",
+            Provider::AntigravityZen { .. } => "Antigravity Zen",
+            Provider::Custom { name, .. } => name.as_str(),
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        match self {
+            Provider::OpenAI { model }
+            | Provider::Anthropic { model }
+            | Provider::Ollama { model }
+            | Provider::Router9 { model }
+            | Provider::AntigravityZen { model }
+            | Provider::Custom { model, .. } => model.as_str(),
+        }
+    }
+
+    pub fn display_label(&self) -> String {
+        format!("{} ({})", self.name(), self.model())
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,9 +133,12 @@ pub struct TokenUsage {
 
 #[derive(Clone)]
 pub struct ReActAgent {
-    client: Client,
+    pub client: Client,
     pub history: Vec<Message>,
     pub provider: Provider,
+    pub fallback_chain: Vec<Provider>,
+    pub max_retries: usize,
+    pub event_tx: Option<AgentEvents>,
     pub user_name: String,
     pub persona: String,
     pub thinking_mode: String,
@@ -151,6 +183,9 @@ impl ReActAgent {
             client: Client::new(),
             history: Vec::new(),
             provider: Self::detect_provider(),
+            fallback_chain: Vec::new(),
+            max_retries: 3,
+            event_tx: None,
             user_name: "Prof. Cecep".into(),
             persona: "You are CACode, an elite sovereign Rust development assistant. The user is Prof. Cecep (Cecep Saeful Azhar Hidayat, ST). Always greet and address him respectfully as 'Prof. Cecep' (e.g. 'Hi Prof. Cecep', 'Siap, Prof. Cecep.'). Be direct, concise, and technically precise.".into(),
             thinking_mode: "Fast".into(),
@@ -372,13 +407,12 @@ impl ReActAgent {
         ))
     }
 
-    pub async fn call_llm(&mut self, user_input: &str) -> Result<String> {
-        self.total_calls += 1;
-        let mut msgs = vec![self.system_prompt()];
-        msgs.extend(self.history.clone());
-        msgs.push(Message { role: "user".into(), content: user_input.into() });
-
-        let (content, usage) = match &self.provider {
+    pub async fn call_single_provider(
+        &self,
+        provider: &Provider,
+        msgs: &[Message],
+    ) -> Result<(String, TokenUsage)> {
+        match provider {
             Provider::OpenAI { model } => {
                 let api_key = env::var("OPENAI_API_KEY")?;
                 let base_url = env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
@@ -409,7 +443,7 @@ impl ReActAgent {
                         text.chars().take(500).collect::<String>()
                     ));
                 }
-                Self::extract_response_content(&text)?
+                Self::extract_response_content(&text)
             }
             Provider::Anthropic { model } => {
                 let api_key = env::var("ANTHROPIC_API_KEY")?;
@@ -451,7 +485,7 @@ impl ReActAgent {
                         total_tokens: 50 + comp,
                     }
                 };
-                (txt, usage)
+                Ok((txt, usage))
             }
             Provider::Ollama { model } => {
                 let base_url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
@@ -482,7 +516,7 @@ impl ReActAgent {
                         total_tokens: 50 + comp,
                     }
                 };
-                (txt, usage)
+                Ok((txt, usage))
             }
             Provider::Router9 { model } => {
                 let base_url = env::var("ROUTER9_URL").unwrap_or_else(|_| "http://localhost:20128".into());
@@ -514,7 +548,7 @@ impl ReActAgent {
                         text.chars().take(500).collect::<String>()
                     ));
                 }
-                Self::extract_response_content(&text)?
+                Self::extract_response_content(&text)
             }
             Provider::AntigravityZen { model } => {
                 let api_key = env::var("ANTIGRAVITY_API_KEY")
@@ -542,24 +576,116 @@ impl ReActAgent {
                         text.chars().take(500).collect::<String>()
                     ));
                 }
-                Self::extract_response_content(&text)?
+                Self::extract_response_content(&text)
             }
-        };
+            Provider::Custom { name, base_url, api_key, model } => {
+                let base = base_url.trim_end_matches('/');
+                let endpoint = if base.ends_with("/v1") || base.ends_with("/api") {
+                    format!("{}/chat/completions", base)
+                } else {
+                    format!("{}/v1/chat/completions", base)
+                };
+                let mut req = self.client.post(&endpoint);
+                if !api_key.is_empty() {
+                    req = req.bearer_auth(api_key);
+                }
+                let resp = req
+                    .json(&serde_json::json!({
+                        "model": model,
+                        "messages": msgs,
+                        "stream": false
+                    }))
+                    .send()
+                    .await?;
+                let status = resp.status();
+                let bytes = resp.bytes().await?;
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if !status.is_success() {
+                    return Err(anyhow!(
+                        "{} HTTP {} (endpoint: {}) — {}",
+                        name,
+                        status,
+                        endpoint,
+                        text.chars().take(500).collect::<String>()
+                    ));
+                }
+                Self::extract_response_content(&text)
+            }
+        }
+    }
 
-        // Record metrics
-        self.last_usage = usage.clone();
-        self.total_usage.prompt_tokens += usage.prompt_tokens;
-        self.total_usage.completion_tokens += usage.completion_tokens;
-        self.total_usage.total_tokens += usage.total_tokens;
+    pub async fn call_llm(&mut self, user_input: &str) -> Result<String> {
+        self.total_calls += 1;
+        let mut msgs = vec![self.system_prompt()];
+        msgs.extend(self.history.clone());
+        msgs.push(Message { role: "user".into(), content: user_input.into() });
 
-        let model_name = match &self.provider {
-            Provider::OpenAI { model } | Provider::Anthropic { model }
-            | Provider::Ollama { model } | Provider::Router9 { model }
-            | Provider::AntigravityZen { model } => model.clone(),
-        };
-        Self::record_usage_to_sqlite(&model_name, &usage);
+        let mut providers_to_try = vec![self.provider.clone()];
+        for fb in &self.fallback_chain {
+            if !providers_to_try.contains(fb) {
+                providers_to_try.push(fb.clone());
+            }
+        }
 
-        Ok(content)
+        let max_retries = self.max_retries.max(1);
+        let mut last_error = anyhow!("No provider available");
+
+        for tier_idx in 0..providers_to_try.len() {
+            let current_prov = providers_to_try[tier_idx].clone();
+            let mut success_res: Option<(String, TokenUsage)> = None;
+
+            for attempt in 1..=max_retries {
+                match self.call_single_provider(&current_prov, &msgs).await {
+                    Ok(res) => {
+                        success_res = Some(res);
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = err;
+                        if attempt < max_retries {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+
+            if let Some((content, usage)) = success_res {
+                if tier_idx > 0 {
+                    self.provider = current_prov.clone();
+                }
+
+                self.last_usage = usage.clone();
+                self.total_usage.prompt_tokens += usage.prompt_tokens;
+                self.total_usage.completion_tokens += usage.completion_tokens;
+                self.total_usage.total_tokens += usage.total_tokens;
+
+                Self::record_usage_to_sqlite(current_prov.model(), &usage);
+                return Ok(content);
+            }
+
+            // Retries exhausted for this tier; log failover event
+            if tier_idx + 1 < providers_to_try.len() {
+                let prev_name = current_prov.name();
+                let next_prov = &providers_to_try[tier_idx + 1];
+                let next_name = next_prov.name();
+                let failover_msg = format!(
+                    "⚠️ {} failed (retries exhausted). Failing over to Fallback Tier {} ({})",
+                    prev_name,
+                    tier_idx + 1,
+                    next_name
+                );
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(AgentEvent::Thinking(failover_msg.clone()));
+                }
+                eprintln!("{}", failover_msg);
+            }
+        }
+
+        Err(anyhow!(
+            "All providers failed (primary + {} fallbacks). Last error: {}",
+            self.fallback_chain.len(),
+            last_error
+        ))
     }
 
     pub fn parse_tool_calls(&self, content: &str) -> Vec<ToolCall> {
@@ -746,6 +872,7 @@ impl ReActAgent {
         cancel: CancellationToken,
     ) {
         let started = Instant::now();
+        self.event_tx = Some(events.clone());
         self.add_user(&prompt);
         let mut current_prompt = prompt;
 
@@ -1021,5 +1148,61 @@ pub mod search_replace;
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "welcome\nworld\n");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_custom_provider_display_and_helpers() {
+        let p = Provider::Custom {
+            name: "Xiaomi DeepSeek".into(),
+            base_url: "https://api.xiaomi.com/v1".into(),
+            api_key: "xm-key".into(),
+            model: "deepseek-v3".into(),
+        };
+        assert_eq!(p.name(), "Xiaomi DeepSeek");
+        assert_eq!(p.model(), "deepseek-v3");
+        assert_eq!(p.display_label(), "Xiaomi DeepSeek (deepseek-v3)");
+
+        // Serialization
+        let serialized = serde_json::to_string(&p).unwrap();
+        let deserialized: Provider = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, p);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_chain_failover_event_logging() {
+        let mut agent = ReActAgent::new();
+        agent.max_retries = 1;
+        // Primary provider points to an invalid/unreachable host
+        agent.provider = Provider::Custom {
+            name: "FailingPrimary".into(),
+            base_url: "http://127.0.0.1:59998".into(),
+            api_key: "dummy".into(),
+            model: "fail-model".into(),
+        };
+        // Fallback tier 1 also unreachable
+        let fallback_1 = Provider::Custom {
+            name: "FailingFallback1".into(),
+            base_url: "http://127.0.0.1:59999".into(),
+            api_key: "dummy".into(),
+            model: "fail-fb1".into(),
+        };
+        agent.fallback_chain = vec![fallback_1];
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.event_tx = Some(tx);
+
+        let res = agent.call_llm("test failover").await;
+        assert!(res.is_err(), "Expected error when all providers fail");
+
+        // Verify failover event was emitted
+        let mut received_failover_event = false;
+        while let Ok(evt) = rx.try_recv() {
+            if let AgentEvent::Thinking(ref msg) = evt {
+                if msg.contains("FailingPrimary failed") && msg.contains("Fallback Tier 1") {
+                    received_failover_event = true;
+                }
+            }
+        }
+        assert!(received_failover_event, "Failover event should be logged when primary fails");
     }
 }

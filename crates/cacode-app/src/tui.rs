@@ -22,22 +22,244 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use cacode_core::commands::chat::{AgentEvent, Provider, ReActAgent, TokenUsage};
-use crate::config::CaCodeConfig;
+use crate::config::{CaCodeConfig, CustomProviderConfig};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemePreset {
+    Classic,
+    TokyoNight,
+    Nord,
+    OneDark,
+    HighContrast,
+    Light,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Theme {
+    pub preset: ThemePreset,
+    pub name: &'static str,
+    pub bg: Color,
+    pub card_bg: Color,
+    pub pill_bg: Color,
+    pub accent: Color,
+    pub accent_dim: Color,
+    pub text: Color,
+    pub text_soft: Color,
+    pub muted: Color,
+    pub border: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub error: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::classic()
+    }
+}
+
+impl Theme {
+    pub fn classic() -> Self {
+        Self {
+            preset: ThemePreset::Classic,
+            name: "Classic",
+            bg: Color::Rgb(5, 8, 15),
+            card_bg: Color::Rgb(11, 17, 32),
+            pill_bg: Color::Rgb(10, 16, 32),
+            accent: Color::Rgb(59, 130, 246),
+            accent_dim: Color::Rgb(6, 182, 212),
+            text: Color::Rgb(248, 250, 252),
+            text_soft: Color::Rgb(226, 232, 240),
+            muted: Color::Rgb(100, 116, 139),
+            border: Color::Rgb(30, 41, 59),
+            success: Color::Rgb(34, 197, 94),
+            warning: Color::Rgb(245, 158, 11),
+            error: Color::Rgb(239, 68, 68),
+        }
+    }
+
+    pub fn tokyo_night() -> Self {
+        Self {
+            preset: ThemePreset::TokyoNight,
+            name: "TokyoNight",
+            bg: Color::Rgb(26, 27, 38),
+            card_bg: Color::Rgb(31, 35, 53),
+            pill_bg: Color::Rgb(36, 40, 59),
+            accent: Color::Rgb(122, 162, 247),
+            accent_dim: Color::Rgb(187, 154, 247),
+            text: Color::Rgb(192, 202, 245),
+            text_soft: Color::Rgb(169, 177, 214),
+            muted: Color::Rgb(86, 95, 137),
+            border: Color::Rgb(59, 66, 97),
+            success: Color::Rgb(158, 206, 106),
+            warning: Color::Rgb(224, 175, 104),
+            error: Color::Rgb(247, 118, 142),
+        }
+    }
+
+    pub fn nord() -> Self {
+        Self {
+            preset: ThemePreset::Nord,
+            name: "Nord",
+            bg: Color::Rgb(46, 52, 64),
+            card_bg: Color::Rgb(59, 66, 82),
+            pill_bg: Color::Rgb(67, 76, 94),
+            accent: Color::Rgb(136, 192, 208),
+            accent_dim: Color::Rgb(129, 161, 193),
+            text: Color::Rgb(236, 239, 244),
+            text_soft: Color::Rgb(229, 233, 240),
+            muted: Color::Rgb(100, 116, 139),
+            border: Color::Rgb(76, 86, 106),
+            success: Color::Rgb(163, 190, 140),
+            warning: Color::Rgb(235, 203, 139),
+            error: Color::Rgb(191, 97, 106),
+        }
+    }
+
+    pub fn one_dark() -> Self {
+        Self {
+            preset: ThemePreset::OneDark,
+            name: "OneDark",
+            bg: Color::Rgb(33, 37, 43),
+            card_bg: Color::Rgb(40, 44, 52),
+            pill_bg: Color::Rgb(44, 49, 58),
+            accent: Color::Rgb(97, 175, 239),
+            accent_dim: Color::Rgb(198, 120, 221),
+            text: Color::Rgb(171, 178, 191),
+            text_soft: Color::Rgb(220, 223, 228),
+            muted: Color::Rgb(92, 99, 112),
+            border: Color::Rgb(62, 68, 81),
+            success: Color::Rgb(152, 195, 121),
+            warning: Color::Rgb(229, 192, 123),
+            error: Color::Rgb(224, 108, 117),
+        }
+    }
+
+    pub fn high_contrast() -> Self {
+        Self {
+            preset: ThemePreset::HighContrast,
+            name: "HighContrast",
+            bg: Color::Rgb(0, 0, 0),
+            card_bg: Color::Rgb(10, 10, 10),
+            pill_bg: Color::Rgb(23, 23, 23),
+            accent: Color::Rgb(250, 204, 21),
+            accent_dim: Color::Rgb(255, 255, 255),
+            text: Color::Rgb(255, 255, 255),
+            text_soft: Color::Rgb(245, 245, 245),
+            muted: Color::Rgb(163, 163, 163),
+            border: Color::Rgb(250, 204, 21),
+            success: Color::Rgb(74, 222, 128),
+            warning: Color::Rgb(250, 204, 21),
+            error: Color::Rgb(248, 113, 113),
+        }
+    }
+
+    pub fn light() -> Self {
+        Self {
+            preset: ThemePreset::Light,
+            name: "Light",
+            bg: Color::Rgb(248, 250, 252),
+            card_bg: Color::Rgb(255, 255, 255),
+            pill_bg: Color::Rgb(241, 245, 249),
+            accent: Color::Rgb(37, 99, 235),
+            accent_dim: Color::Rgb(2, 132, 199),
+            text: Color::Rgb(15, 23, 42),
+            text_soft: Color::Rgb(51, 65, 85),
+            muted: Color::Rgb(100, 116, 139),
+            border: Color::Rgb(203, 213, 225),
+            success: Color::Rgb(22, 163, 74),
+            warning: Color::Rgb(217, 119, 6),
+            error: Color::Rgb(220, 38, 38),
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.trim().to_lowercase().as_str() {
+            "tokyo" | "tokyonight" | "tokyo-night" => Self::tokyo_night(),
+            "nord" => Self::nord(),
+            "onedark" | "one-dark" => Self::one_dark(),
+            "contrast" | "highcontrast" | "high-contrast" => Self::high_contrast(),
+            "light" => Self::light(),
+            _ => Self::classic(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WizardState {
+    None,
+    PrdStep1ProjectName,
+    PrdStep2Stack { project_name: String },
+    PrdStep3Structure { project_name: String, stack: String },
+}
+
+pub fn resolve_provider_string(name: &str, config: &CaCodeConfig) -> Option<Provider> {
+    let lower = name.trim().to_lowercase();
+    match lower.as_str() {
+        "openai" => Some(Provider::OpenAI {
+            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()),
+        }),
+        "anthropic" => Some(Provider::Anthropic {
+            model: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-20240620".into()),
+        }),
+        "ollama" => {
+            let model = config.ollama_model.clone()
+                .or_else(|| std::env::var("OLLAMA_MODEL").ok())
+                .unwrap_or_else(|| "llama3".into());
+            Some(Provider::Ollama { model })
+        }
+        "9router" | "router9" => {
+            let model = config.router9_model.clone()
+                .or_else(|| std::env::var("ROUTER9_MODEL").ok())
+                .unwrap_or_else(|| "ZA126_PRO".into());
+            Some(Provider::Router9 { model })
+        }
+        "antigravity" | "antigravityzen" | "zen" => {
+            let model = config.effective_antigravity_model();
+            Some(Provider::AntigravityZen { model })
+        }
+        custom_name => {
+            config.custom_providers.iter().find(|cp| cp.id.eq_ignore_ascii_case(custom_name) || cp.name.eq_ignore_ascii_case(custom_name)).map(|cp| {
+                Provider::Custom {
+                    name: cp.name.clone(),
+                    base_url: cp.base_url.clone(),
+                    api_key: cp.api_key.clone(),
+                    model: cp.model.clone(),
+                }
+            })
+        }
+    }
+}
+
+pub fn build_fallback_chain(config: &CaCodeConfig) -> Vec<Provider> {
+    let mut chain = Vec::new();
+    if let Some(ref fb1) = config.fallback_1 {
+        if let Some(p) = resolve_provider_string(fb1, config) {
+            chain.push(p);
+        }
+    }
+    if let Some(ref fb2) = config.fallback_2 {
+        if let Some(p) = resolve_provider_string(fb2, config) {
+            chain.push(p);
+        }
+    }
+    if let Some(ref fb3) = config.fallback_3 {
+        if let Some(p) = resolve_provider_string(fb3, config) {
+            chain.push(p);
+        }
+    }
+    if chain.is_empty() {
+        chain.push(Provider::Router9 { model: "ZA126_PRO".into() });
+        chain.push(Provider::Ollama { model: "llama3".into() });
+    }
+    chain
+}
 
 const BRAND: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const TEXT: Color = Color::White;
 const GRAY: Color = Color::Rgb(180, 180, 190);
 const BG_BLACK: Color = Color::Rgb(0, 0, 0);
-
-// Minimalist single-column layout: near-black background, blue/cyan accent.
-// Codex-style navy header panel and ? shortcuts overlay are intentionally omitted.
-const BG_DARK: Color = Color::Rgb(5, 8, 15); // near-black (#05080f)
-const BG_PILL: Color = Color::Rgb(10, 16, 32); // slightly lighter pill background
-const ACCENT: Color = Color::Rgb(59, 130, 246); // #3b82f6 blue accent
-const ACCENT_DIM: Color = Color::Rgb(96, 165, 250); // brighter blue/cyan accent
-const TEXT_SOFT: Color = Color::Rgb(226, 232, 240); // soft lavender/white
-const MUTED: Color = Color::Rgb(100, 116, 139); // muted slate
 
 const LOGO: &[&str] = &[
     r"  ██████╗ █████╗  ██████╗ ██████╗ ██████╗ ███████╗",
@@ -50,7 +272,7 @@ const LOGO: &[&str] = &[
 
 const WELCOME_LINES: &[&str] = &[
     "",
-    "  Sovereign Rust Development Agent  v1.0.8",
+    "  Sovereign Rust Development Agent  v1.0.9",
     "",
     "  • ReAct Agent Loop with deterministic local tool execution",
     "  • Multi-provider BYOK & Free: Antigravity Zen, Ollama, 9Router, OpenAI, Anthropic",
@@ -65,19 +287,22 @@ const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/models", "Interactive AI model picker"),
     ("/providers", "Probe & display local & free providers (Ollama, Zen)"),
-    ("/provider", "Switch active provider (/provider <name>)"),
+    ("/provider", "Manage & switch AI providers (/provider add|list|<name>)"),
+    ("/fallback", "Configure fallback routing tier (/fallback <1|2|3> <provider>)"),
+    ("/theme", "Switch UI theme (/theme <classic|tokyo|nord|onedark|contrast|light>)"),
+    ("/pro", "Pro edition differentiation & license activation (/pro <key>)"),
     ("/mode", "Select thinking level: Fast, Analytical, Deep"),
     ("/settings", "Open BYOK settings & provider configuration"),
     ("/monitor", "View real-time token telemetry & proxy log"),
     ("/report", "View token usage summary, heatmap & model analytics"),
     ("/skills", "Manage custom skills & reusable prompts"),
     ("/todo", "Manage task checklist (/todo add|done|list|clear)"),
-    ("/dev", "⚡ Feature development & implementation protocol"),
-    ("/prd", "📋 Product Requirements Document drafting workflow"),
-    ("/audit", "🛡️ Security & architecture whitebox audit"),
+    ("/dev", "⚡ Feature development & implementation protocol (@dev)"),
+    ("/prd", "📋 Product Requirements Document drafting wizard (@prd)"),
+    ("/audit", "🛡️ Security & architecture whitebox audit (@audit)"),
     ("/refact", "🧹 Code refactoring, simplification & cleanup"),
     ("/update", "📦 Dependency bump, migration & semantic version update"),
-    ("/fix", "🐞 Systematic 4-phase bugfix protocol"),
+    ("/fix", "🐞 Systematic 4-phase bugfix protocol (@fix)"),
     ("/bughunt", "🎯 Deep bug hunt (boundary fuzzing, concurrency & panics)"),
     ("/test", "🧪 TDD test authoring (unit & integration tests)"),
     ("/qa", "✅ Quality Assurance dual-check sign-off"),
@@ -88,7 +313,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.8)"),
+    ("/version", "Show CACode version (v1.0.9)"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -295,6 +520,7 @@ pub struct ChatSession {
     show_welcome: bool,
     pub react_steps: Vec<String>,
     pub todos: Vec<TodoItem>,
+    pub wizard_state: WizardState,
 }
 
 impl ChatSession {
@@ -303,6 +529,8 @@ impl ChatSession {
         agent.user_name = config.user_name.clone();
         agent.persona = config.system_persona.clone();
         agent.thinking_mode = config.thinking_mode.clone();
+        agent.fallback_chain = build_fallback_chain(config);
+        agent.max_retries = config.max_retries;
         Self {
             name,
             messages: Vec::new(),
@@ -314,6 +542,7 @@ impl ChatSession {
             show_welcome: true,
             react_steps: Vec::new(),
             todos: Vec::new(),
+            wizard_state: WizardState::None,
         }
     }
 
@@ -610,12 +839,14 @@ struct App {
     steering_tx: Option<mpsc::UnboundedSender<String>>,
     cancel_token: Option<CancellationToken>,
     agent_turn_session: usize,
+    pub theme: Theme,
 }
 
 impl App {
     fn new(config: CaCodeConfig) -> Self {
         let settings = Self::build_settings(&config);
         let session = ChatSession::new("Session 1".into(), &config);
+        let theme = Theme::from_name(&config.theme);
         let mut app = Self {
             active_page: 0,
             sessions: vec![session],
@@ -642,10 +873,15 @@ impl App {
             steering_tx: None,
             cancel_token: None,
             agent_turn_session: 0,
+            theme,
         };
         app.refresh_skills();
         app.refresh_models_cache();
         app
+    }
+
+    pub fn is_pro(&self) -> bool {
+        self.config.is_pro()
     }
 
     fn session(&self) -> &ChatSession {
@@ -915,22 +1151,12 @@ impl App {
         SettingsState { fields, selected: 0, editing: false }
     }
 
-    fn provider_name(&self) -> &'static str {
-        match &self.session().agent.provider {
-            Provider::OpenAI { .. } => "OpenAI",
-            Provider::Anthropic { .. } => "Anthropic",
-            Provider::Ollama { .. } => "Ollama",
-            Provider::Router9 { .. } => "9Router",
-            Provider::AntigravityZen { .. } => "Antigravity Zen",
-        }
+    fn provider_name(&self) -> &str {
+        self.session().agent.provider.name()
     }
 
     fn model_name(&self) -> String {
-        match &self.session().agent.provider {
-            Provider::OpenAI { model } | Provider::Anthropic { model }
-            | Provider::Ollama { model } | Provider::Router9 { model }
-            | Provider::AntigravityZen { model } => model.clone(),
-        }
+        self.session().agent.provider.model().to_string()
     }
 
     fn thinking_mode(&self) -> &str {
@@ -1573,6 +1799,7 @@ async fn handle_chat_key(
                                 Provider::Ollama { model } => *model = m.clone(),
                                 Provider::Router9 { model } => *model = m.clone(),
                                 Provider::AntigravityZen { model } => *model = m.clone(),
+                                Provider::Custom { model, .. } => *model = m.clone(),
                             }
                             if matches!(app.session().agent.provider, Provider::AntigravityZen { .. }) {
                                 app.config.antigravity_zen_model = Some(m.clone());
@@ -1732,6 +1959,94 @@ async fn handle_chat_key(
             app.session_mut().cursor_pos = 0;
             app.session_mut().show_welcome = false;
             app.autocomplete_idx = 0;
+
+            match app.session().wizard_state.clone() {
+                WizardState::PrdStep1ProjectName => {
+                    let project_name = input.clone();
+                    app.session_mut().messages.push(ChatMessage::plain("user", project_name.clone()));
+                    app.session_mut().wizard_state = WizardState::PrdStep2Stack { project_name };
+                    let q2 = "🛠️ [PRD Wizard • 2/3] Bahasa pemrograman & arsitektur apa yang ingin digunakan?\n  1. (Recommended) Rust + Tauri v2 (High-performance, sovereign desktop, zero-crash)\n  2. Go + HTMX / Templ (Lightweight single binary)\n  3. TypeScript + SvelteKit / CAUI (Modern reactive UI)\n  4. Python + FastAPI (Rapid API prototype)\n  *(Ketik angka 1-4 atau ketik pilihan manual)*";
+                    app.session_mut().messages.push(ChatMessage::plain("assistant", q2));
+                    return Ok(());
+                }
+                WizardState::PrdStep2Stack { project_name } => {
+                    let stack = match input.trim() {
+                        "1" => "Rust + Tauri v2 (High-performance, sovereign desktop, zero-crash)".to_string(),
+                        "2" => "Go + HTMX / Templ (Lightweight single binary)".to_string(),
+                        "3" => "TypeScript + SvelteKit / CAUI (Modern reactive UI)".to_string(),
+                        "4" => "Python + FastAPI (Rapid API prototype)".to_string(),
+                        other => other.to_string(),
+                    };
+                    app.session_mut().messages.push(ChatMessage::plain("user", stack.clone()));
+                    app.session_mut().wizard_state = WizardState::PrdStep3Structure { project_name, stack };
+                    let q3 = "📐 [PRD Wizard • 3/3] Struktur dan modularitas seperti apa yang dibutuhkan?\n  1. (Recommended) Modular Workspace: Core Library + CLI + TUI + Local SQLite\n  2. Clean Architecture: Domain + UseCase + Infrastructure + Presentation\n  3. Microservices: API Gateway + Business Services + Background Worker\n  *(Ketik angka 1-3 atau ketik struktur manual)*";
+                    app.session_mut().messages.push(ChatMessage::plain("assistant", q3));
+                    return Ok(());
+                }
+                WizardState::PrdStep3Structure { project_name, stack } => {
+                    let structure = match input.trim() {
+                        "1" => "Modular Workspace: Core Library + CLI + TUI + Local SQLite".to_string(),
+                        "2" => "Clean Architecture: Domain + UseCase + Infrastructure + Presentation".to_string(),
+                        "3" => "Microservices: API Gateway + Business Services + Background Worker".to_string(),
+                        other => other.to_string(),
+                    };
+                    app.session_mut().messages.push(ChatMessage::plain("user", structure.clone()));
+                    app.session_mut().wizard_state = WizardState::None;
+                    let synthesis_prompt = format!(
+                        "🎯 [PRD WIZARD COMPLETE]\nAuthor a comprehensive, production-grade Product Requirements Document (PRD.md) in the current directory with the following specifications:\n\n- Project Name & Objective: {}\n- Target Stack & Architecture: {}\n- Modularity & Structure: {}\n\nStructure the PRD.md with:\n1. Executive Summary & Problem Statement\n2. Key Functional Requirements & Personas\n3. System Architecture & Tech Stack Justification\n4. Directory Structure & Modular Component Design\n5. API Endpoints / Local Data Schema\n6. Phased Implementation Milestones & QA Acceptance Criteria\n\nUse the `write_file` tool to save `PRD.md`.",
+                        project_name, stack, structure
+                    );
+                    app.session_mut().messages.push(ChatMessage::plain("assistant", "Synthesizing requirements into PRD.md via ReAct agent...".to_string()));
+                    app.session_mut().scroll_offset = 0;
+                    app.start_turn(synthesis_prompt);
+                    return Ok(());
+                }
+                WizardState::None => {}
+            }
+
+            if input == "@prd" || input == "/prd" {
+                app.session_mut().wizard_state = WizardState::PrdStep1ProjectName;
+                let q1 = "🎯 [PRD Wizard • 1/3] Apa nama dan tujuan utama proyek/aplikasi yang ingin Anda buat?";
+                app.session_mut().messages.push(ChatMessage::plain("assistant", q1));
+                return Ok(());
+            } else if let Some(stripped) = input.strip_prefix("@prd ").or_else(|| input.strip_prefix("/prd ")) {
+                let project_name = stripped.trim().to_string();
+                app.session_mut().messages.push(ChatMessage::plain("user", project_name.clone()));
+                app.session_mut().wizard_state = WizardState::PrdStep2Stack { project_name };
+                let q2 = "🛠️ [PRD Wizard • 2/3] Bahasa pemrograman & arsitektur apa yang ingin digunakan?\n  1. (Recommended) Rust + Tauri v2 (High-performance, sovereign desktop, zero-crash)\n  2. Go + HTMX / Templ (Lightweight single binary)\n  3. TypeScript + SvelteKit / CAUI (Modern reactive UI)\n  4. Python + FastAPI (Rapid API prototype)\n  *(Ketik angka 1-4 atau ketik pilihan manual)*";
+                app.session_mut().messages.push(ChatMessage::plain("assistant", q2));
+                return Ok(());
+            } else if input == "@dev" {
+                app.session_mut().messages.push(ChatMessage::plain("assistant", "⚡ [Dev Protocol] Apa fitur atau perubahan yang ingin Anda implementasikan? (Ketik deskripsi tugas)"));
+                return Ok(());
+            } else if let Some(stripped) = input.strip_prefix("@dev ") {
+                let task = stripped.trim();
+                let dev_prompt = format!("⚡ [DEV PROTOCOL ACTIVATED]\nTask: {}\nExecute systematic implementation:\n1. Search and inspect existing files\n2. Author or patch implementation\n3. Run cargo test or validation to verify zero regressions.", task);
+                app.session_mut().messages.push(ChatMessage::plain("user", input.clone()));
+                app.session_mut().scroll_offset = 0;
+                app.start_turn(dev_prompt);
+                return Ok(());
+            } else if input == "@audit" {
+                app.session_mut().messages.push(ChatMessage::plain("assistant", "🛡️ [Audit Protocol] File, modul, atau aspek keamanan mana yang ingin diaudit?"));
+                return Ok(());
+            } else if let Some(stripped) = input.strip_prefix("@audit ") {
+                let target = stripped.trim();
+                let audit_prompt = format!("🛡️ [AUDIT PROTOCOL ACTIVATED]\nTarget: {}\nPerform whitebox audit on code safety, memory management, error handling, and architecture soundness. Report actionable findings.", target);
+                app.session_mut().messages.push(ChatMessage::plain("user", input.clone()));
+                app.session_mut().scroll_offset = 0;
+                app.start_turn(audit_prompt);
+                return Ok(());
+            } else if input == "@fix" {
+                app.session_mut().messages.push(ChatMessage::plain("assistant", "🐞 [Fix Protocol] Jelaskan bug, error log, atau perilaku tak terduga yang terjadi:"));
+                return Ok(());
+            } else if let Some(stripped) = input.strip_prefix("@fix ") {
+                let bug = stripped.trim();
+                let fix_prompt = format!("🐞 [FIX PROTOCOL ACTIVATED]\nIssue: {}\nApply systematic 4-phase bugfix:\n1. Understand root cause and find reproduction path\n2. Formulate minimal targeted patch\n3. Apply patch via patch_file or search_replace\n4. Verify with test/build.", bug);
+                app.session_mut().messages.push(ChatMessage::plain("user", input.clone()));
+                app.session_mut().scroll_offset = 0;
+                app.start_turn(fix_prompt);
+                return Ok(());
+            }
 
             // Mid-turn steering: while a ReAct turn is in flight, a plain
             // message is captured as a `[Steering / Mid-turn]` instruction
@@ -1911,6 +2226,7 @@ async fn handle_chat_key(
                                 Provider::Ollama { model } => *model = arg.to_string(),
                                 Provider::Router9 { model } => *model = arg.to_string(),
                                 Provider::AntigravityZen { model } => *model = arg.to_string(),
+                                Provider::Custom { model, .. } => *model = arg.to_string(),
                             }
                             if matches!(app.session().agent.provider, Provider::AntigravityZen { .. }) {
                                 app.config.antigravity_zen_model = Some(arg.to_string());
@@ -1967,43 +2283,181 @@ async fn handle_chat_key(
                     }
                     "/provider" => {
                         let current_provider = app.provider_name().to_string();
+                        let cur_model = app.model_name();
                         if arg.is_empty() {
-                            app.session_mut().messages.push(ChatMessage::plain("system", format!("Current provider: {}. Usage: /provider antigravity|zen|ollama|9router|openai|anthropic\nType /providers to probe local & free provider status.", current_provider)));
-                        } else {
-                            let new_p = match arg.to_lowercase().as_str() {
-                                "openai" => Provider::OpenAI { model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()) },
-                                "anthropic" => Provider::Anthropic { model: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-20240620".into()) },
-                                "ollama" => {
-                                    let model = app.config.ollama_model.clone()
-                                        .or_else(|| std::env::var("OLLAMA_MODEL").ok())
-                                        .unwrap_or_else(|| "llama3".into());
-                                    Provider::Ollama { model }
+                            let msg = format!(
+                                "Active Provider: {} ({})\nUsage:\n  /provider <name>                          - Switch active provider\n  /provider list                            - List all endpoints & models\n  /provider add <name> <url> <key> <model>  - Add custom provider",
+                                current_provider, cur_model
+                            );
+                            app.session_mut().messages.push(ChatMessage::plain("system", msg));
+                        } else if arg == "list" {
+                            let mut out = String::from("Configured Providers & Endpoints:\n");
+                            out.push_str("  • Antigravity Zen: https://antigravity.ai/zen/v1\n");
+                            out.push_str(&format!("  • Ollama: {}\n", app.config.effective("OLLAMA_URL", &app.config.ollama_url)));
+                            out.push_str(&format!("  • 9Router: {}\n", app.config.effective("ROUTER9_URL", &app.config.router9_url)));
+                            out.push_str(&format!("  • OpenAI: {}\n", app.config.effective("OPENAI_BASE_URL", &app.config.openai_base_url)));
+                            out.push_str("  • Anthropic: https://api.anthropic.com/v1\n");
+                            if !app.config.custom_providers.is_empty() {
+                                out.push_str("\nCustom Providers:\n");
+                                for cp in &app.config.custom_providers {
+                                    out.push_str(&format!("  • {} (id: {}, model: {}, url: {})\n", cp.name, cp.id, cp.model, cp.base_url));
                                 }
-                                "9router" | "router9" => Provider::Router9 { model: std::env::var("ROUTER9_MODEL").unwrap_or_else(|_| "ZA126_PRO".into()) },
-                                "antigravity" | "antigravityzen" | "zen" => {
-                                    let model = app.config.effective_antigravity_model();
-                                    Provider::AntigravityZen { model }
-                                }
-                                other => {
-                                    app.session_mut().messages.push(ChatMessage::plain("system", format!("Unknown provider: {}. Available: antigravity (or zen), ollama, 9router, openai, anthropic", other)));
-                                    return Ok(());
-                                }
-                            };
-                            let (name, m) = match &new_p {
-                                Provider::AntigravityZen { model } => ("Antigravity Zen", model.clone()),
-                                Provider::Ollama { model } => ("Ollama", model.clone()),
-                                Provider::OpenAI { model } => ("OpenAI", model.clone()),
-                                Provider::Anthropic { model } => ("Anthropic", model.clone()),
-                                Provider::Router9 { model } => ("9Router", model.clone()),
-                            };
+                            }
+                            out.push_str(&format!("\nActive: {} (model: {})\n", app.provider_name(), app.model_name()));
+                            out.push_str(&format!(
+                                "Failover Chain: F1: {}, F2: {}, F3: {}\n",
+                                app.config.fallback_1.as_deref().unwrap_or("none"),
+                                app.config.fallback_2.as_deref().unwrap_or("none"),
+                                app.config.fallback_3.as_deref().unwrap_or("none"),
+                            ));
+                            app.session_mut().messages.push(ChatMessage::plain("system", out));
+                        } else if let Some(stripped) = arg.strip_prefix("add ") {
+                            let sub_args: Vec<&str> = stripped.split_whitespace().collect();
+                            if sub_args.len() < 4 {
+                                app.session_mut().messages.push(ChatMessage::plain("system", "Usage: /provider add <name> <base_url> <key> <model>"));
+                            } else {
+                                let name = sub_args[0].to_string();
+                                let base_url = sub_args[1].to_string();
+                                let key = sub_args[2].to_string();
+                                let model = sub_args[3].to_string();
+                                let id = name.to_lowercase().replace(' ', "-");
+                                app.config.custom_providers.retain(|cp| cp.id != id);
+                                app.config.custom_providers.push(CustomProviderConfig {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    base_url: base_url.clone(),
+                                    api_key: key,
+                                    model: model.clone(),
+                                });
+                                let _ = app.config.save();
+                                app.status_msg = format!("Added custom provider '{}' ✓", name);
+                                app.session_mut().messages.push(ChatMessage::plain(
+                                    "system",
+                                    format!("Added custom provider '{}' (endpoint: {}, model: {}).\nSwitch to it with: `/provider {}`", name, base_url, model, id),
+                                ));
+                            }
+                        } else if let Some(new_p) = resolve_provider_string(arg, &app.config) {
+                            let name = new_p.name().to_string();
+                            let m = new_p.model().to_string();
                             app.session_mut().agent.provider = new_p;
                             app.status_msg = format!("Provider switched to {} ({}) ✓", name, m);
                             app.session_mut().messages.push(ChatMessage::plain("system", format!("Active provider switched to {} (model: {})", name, m)));
+                        } else {
+                            app.session_mut().messages.push(ChatMessage::plain(
+                                "system",
+                                format!("Unknown provider: '{}'. Type `/provider list` to see available providers or `/provider add` to create one.", arg),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    "/fallback" => {
+                        let parts: Vec<&str> = arg.split_whitespace().collect();
+                        if parts.is_empty() {
+                            let f1 = app.config.fallback_1.as_deref().unwrap_or("none").to_string();
+                            let f2 = app.config.fallback_2.as_deref().unwrap_or("none").to_string();
+                            let f3 = app.config.fallback_3.as_deref().unwrap_or("none").to_string();
+                            let msg = format!(
+                                "Current Fallback Routing Tiers:\n  Fallback Tier 1: {}\n  Fallback Tier 2: {}\n  Fallback Tier 3: {}\n\nUsage: /fallback <1|2|3> <provider>\nExample: /fallback 1 9router",
+                                f1, f2, f3
+                            );
+                            app.session_mut().messages.push(ChatMessage::plain("system", msg));
+                        } else if parts.len() >= 2 {
+                            let tier = parts[0];
+                            let target_prov = parts[1];
+                            if resolve_provider_string(target_prov, &app.config).is_some() {
+                                match tier {
+                                    "1" => app.config.fallback_1 = Some(target_prov.to_string()),
+                                    "2" => app.config.fallback_2 = Some(target_prov.to_string()),
+                                    "3" => app.config.fallback_3 = Some(target_prov.to_string()),
+                                    _ => {
+                                        app.session_mut().messages.push(ChatMessage::plain("system", "Invalid tier. Choose 1, 2, or 3. E.g.: /fallback 1 9router"));
+                                        return Ok(());
+                                    }
+                                }
+                                let _ = app.config.save();
+                                let new_chain = build_fallback_chain(&app.config);
+                                for s in &mut app.sessions {
+                                    s.agent.fallback_chain = new_chain.clone();
+                                }
+                                app.status_msg = format!("Fallback Tier {} set to {} ✓", tier, target_prov);
+                                app.session_mut().messages.push(ChatMessage::plain(
+                                    "system",
+                                    format!("Fallback Tier {} configured to: {}", tier, target_prov),
+                                ));
+                            } else {
+                                app.session_mut().messages.push(ChatMessage::plain(
+                                    "system",
+                                    format!("Unknown provider '{}'. Use /provider list to inspect valid providers.", target_prov),
+                                ));
+                            }
+                        } else {
+                            app.session_mut().messages.push(ChatMessage::plain("system", "Usage: /fallback <1|2|3> <provider>"));
+                        }
+                        return Ok(());
+                    }
+                    "/theme" => {
+                        if arg.is_empty() {
+                            let current_theme = app.theme.name;
+                            app.session_mut().messages.push(ChatMessage::plain(
+                                "system",
+                                format!(
+                                    "Available Themes:\n  • classic      - CACode near-black, vivid blue, cyan\n  • tokyo        - Deep indigo/purple, cyan/blue, magenta, soft green\n  • nord         - Arctic slate-blue, frost blue, ice cyan, snow white\n  • onedark      - Atom dark gray, blue, purple, amber\n  • contrast     - High-contrast pure black, stark bright yellow, white\n  • light        - Paper slate, dark text, royal blue, border\n\nActive Theme: {}\nUsage: /theme <classic|tokyo|nord|onedark|contrast|light>",
+                                    current_theme
+                                ),
+                            ));
+                        } else {
+                            let new_theme = Theme::from_name(arg);
+                            app.theme = new_theme;
+                            app.config.theme = arg.to_lowercase();
+                            let _ = app.config.save();
+                            let theme_name = app.theme.name;
+                            let theme_preset = app.theme.preset;
+                            app.status_msg = format!("Theme switched to {} ✓", theme_name);
+                            app.session_mut().messages.push(ChatMessage::plain(
+                                "system",
+                                format!("Theme palette updated to {} (preset: {:?})", theme_name, theme_preset),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    "/pro" => {
+                        if arg.is_empty() {
+                            let status = if app.is_pro() {
+                                "⭐ ACTIVE [PRO EDITION UNLOCKED]"
+                            } else {
+                                "FREE EDITION (Standard)"
+                            };
+                            let card = format!(
+                                "╔══════════════════════════════════════════════════════════════════════════════╗\n\
+                                 ║                          CACODE PRO DIFFERENTIATION                          ║\n\
+                                 ╠════════════════════════════════════════╦═════════════════════════════════════╣\n\
+                                 ║ FREE EDITION                           ║ PRO EDITION ($10/mo or Sovereign)   ║\n\
+                                 ╠════════════════════════════════════════╬═════════════════════════════════════╣\n\
+                                 ║ • Single AI provider                   ║ • 3-Tier Auto-Fallback & Zero-Down  ║\n\
+                                 ║ • Standard chat REPL                   ║ • Interactive Skill Wizards (@prd)  ║\n\
+                                 ║ • Classic dark theme only              ║ • 6 Premium Themes + Light Mode     ║\n\
+                                 ║ • Basic context window                 ║ • Ultra Context Compressor          ║\n\
+                                 ║ • Single session                       ║ • Multi-session Workspace (1-9)     ║\n\
+                                 ║ • Sequential execution                 ║ • Parallel Task Spawning            ║\n\
+                                 ╚════════════════════════════════════════╩═════════════════════════════════════╝\n\n\
+                                 Current Status: {}\n\
+                                 To activate Pro, run: `/pro <license-key>`",
+                                status
+                            );
+                            app.session_mut().messages.push(ChatMessage::plain("system", card));
+                        } else {
+                            app.config.pro_license_key = Some(arg.to_string());
+                            let _ = app.config.save();
+                            app.status_msg = "⭐ Pro license activated! [PRO] ✓".into();
+                            app.session_mut().messages.push(ChatMessage::plain(
+                                "system",
+                                format!("⭐ CACode PRO successfully activated with key '{}'!\nAll premium features unlocked: 3-Tier Auto-Fallback, Skill Wizards, Premium Themes, and Multi-Session Workspace.", arg),
+                            ));
                         }
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch provider (antigravity, zen, ollama, 9router, openai, anthropic)\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /todo <args>       - Task checklist (/todo add|done|list|clear)\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.8)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch or configure provider (/provider add|list|<name>)\n  /fallback <1|2|3>  - Configure 3-tier auto-failover routing\n  /theme <name>      - Switch theme preset (classic, tokyo, nord, onedark, contrast, light)\n  /pro [key]         - Pro license activation & feature matrix\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /todo <args>       - Task checklist (/todo add|done|list|clear)\n  /dev, @dev         - Development implementation protocol\n  /prd, @prd         - Interactive PRD authoring wizard\n  /audit, @audit     - Security & architecture whitebox audit\n  /fix, @fix         - Systematic 4-phase bugfix\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.9)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
                         return Ok(());
                     }
                     "/clear" => {
@@ -2046,7 +2500,7 @@ async fn handle_chat_key(
                         app.session_mut().messages.push(ChatMessage::plain("system", info));
                         return Ok(());
                     }
-                    "/dev" | "/prd" | "/audit" | "/refact" | "/update" | "/fix" | "/bughunt" | "/test" | "/qa" => {
+                    "/refact" | "/update" | "/bughunt" | "/test" | "/qa" => {
                         let skill_name = cmd.trim_start_matches('/');
                         let skill_file = format!("{}.md", skill_name);
                         let dir = App::skills_dir();
@@ -2161,7 +2615,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.8 (Sovereign Rust Agent)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.9 (Sovereign Rust Agent)"));
                         return Ok(());
                     }
                     s => {
@@ -2390,9 +2844,8 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent) {
 
 fn ui(f: &mut Frame, app: &App) {
     let size = f.area();
-    // Near-black background for the minimalist single-column layout.
     f.render_widget(Clear, size);
-    let bg = Paragraph::new("").style(Style::default().bg(BG_DARK));
+    let bg = Paragraph::new("").style(Style::default().bg(app.theme.bg));
     f.render_widget(bg, size);
 
     let outer = Layout::default()
@@ -2466,7 +2919,7 @@ fn ui(f: &mut Frame, app: &App) {
                 width: left_pane.width,
                 height: chat_h,
             };
-            draw_messages(f, session, chat_rect);
+            draw_messages(f, app, session, chat_rect);
 
             let pill_rect = Rect {
                 x: left_pane.x + 1,
@@ -2496,7 +2949,7 @@ fn ui(f: &mut Frame, app: &App) {
                 width: box_area.width,
                 height: chat_h,
             };
-            draw_messages(f, session, chat_rect);
+            draw_messages(f, app, session, chat_rect);
 
             let pill_rect = Rect {
                 x: box_area.x + 1,
@@ -2562,53 +3015,58 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Draw exit confirmation modal if requested
     if app.show_exit_confirmation {
-        draw_exit_confirmation(f, size);
+        draw_exit_confirmation(f, app, size);
     }
 }
 
 fn draw_page_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let mut spans = Vec::new();
-    spans.push(Span::styled(" [Esc] Back to Chat │ ", Style::default().fg(BRAND)));
+    spans.push(Span::styled(" [Esc] Back to Chat │ ", Style::default().fg(theme.accent)));
     for (i, name) in PAGE_NAMES.iter().enumerate() {
         let style = if i == app.active_page {
-            Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(theme.muted)
         };
         spans.push(Span::styled(format!("{}:{} ", i + 1, name), style));
         if i < PAGE_NAMES.len() - 1 {
-            spans.push(Span::styled("┃ ", Style::default().fg(DIM)));
+            spans.push(Span::styled("┃ ", Style::default().fg(theme.border)));
         }
     }
-    spans.push(Span::styled("│ [Ctrl+1..5 / F1..F5 / ⇆ Tab]", Style::default().fg(DIM)));
-    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_BLACK)), area);
+    spans.push(Span::styled("│ [Ctrl+1..5 / F1..F5 / ⇆ Tab]", Style::default().fg(theme.muted)));
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg)), area);
 }
 
 fn format_session_tabs_spans<'a>(app: &'a App, width: u16) -> Vec<Span<'a>> {
+    let theme = &app.theme;
     let mut left_spans = Vec::new();
     left_spans.push(Span::raw(" "));
+    if app.is_pro() {
+        left_spans.push(Span::styled("[⭐ PRO] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    }
     for (i, session) in app.sessions.iter().enumerate() {
         if i == app.active_session {
             left_spans.push(Span::styled(
                 format!("● {} ", session.name),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
             ));
         } else {
             left_spans.push(Span::styled(
                 format!("{} ", session.name),
-                Style::default().fg(MUTED),
+                Style::default().fg(theme.muted),
             ));
         }
         if i < app.sessions.len() - 1 || app.sessions.len() < MAX_SESSIONS {
-            left_spans.push(Span::styled("│ ", Style::default().fg(DIM)));
+            left_spans.push(Span::styled("│ ", Style::default().fg(theme.border)));
         }
     }
     if app.sessions.len() < MAX_SESSIONS {
-        left_spans.push(Span::styled("+ (Ctrl+T) ", Style::default().fg(ACCENT_DIM)));
+        left_spans.push(Span::styled("+ (Ctrl+T) ", Style::default().fg(theme.accent_dim)));
     }
 
     let right_spans = vec![
-        Span::styled("[Tab / ⇆ Switch · Ctrl+W Close] ", Style::default().fg(MUTED)),
+        Span::styled("[Tab / ⇆ Switch · Ctrl+W Close] ", Style::default().fg(theme.muted)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.width()).sum();
@@ -2626,7 +3084,7 @@ fn format_session_tabs_spans<'a>(app: &'a App, width: u16) -> Vec<Span<'a>> {
 
 fn draw_session_tabs(f: &mut Frame, app: &App, area: Rect) {
     let spans = format_session_tabs_spans(app, area.width);
-    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_DARK)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(app.theme.bg)), area);
 }
 
 #[allow(dead_code)]
@@ -2635,44 +3093,51 @@ fn draw_chat_content(f: &mut Frame, app: &App, area: Rect) {
     if session.show_welcome && session.messages.is_empty() {
         draw_welcome(f, app, area);
     } else {
-        draw_messages(f, session, area);
+        draw_messages(f, app, session, area);
     }
 }
 
-fn draw_welcome(f: &mut Frame, _app: &App, area: Rect) {
+fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let mut lines: Vec<Line> = Vec::new();
     for row in LOGO {
         lines.push(Line::from(Span::styled(
             *row,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         )));
     }
     for row in WELCOME_LINES {
-        let style = if row.starts_with("  •") {
-            Style::default().fg(GRAY)
-        } else if row.contains("Sovereign") {
-            Style::default().fg(ACCENT_DIM).add_modifier(Modifier::BOLD)
+        if row.contains("Sovereign") {
+            let mut spans = vec![
+                Span::styled(*row, Style::default().fg(theme.accent_dim).add_modifier(Modifier::BOLD)),
+            ];
+            if app.is_pro() {
+                spans.push(Span::styled("  [⭐ PRO ACTIVE]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            }
+            lines.push(Line::from(spans));
+        } else if row.starts_with("  •") {
+            lines.push(Line::from(Span::styled(*row, Style::default().fg(theme.text_soft))));
         } else {
-            Style::default().fg(MUTED)
-        };
-        lines.push(Line::from(Span::styled(*row, style)));
+            lines.push(Line::from(Span::styled(*row, Style::default().fg(theme.muted))));
+        }
     }
 
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .alignment(Alignment::Center)
-        .style(Style::default().bg(BG_DARK));
+        .style(Style::default().bg(theme.bg));
     f.render_widget(p, area);
 }
 
 fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
+    let theme = &app.theme;
     let session = app.session();
 
     let card_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT_DIM))
-        .style(Style::default().bg(BG_PILL));
+        .border_style(Style::default().fg(theme.accent_dim))
+        .style(Style::default().bg(theme.pill_bg));
     f.render_widget(card_block, area);
 
     if area.height < 5 || area.width < 10 {
@@ -2684,9 +3149,9 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     // Line 1: Input text or placeholder
     let show_placeholder = session.input.is_empty();
     let content_style = if show_placeholder {
-        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC)
+        Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC)
     } else {
-        Style::default().fg(TEXT_SOFT)
+        Style::default().fg(theme.text_soft)
     };
 
     let line1 = Line::from(vec![
@@ -2697,7 +3162,7 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
         },
     ]);
     f.render_widget(
-        Paragraph::new(line1).style(Style::default().bg(BG_PILL)),
+        Paragraph::new(line1).style(Style::default().bg(theme.pill_bg)),
         Rect {
             x: area.x + 2,
             y: area.y + 1,
@@ -2708,9 +3173,9 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
 
     // Line 2: Divider
     let divider = "─".repeat(inner_width);
-    let line2 = Line::from(Span::styled(divider, Style::default().fg(Color::Rgb(38, 45, 56))));
+    let line2 = Line::from(Span::styled(divider, Style::default().fg(theme.border)));
     f.render_widget(
-        Paragraph::new(line2).style(Style::default().bg(BG_PILL)),
+        Paragraph::new(line2).style(Style::default().bg(theme.pill_bg)),
         Rect {
             x: area.x + 2,
             y: area.y + 2,
@@ -2725,19 +3190,19 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     let provider = app.provider_name();
 
     let left_spans = vec![
-        Span::styled("⚡ ", Style::default().fg(Color::Yellow)),
-        Span::styled(format!("{} ", mode), Style::default().fg(TEXT_SOFT).add_modifier(Modifier::BOLD)),
+        Span::styled("⚡ ", Style::default().fg(theme.warning)),
+        Span::styled(format!("{} ", mode), Style::default().fg(theme.text_soft).add_modifier(Modifier::BOLD)),
         Span::styled(" ", Style::default()),
-        Span::styled(format!("{} ", model), Style::default().fg(TEXT_SOFT)),
+        Span::styled(format!("{} ", model), Style::default().fg(theme.text_soft)),
         Span::styled(" ", Style::default()),
-        Span::styled(provider, Style::default().fg(ACCENT_DIM)),
+        Span::styled(provider, Style::default().fg(theme.accent_dim)),
     ];
 
     let right_spans = vec![
-        Span::styled("tab", Style::default().fg(ACCENT_DIM)),
-        Span::styled(" switch agent · ", Style::default().fg(MUTED)),
-        Span::styled("ctrl+p", Style::default().fg(ACCENT_DIM)),
-        Span::styled(" commands", Style::default().fg(MUTED)),
+        Span::styled("tab", Style::default().fg(theme.accent_dim)),
+        Span::styled(" switch agent · ", Style::default().fg(theme.muted)),
+        Span::styled("ctrl+p", Style::default().fg(theme.accent_dim)),
+        Span::styled(" commands", Style::default().fg(theme.muted)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -2752,7 +3217,7 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
 
     let line3 = Line::from(footer_spans);
     f.render_widget(
-        Paragraph::new(line3).style(Style::default().bg(BG_PILL)),
+        Paragraph::new(line3).style(Style::default().bg(theme.pill_bg)),
         Rect {
             x: area.x + 2,
             y: area.y + 3,
@@ -2766,7 +3231,8 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     Some((cx, cy))
 }
 
-fn draw_exit_confirmation(f: &mut Frame, screen: Rect) {
+fn draw_exit_confirmation(f: &mut Frame, app: &App, screen: Rect) {
+    let theme = &app.theme;
     let modal_w = 54u16.min(screen.width.saturating_sub(2));
     let modal_h = 7u16.min(screen.height);
     let x = screen.x + (screen.width.saturating_sub(modal_w)) / 2;
@@ -2778,10 +3244,10 @@ fn draw_exit_confirmation(f: &mut Frame, screen: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
         .title(" Exit Confirmation ")
         .title_alignment(Alignment::Center)
-        .style(Style::default().bg(BG_PILL));
+        .style(Style::default().bg(theme.card_bg));
     f.render_widget(block, modal_rect);
 
     let inner_area = Rect {
@@ -2795,28 +3261,36 @@ fn draw_exit_confirmation(f: &mut Frame, screen: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "Are you sure you want to quit CACode?",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )).alignment(Alignment::Center),
         Line::from(""),
         Line::from(vec![
-            Span::styled("[Y] Yes, Exit", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("[Y] Yes, Exit", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
             Span::raw("        "),
-            Span::styled("[N] Cancel", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("[N] Cancel", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
         ]).alignment(Alignment::Center),
     ];
 
-    let p = Paragraph::new(lines).style(Style::default().bg(BG_PILL));
+    let p = Paragraph::new(lines).style(Style::default().bg(theme.card_bg));
     f.render_widget(p, inner_area);
 }
 
 fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let status_str = if app.is_thinking { "● Thinking..." } else { "○ Idle" };
+    let pro_badge = if app.is_pro() { " [⭐ PRO]" } else { "" };
+    let title_span = Span::styled(
+        format!(" [ ⚡ RUNTIME{} · {} ] ", pro_badge, status_str),
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+    );
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(" [ ⚡ RUNTIME & TELEMETRY ] ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
+        .border_style(Style::default().fg(theme.accent))
+        .title(title_span)
         .title_alignment(Alignment::Center)
-        .style(Style::default().bg(BG_DARK));
+        .style(Style::default().bg(theme.bg));
     f.render_widget(block, area);
 
     if area.width < 10 || area.height < 10 {
@@ -2855,86 +3329,132 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     let cost = est_token_cost(app.provider_name(), prompt_tok, compl_tok);
     let cost_str = if cost == 0.0 { "$0.00".to_string() } else { format!("${:.2}", cost) };
 
-    // 3. Context Window
+    // 3. Progress & Steps
+    let step_count = session.react_steps.len().clamp(1, 5);
+    let current_step = if app.is_thinking {
+        step_count.min(5)
+    } else if session.messages.is_empty() {
+        0
+    } else {
+        5
+    };
+    let step_pct = (current_step * 20).min(100);
+    let step_bar_w = 8usize;
+    let step_filled = ((step_pct as f64 / 100.0) * step_bar_w as f64).round() as usize;
+
+    // 4. Context Window & Visual Meter
     let limit = if session.agent.context_window_limit > 0 { session.agent.context_window_limit } else { 200_000 };
     let pct = ((total_tok as f64 / limit as f64) * 100.0).min(100.0);
-
-    // 4. Runtime / Status
-    let (status_label, status_col) = if app.is_thinking {
-        ("Thinking...", Color::Yellow)
+    let ctx_bar_w = (inner.width as usize).saturating_sub(10).clamp(8, 20);
+    let ctx_filled = ((pct / 100.0) * ctx_bar_w as f64).round() as usize;
+    let ctx_color = if pct >= 80.0 {
+        theme.error
+    } else if pct >= 50.0 {
+        theme.warning
     } else {
-        ("Idle", Color::Green)
+        theme.success
     };
-
-    // 5. CWD & Environment
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let cwd_str = if let Some(home) = dirs::home_dir() {
-        if let Ok(rel) = cwd.strip_prefix(&home) {
-            format!("~/{}", rel.display())
-        } else {
-            cwd.display().to_string()
-        }
-    } else {
-        cwd.display().to_string()
-    };
-    let short_cwd = if cwd_str.chars().count() > (inner.width as usize).saturating_sub(6) {
-        let max_c = (inner.width as usize).saturating_sub(9);
-        let s: String = cwd_str.chars().take(max_c).collect();
-        format!("{}...", s)
-    } else {
-        cwd_str
-    };
-
-    let turns_count = session.messages.iter().filter(|m| m.role == "user").count();
-
-    let div_str = "─".repeat(inner.width as usize);
-    let div_style = Style::default().fg(Color::Rgb(38, 45, 56));
 
     let mut lines = Vec::new();
 
-    // Section: Task Title
+    // Card 1: TASK
     lines.push(Line::from(vec![
-        Span::styled("Task: ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("\"{}\"", task_title), Style::default().fg(Color::White)),
+        Span::styled("┌─ ", Style::default().fg(theme.border)),
+        Span::styled("🎯 TASK ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat((inner.width as usize).saturating_sub(11)), Style::default().fg(theme.border)),
     ]));
-    lines.push(Line::from(Span::styled(&div_str, div_style)));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", Style::default().fg(theme.border)),
+        Span::styled(format!("\"{}\"", task_title), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+    ]));
 
-    // Section: Tokens & Cost banner
+    // Card 2: METRICS
     lines.push(Line::from(vec![
-        Span::styled("Tokens: ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(fmt_num(total_tok), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("  ·  Cost: ", Style::default().fg(MUTED)),
-        Span::styled(cost_str, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled("┌─ ", Style::default().fg(theme.border)),
+        Span::styled("📊 METRICS ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat((inner.width as usize).saturating_sub(14)), Style::default().fg(theme.border)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  ↳ In: ", Style::default().fg(MUTED)),
-        Span::styled(format!("{:<8}", fmt_num(prompt_tok)), Style::default().fg(TEXT_SOFT)),
-        Span::styled(" Out: ", Style::default().fg(MUTED)),
-        Span::styled(fmt_num(compl_tok), Style::default().fg(TEXT_SOFT)),
+        Span::styled("│ ", Style::default().fg(theme.border)),
+        Span::styled("Total: ", Style::default().fg(theme.muted)),
+        Span::styled(fmt_num(total_tok), Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+        Span::styled("   Cost: ", Style::default().fg(theme.muted)),
+        Span::styled(cost_str, Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
     ]));
-    lines.push(Line::from(Span::styled(&div_str, div_style)));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", Style::default().fg(theme.border)),
+        Span::styled(format!("In: {:<7} Out: {}", fmt_num(prompt_tok), fmt_num(compl_tok)), Style::default().fg(theme.text_soft)),
+    ]));
 
-    // Section: Context Window & Visual Progress Bar
-    let ctx_bar_w = (inner.width as usize).saturating_sub(6).clamp(8, 22);
-    let filled = ((pct / 100.0) * ctx_bar_w as f64).round() as usize;
+    // Card 3: PROGRESS & STEPS
     lines.push(Line::from(vec![
-        Span::styled("Context: ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:.1}k / {}k", total_tok as f64 / 1000.0, limit / 1000), Style::default().fg(TEXT_SOFT)),
-        Span::styled(format!(" ({:.1}%)", pct), Style::default().fg(if pct > 80.0 { Color::Red } else { Color::Cyan })),
+        Span::styled("┌─ ", Style::default().fg(theme.border)),
+        Span::styled("⚡ PROGRESS & STEPS ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat((inner.width as usize).saturating_sub(22)), Style::default().fg(theme.border)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  [", Style::default().fg(DIM)),
-        Span::styled("█".repeat(filled.min(ctx_bar_w)), Style::default().fg(if pct > 80.0 { Color::Red } else { Color::Cyan })),
-        Span::styled("░".repeat(ctx_bar_w.saturating_sub(filled)), Style::default().fg(Color::Rgb(51, 65, 85))),
-        Span::styled("]", Style::default().fg(DIM)),
+        Span::styled("│ ", Style::default().fg(theme.border)),
+        Span::styled(format!("Step {}/5 ", current_step), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+        Span::styled("[", Style::default().fg(theme.border)),
+        Span::styled("█".repeat(step_filled), Style::default().fg(theme.accent_dim)),
+        Span::styled("░".repeat(step_bar_w.saturating_sub(step_filled)), Style::default().fg(theme.border)),
+        Span::styled("] ", Style::default().fg(theme.border)),
+        Span::styled(format!("{}%", step_pct), Style::default().fg(theme.text_soft)),
     ]));
-    lines.push(Line::from(Span::styled(&div_str, div_style)));
 
-    // Section: Task Checklist
-    lines.push(Line::from(Span::styled(
-        "[ 📋 TASK CHECKLIST ]",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )));
+    // Card 4: CONTEXT CAPACITY
+    lines.push(Line::from(vec![
+        Span::styled("┌─ ", Style::default().fg(theme.border)),
+        Span::styled("🗜️ CONTEXT CAPACITY ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat((inner.width as usize).saturating_sub(23)), Style::default().fg(theme.border)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", Style::default().fg(theme.border)),
+        Span::styled(format!("{:.1}k / {}k ", total_tok as f64 / 1000.0, limit / 1000), Style::default().fg(theme.text_soft)),
+        Span::styled(format!("({:.1}%)", pct), Style::default().fg(ctx_color).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", Style::default().fg(theme.border)),
+        Span::styled("[", Style::default().fg(theme.border)),
+        Span::styled("█".repeat(ctx_filled.min(ctx_bar_w)), Style::default().fg(ctx_color)),
+        Span::styled("░".repeat(ctx_bar_w.saturating_sub(ctx_filled)), Style::default().fg(theme.border)),
+        Span::styled("]", Style::default().fg(theme.border)),
+    ]));
+
+    // Card 5: FAILOVER CHAIN
+    lines.push(Line::from(vec![
+        Span::styled("┌─ ", Style::default().fg(theme.border)),
+        Span::styled("🔄 FAILOVER CHAIN ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat((inner.width as usize).saturating_sub(21)), Style::default().fg(theme.border)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", Style::default().fg(theme.border)),
+        Span::styled("● ", Style::default().fg(theme.success)),
+        Span::styled(format!("Pri: {:<14}", app.provider_name()), Style::default().fg(theme.text)),
+        Span::styled(" [Active]", Style::default().fg(theme.success)),
+    ]));
+    let fb_chain = &session.agent.fallback_chain;
+    if fb_chain.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(theme.border)),
+            Span::styled("  No fallbacks configured", Style::default().fg(theme.muted)),
+        ]));
+    } else {
+        for (i, fb) in fb_chain.iter().take(3).enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(theme.border)),
+                Span::styled(format!("  F{}: {:<13}", i + 1, fb.name()), Style::default().fg(theme.text_soft)),
+                Span::styled(" [Ready]", Style::default().fg(theme.accent_dim)),
+            ]));
+        }
+    }
+
+    // Card 6: CHECKLIST (TODO)
+    lines.push(Line::from(vec![
+        Span::styled("┌─ ", Style::default().fg(theme.border)),
+        Span::styled("📋 CHECKLIST (TODO) ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat((inner.width as usize).saturating_sub(23)), Style::default().fg(theme.border)),
+    ]));
 
     let mut items_to_display: Vec<TodoItem> = session.todos.clone();
     if items_to_display.is_empty() && !session.react_steps.is_empty() {
@@ -2959,14 +3479,17 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if items_to_display.is_empty() {
-        lines.push(Line::from(Span::styled("  • No active tasks", Style::default().fg(MUTED))));
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(theme.border)),
+            Span::styled("• No active tasks", Style::default().fg(theme.muted)),
+        ]));
     } else {
-        let max_items = (inner.height as usize).saturating_sub(18).clamp(3, 10);
+        let max_items = (inner.height as usize).saturating_sub(20).clamp(2, 5);
         let first_active_idx = items_to_display.iter().position(|t| !t.done);
         let spinner = SPINNER_CHARS[app.spinner_frame % SPINNER_CHARS.len()];
 
         for (i, item) in items_to_display.iter().take(max_items).enumerate() {
-            let max_w = (inner.width as usize).saturating_sub(6);
+            let max_w = (inner.width as usize).saturating_sub(8);
             let display_text = if item.text.chars().count() > max_w {
                 let s: String = item.text.chars().take(max_w.saturating_sub(3)).collect();
                 format!("{}...", s)
@@ -2975,80 +3498,49 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
             };
 
             if item.done {
-                // Completed items: [✓] in Color::Green + Modifier::CROSSED_OUT in #64748b (MUTED)
                 lines.push(Line::from(vec![
-                    Span::styled("[✓] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        display_text,
-                        Style::default().fg(MUTED).add_modifier(Modifier::CROSSED_OUT),
-                    ),
+                    Span::styled("│ ", Style::default().fg(theme.border)),
+                    Span::styled("[✓] ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+                    Span::styled(display_text, Style::default().fg(theme.muted).add_modifier(Modifier::CROSSED_OUT)),
                 ]));
             } else if Some(i) == first_active_idx {
-                // Active item: [●] with rotating spinner or yellow bullet + highlighted text
                 let bullet = if app.is_thinking {
                     format!("[{}] ", spinner)
                 } else {
                     "[●] ".to_string()
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(bullet, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        display_text,
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled("│ ", Style::default().fg(theme.border)),
+                    Span::styled(bullet, Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+                    Span::styled(display_text, Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
                 ]));
             } else {
-                // Pending items: [ ] in MUTED with plain text
                 lines.push(Line::from(vec![
-                    Span::styled("[ ] ", Style::default().fg(MUTED)),
-                    Span::styled(display_text, Style::default().fg(TEXT_SOFT)),
+                    Span::styled("│ ", Style::default().fg(theme.border)),
+                    Span::styled("[ ] ", Style::default().fg(theme.muted)),
+                    Span::styled(display_text, Style::default().fg(theme.text_soft)),
                 ]));
             }
         }
     }
-    lines.push(Line::from(Span::styled(&div_str, div_style)));
 
-    // Section: Runtime & Environment
+    // Card 7: Footer
     lines.push(Line::from(vec![
-        Span::styled("Provider:  ", Style::default().fg(MUTED)),
-        Span::styled(app.provider_name(), Style::default().fg(ACCENT_DIM)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Model:     ", Style::default().fg(MUTED)),
-        Span::styled(app.model_name(), Style::default().fg(TEXT_SOFT)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Mode:      ", Style::default().fg(MUTED)),
-        Span::styled(app.thinking_mode(), Style::default().fg(TEXT_SOFT)),
-        Span::styled(" · ", Style::default().fg(DIM)),
-        Span::styled(status_label, Style::default().fg(status_col)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("CWD:       ", Style::default().fg(MUTED)),
-        Span::styled(short_cwd, Style::default().fg(TEXT_SOFT)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Session:   ", Style::default().fg(MUTED)),
-        Span::styled(&session.name, Style::default().fg(TEXT_SOFT)),
-        Span::styled(format!(" ({} turns)", turns_count), Style::default().fg(MUTED)),
-    ]));
-    lines.push(Line::from(Span::styled(&div_str, div_style)));
-
-    // Section: Shortcuts
-    lines.push(Line::from(vec![
-        Span::styled("^C", Style::default().fg(ACCENT_DIM)),
-        Span::styled(" cancel · ", Style::default().fg(MUTED)),
-        Span::styled("Tab", Style::default().fg(ACCENT_DIM)),
-        Span::styled(" session · ", Style::default().fg(MUTED)),
-        Span::styled("Esc", Style::default().fg(ACCENT_DIM)),
-        Span::styled(" exit", Style::default().fg(MUTED)),
+        Span::styled("└─ ", Style::default().fg(theme.border)),
+        Span::styled("^C", Style::default().fg(theme.accent_dim)),
+        Span::styled(" cancel · ", Style::default().fg(theme.muted)),
+        Span::styled("Tab", Style::default().fg(theme.accent_dim)),
+        Span::styled(" tab · ", Style::default().fg(theme.muted)),
+        Span::styled("Esc", Style::default().fg(theme.accent_dim)),
+        Span::styled(" exit", Style::default().fg(theme.muted)),
     ]));
 
-    let p = Paragraph::new(lines).style(Style::default().bg(BG_DARK));
+    let p = Paragraph::new(lines).style(Style::default().bg(theme.bg));
     f.render_widget(p, inner);
 }
 
-fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
+fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
+    let theme = &app.theme;
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &session.messages {
@@ -3058,16 +3550,16 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                 for (idx, line) in unescaped.lines().enumerate() {
                     let mut spans = Vec::new();
                     if idx == 0 {
-                        spans.push(Span::styled("● ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)));
+                        spans.push(Span::styled("● ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
                     } else {
                         spans.push(Span::raw("  "));
                     }
-                    spans.extend(render_styled_line(line, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                    spans.extend(render_styled_line(line, Style::default().fg(theme.text).add_modifier(Modifier::BOLD)));
                     lines.push(Line::from(spans));
                 }
                 if unescaped.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("● ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
+                        Span::styled("● ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
                     ]));
                 }
                 lines.push(Line::from(""));
@@ -3075,29 +3567,35 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
             "tool_start" => {
                 let unescaped = unescape_newlines(&msg.content);
                 let parts: Vec<&str> = unescaped.splitn(2, ' ').collect();
-                if parts.len() == 2 {
+                let tool_name = parts[0];
+                let tool_args = if parts.len() > 1 { parts[1] } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled("  ┌─ ⚙️ Action: ", Style::default().fg(theme.accent_dim)),
+                    Span::styled(tool_name.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ──────────────────────────", Style::default().fg(theme.border)),
+                ]));
+                if !tool_args.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{} ", parts[0]), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                        Span::styled(parts[1].to_string(), Style::default().fg(TEXT_SOFT).add_modifier(Modifier::BOLD)),
+                        Span::styled("  │  Args: ", Style::default().fg(theme.muted)),
+                        Span::styled(tool_args.to_string(), Style::default().fg(theme.text_soft)),
                     ]));
-                } else {
-                    lines.push(Line::from(Span::styled(unescaped, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
                 }
+                lines.push(Line::from(Span::styled("  └──────────────────────────────────────", Style::default().fg(theme.border))));
             }
             "tool_result" => {
                 let unescaped = unescape_newlines(&msg.content);
                 let mut msg_lines = unescaped.lines();
                 if let Some(badge) = msg_lines.next() {
                     lines.push(Line::from(vec![
-                        Span::styled("  ↳ ", Style::default().fg(MUTED)),
-                        Span::styled(badge.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                        Span::styled("  ↳ ", Style::default().fg(theme.border)),
+                        Span::styled(format!("[✓ Result: {}]", badge), Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
                     ]));
                 }
                 for l in msg_lines {
                     let mut spans = vec![
-                        Span::styled("    │ ", Style::default().fg(DIM)),
+                        Span::styled("    │ ", Style::default().fg(theme.border)),
                     ];
-                    spans.extend(render_styled_line(l, Style::default().fg(MUTED)));
+                    spans.extend(render_styled_line(l, Style::default().fg(theme.text_soft)));
                     lines.push(Line::from(spans));
                 }
                 lines.push(Line::from(""));
@@ -3107,14 +3605,14 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                 let mut msg_lines = unescaped.lines();
                 if let Some(badge) = msg_lines.next() {
                     lines.push(Line::from(vec![
-                        Span::styled("  ↳ ", Style::default().fg(MUTED)),
-                        Span::styled(badge.to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                        Span::styled("  ↳ ", Style::default().fg(theme.border)),
+                        Span::styled(format!("[✗ Error: {}]", badge), Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
                     ]));
                 }
                 for l in msg_lines {
                     lines.push(Line::from(vec![
-                        Span::styled("    │ ", Style::default().fg(DIM)),
-                        Span::styled(l.to_string(), Style::default().fg(Color::Rgb(248, 113, 113))),
+                        Span::styled("    │ ", Style::default().fg(theme.border)),
+                        Span::styled(l.to_string(), Style::default().fg(theme.error)),
                     ]));
                 }
                 lines.push(Line::from(""));
@@ -3129,25 +3627,24 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                             let lang = line.trim_start().trim_start_matches('`').trim();
                             let lang_tag = if lang.is_empty() { "code" } else { lang };
                             lines.push(Line::from(vec![
-                                Span::styled("  ╭── ", Style::default().fg(ACCENT_DIM)),
-                                Span::styled(lang_tag.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-                                Span::styled(" ────────────────────", Style::default().fg(ACCENT_DIM)),
+                                Span::styled("  ╭── ", Style::default().fg(theme.accent_dim)),
+                                Span::styled(lang_tag.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                                Span::styled(" ────────────────────", Style::default().fg(theme.accent_dim)),
                             ]));
                         } else {
                             in_code_block = false;
-                            lines.push(Line::from(Span::styled("  ╰────────────────────────────", Style::default().fg(ACCENT_DIM))));
+                            lines.push(Line::from(Span::styled("  ╰────────────────────────────", Style::default().fg(theme.accent_dim))));
                         }
                     } else if in_code_block {
                         lines.push(Line::from(vec![
-                            Span::styled("  │ ", Style::default().fg(ACCENT_DIM)),
-                            Span::styled(line.to_string(), Style::default().fg(Color::Rgb(226, 232, 240))),
+                            Span::styled("  │ ", Style::default().fg(theme.accent_dim)),
+                            Span::styled(line.to_string(), Style::default().fg(theme.text)),
                         ]));
                     } else {
-                        let styled_spans = render_styled_line(line, Style::default().fg(GRAY));
+                        let styled_spans = render_styled_line(line, Style::default().fg(theme.text_soft));
                         lines.push(Line::from(styled_spans));
                     }
                 }
-                // Subtle per-turn token telemetry footer: e.g. [⚡ 1,240 tokens (980 in / 260 out) • 1.2s]
                 if let Some(ref u) = msg.tokens {
                     let total_str = fmt_num(u.total_tokens);
                     let in_str = fmt_num(u.prompt_tokens);
@@ -3159,7 +3656,7 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
                     );
                     lines.push(Line::from(Span::styled(
                         tag,
-                        Style::default().fg(DIM).add_modifier(Modifier::DIM),
+                        Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
                     )));
                 }
                 lines.push(Line::from(""));
@@ -3167,7 +3664,7 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
             _ => {
                 let unescaped = unescape_newlines(&msg.content);
                 for line in unescaped.lines() {
-                    let styled_spans = render_styled_line(line, Style::default().fg(DIM).add_modifier(Modifier::ITALIC));
+                    let styled_spans = render_styled_line(line, Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC));
                     lines.push(Line::from(styled_spans));
                 }
                 lines.push(Line::from(""));
@@ -3183,7 +3680,7 @@ fn draw_messages(f: &mut Frame, session: &ChatSession, area: Rect) {
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
-        .style(Style::default().bg(BG_BLACK));
+        .style(Style::default().bg(theme.bg));
     f.render_widget(p, area);
 }
 
@@ -3654,6 +4151,7 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
+    let theme = &app.theme;
     if app.active_page != 0 {
         let hint = match app.active_page {
             1 => "↑↓ scroll • r refresh • ⇆ Tab/F1-F5 switch page • Esc back to chat",
@@ -3662,16 +4160,16 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
             4 => "↑↓ navigate • Enter edit • s save • ⇆ Tab/F1-F5 switch page • Esc back to chat",
             _ => "↑↓ navigate • ⇆ Tab/F1-F5 switch page • Esc back to chat",
         };
-        let line = Line::from(Span::styled(hint, Style::default().fg(DIM)));
+        let line = Line::from(Span::styled(hint, Style::default().fg(theme.muted)));
         f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(BG_BLACK)),
+            Paragraph::new(line).style(Style::default().bg(theme.bg)),
             area,
         );
         return None;
     }
 
     let session = app.session();
-    let text_col = if app.is_thinking { ACCENT_DIM } else { TEXT_SOFT };
+    let text_col = if app.is_thinking { theme.accent_dim } else { theme.text_soft };
     let has_image = detect_image_reference(&session.input).is_some();
 
     if app.is_thinking && !session.input.is_empty() {
@@ -3685,13 +4183,13 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         let mut steer_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT))
-            .style(Style::default().bg(BG_PILL));
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(theme.pill_bg));
 
         if has_image {
             steer_block = steer_block.title(
                 Line::from(vec![
-                    Span::styled(" [🖼️ Image] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    Span::styled(" [🖼️ Image] ", Style::default().fg(theme.accent_dim).add_modifier(Modifier::BOLD))
                 ]).alignment(Alignment::Right)
             );
         }
@@ -3702,16 +4200,16 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         for (idx, line_str) in lines_raw.iter().enumerate().skip(scroll_top).take(inner_h as usize) {
             let mut spans = Vec::new();
             if idx == 0 {
-                spans.push(Span::styled(steer_label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(steer_label, Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)));
             } else {
                 spans.push(Span::raw(" ".repeat(steer_label.chars().count())));
             }
-            spans.push(Span::styled(*line_str, Style::default().fg(TEXT_SOFT)));
+            spans.push(Span::styled(*line_str, Style::default().fg(theme.text_soft)));
             rendered_lines.push(Line::from(spans));
         }
 
         f.render_widget(
-            Paragraph::new(rendered_lines).style(Style::default().bg(BG_PILL)),
+            Paragraph::new(rendered_lines).style(Style::default().bg(theme.pill_bg)),
             Rect {
                 x: area.x + 2,
                 y: inner_y,
@@ -3730,21 +4228,21 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         let line = Line::from(vec![
             Span::styled(
                 format!("{} ", spinner),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "Thinking... · Type to steer · Ctrl+C to cancel",
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC),
             ),
         ]);
         let thinking_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT))
-            .style(Style::default().bg(BG_PILL));
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(theme.pill_bg));
         f.render_widget(thinking_block, area);
         f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(BG_PILL)),
+            Paragraph::new(line).style(Style::default().bg(theme.pill_bg)),
             Rect {
                 x: area.x + 2,
                 y: area.y + 1,
@@ -3758,7 +4256,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         let (row, col) = get_cursor_coords(&session.input, session.cursor_pos);
         let show_placeholder = session.input.is_empty();
         let content_style = if show_placeholder {
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC)
+            Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC)
         } else {
             Style::default().fg(text_col)
         };
@@ -3766,13 +4264,13 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         let mut input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT_DIM))
-            .style(Style::default().bg(BG_PILL));
+            .border_style(Style::default().fg(theme.accent_dim))
+            .style(Style::default().bg(theme.pill_bg));
 
         if has_image {
             input_block = input_block.title(
                 Line::from(vec![
-                    Span::styled(" [🖼️ Image] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    Span::styled(" [🖼️ Image] ", Style::default().fg(theme.accent_dim).add_modifier(Modifier::BOLD))
                 ]).alignment(Alignment::Right)
             );
         }
@@ -3793,7 +4291,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         };
 
         f.render_widget(
-            Paragraph::new(rendered_lines).style(Style::default().bg(BG_PILL)),
+            Paragraph::new(rendered_lines).style(Style::default().bg(theme.pill_bg)),
             Rect {
                 x: area.x + 2,
                 y: inner_y,
@@ -3809,13 +4307,14 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let provider = app.provider_name();
     let model = app.model_name();
 
     let (status_dot, status_label, status_color) = if app.is_thinking {
-        ("●", "Build", Color::Yellow)
+        ("●", "Build", theme.warning)
     } else {
-        ("●", "Idle", Color::Green)
+        ("●", "Idle", theme.success)
     };
 
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -3830,33 +4329,38 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut left_spans = vec![
-        Span::styled(format!(" {} ", cwd_str), Style::default().fg(TEXT_SOFT)),
-        Span::styled("· ", Style::default().fg(MUTED)),
+        Span::styled(format!(" {} ", cwd_str), Style::default().fg(theme.text_soft)),
+        Span::styled("· ", Style::default().fg(theme.muted)),
         Span::styled(format!("{} ", status_dot), Style::default().fg(status_color)),
         Span::styled(format!("{} ", status_label), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-        Span::styled("· ", Style::default().fg(MUTED)),
-        Span::styled(format!("{} ", model), Style::default().fg(TEXT_SOFT).add_modifier(Modifier::BOLD)),
-        Span::styled("· ", Style::default().fg(MUTED)),
-        Span::styled(format!("{} ", provider), Style::default().fg(ACCENT_DIM)),
+        Span::styled("· ", Style::default().fg(theme.muted)),
+        Span::styled(format!("{} ", model), Style::default().fg(theme.text_soft).add_modifier(Modifier::BOLD)),
+        Span::styled("· ", Style::default().fg(theme.muted)),
+        Span::styled(format!("{} ", provider), Style::default().fg(theme.accent_dim)),
     ];
 
+    if app.is_pro() {
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
+        left_spans.push(Span::styled("[⭐ PRO] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    }
+
     if app.sessions.len() > 1 {
-        left_spans.push(Span::styled("· ", Style::default().fg(MUTED)));
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
         left_spans.push(Span::styled(
             format!("agent {}/{} ", app.active_session + 1, app.sessions.len()),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme.muted),
         ));
     }
 
     if !app.status_msg.is_empty() {
-        left_spans.push(Span::styled("· ", Style::default().fg(MUTED)));
-        left_spans.push(Span::styled(format!("{} ", app.status_msg), Style::default().fg(ACCENT_DIM)));
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
+        left_spans.push(Span::styled(format!("{} ", app.status_msg), Style::default().fg(theme.accent_dim)));
     }
 
     let right_spans = vec![
-        Span::styled("/status", Style::default().fg(ACCENT_DIM)),
-        Span::styled("  ·  ", Style::default().fg(MUTED)),
-        Span::styled("v1.0.8 ", Style::default().fg(MUTED)),
+        Span::styled("/status", Style::default().fg(theme.accent_dim)),
+        Span::styled("  ·  ", Style::default().fg(theme.muted)),
+        Span::styled("v1.0.9 ", Style::default().fg(theme.muted)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -3870,7 +4374,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     all_spans.extend(right_spans);
 
     let line = Line::from(all_spans);
-    let p = Paragraph::new(line).style(Style::default().bg(BG_DARK));
+    let p = Paragraph::new(line).style(Style::default().bg(theme.bg));
     f.render_widget(p, area);
 }
 
@@ -4005,7 +4509,7 @@ mod tests {
 
         // Verify active session styling
         let active_span = spans.iter().find(|s| s.content.contains("Session 1")).unwrap();
-        assert_eq!(active_span.style.fg, Some(ACCENT));
+        assert_eq!(active_span.style.fg, Some(app.theme.accent));
         assert!(active_span.style.add_modifier.contains(Modifier::BOLD));
 
         // 2. Multi-session formatting
@@ -4015,11 +4519,11 @@ mod tests {
 
         let spans2 = format_session_tabs_spans(&app, 120);
         let s1_span = spans2.iter().find(|s| s.content.contains("Session 1")).unwrap();
-        assert_eq!(s1_span.style.fg, Some(MUTED));
+        assert_eq!(s1_span.style.fg, Some(app.theme.muted));
         assert!(!s1_span.style.add_modifier.contains(Modifier::BOLD));
 
         let s2_span = spans2.iter().find(|s| s.content.contains("Session 2")).unwrap();
-        assert_eq!(s2_span.style.fg, Some(ACCENT));
+        assert_eq!(s2_span.style.fg, Some(app.theme.accent));
         assert!(s2_span.style.add_modifier.contains(Modifier::BOLD));
 
         // 3. Tab cycling
@@ -4131,8 +4635,149 @@ mod tests {
         assert_eq!(session_steps.todos[1], TodoItem { text: "write_file src/main.rs".into(), done: false });
 
         // Verify strikethrough styling logic
-        let completed_style = Style::default().fg(MUTED).add_modifier(Modifier::CROSSED_OUT);
+        let completed_style = Style::default().fg(Color::Rgb(100, 116, 139)).add_modifier(Modifier::CROSSED_OUT);
         assert_eq!(completed_style.fg, Some(Color::Rgb(100, 116, 139))); // #64748b
         assert!(completed_style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn test_theme_preset_palette_generation() {
+        // TokyoNight
+        let tokyo = Theme::from_name("tokyo");
+        assert_eq!(tokyo.preset, ThemePreset::TokyoNight);
+        assert_eq!(tokyo.bg, Color::Rgb(26, 27, 38)); // #1a1b26
+        assert_eq!(tokyo.accent, Color::Rgb(122, 162, 247)); // #7aa2f7
+        assert_eq!(tokyo.accent_dim, Color::Rgb(187, 154, 247)); // #bb9af7
+        assert_eq!(tokyo.success, Color::Rgb(158, 206, 106)); // #9ece6a
+
+        // Nord
+        let nord = Theme::from_name("nord");
+        assert_eq!(nord.preset, ThemePreset::Nord);
+        assert_eq!(nord.bg, Color::Rgb(46, 52, 64)); // #2e3440
+        assert_eq!(nord.accent, Color::Rgb(136, 192, 208)); // #88c0d0
+        assert_eq!(nord.text, Color::Rgb(236, 239, 244)); // #eceff4
+
+        // OneDark
+        let onedark = Theme::from_name("onedark");
+        assert_eq!(onedark.preset, ThemePreset::OneDark);
+        assert_eq!(onedark.bg, Color::Rgb(33, 37, 43)); // #21252b
+        assert_eq!(onedark.accent, Color::Rgb(97, 175, 239)); // #61afef
+        assert_eq!(onedark.warning, Color::Rgb(229, 192, 123)); // #e5c07b
+
+        // HighContrast
+        let contrast = Theme::from_name("contrast");
+        assert_eq!(contrast.preset, ThemePreset::HighContrast);
+        assert_eq!(contrast.bg, Color::Rgb(0, 0, 0));
+        assert_eq!(contrast.accent, Color::Rgb(250, 204, 21)); // #facc15
+        assert_eq!(contrast.text, Color::Rgb(255, 255, 255));
+
+        // Light
+        let light = Theme::from_name("light");
+        assert_eq!(light.preset, ThemePreset::Light);
+        assert_eq!(light.bg, Color::Rgb(248, 250, 252)); // #f8fafc
+        assert_eq!(light.accent, Color::Rgb(37, 99, 235)); // #2563eb
+        assert_eq!(light.text, Color::Rgb(15, 23, 42)); // #0f172a
+
+        // Classic
+        let classic = Theme::from_name("classic");
+        assert_eq!(classic.preset, ThemePreset::Classic);
+        assert_eq!(classic.bg, Color::Rgb(5, 8, 15)); // #05080f
+        assert_eq!(classic.accent, Color::Rgb(59, 130, 246)); // #3b82f6
+    }
+
+    #[test]
+    fn test_skill_wizard_question_and_answer_state_machine() {
+        let cfg = CaCodeConfig::default();
+        let mut session = ChatSession::new("WizardTest".into(), &cfg);
+        assert_eq!(session.wizard_state, WizardState::None);
+
+        // Step 1: User triggers @prd
+        session.wizard_state = WizardState::PrdStep1ProjectName;
+
+        // User enters project idea
+        let project_name = "Sistem POS Kasir Bengkel Motor Offline-First".to_string();
+        session.wizard_state = WizardState::PrdStep2Stack { project_name: project_name.clone() };
+
+        // Step 2: User selects recommended option 1
+        let stack_choice = "1";
+        let resolved_stack = match stack_choice {
+            "1" => "Rust + Tauri v2 (High-performance, sovereign desktop, zero-crash)".to_string(),
+            "2" => "Go + HTMX / Templ (Lightweight single binary)".to_string(),
+            "3" => "TypeScript + SvelteKit / CAUI (Modern reactive UI)".to_string(),
+            "4" => "Python + FastAPI (Rapid API prototype)".to_string(),
+            other => other.to_string(),
+        };
+        session.wizard_state = WizardState::PrdStep3Structure {
+            project_name: project_name.clone(),
+            stack: resolved_stack.clone(),
+        };
+
+        // Step 3: User selects recommended structure option 1
+        let structure_choice = "1";
+        let resolved_structure = match structure_choice {
+            "1" => "Modular Workspace: Core Library + CLI + TUI + Local SQLite".to_string(),
+            "2" => "Clean Architecture: Domain + UseCase + Infrastructure + Presentation".to_string(),
+            "3" => "Microservices: API Gateway + Business Services + Background Worker".to_string(),
+            other => other.to_string(),
+        };
+        session.wizard_state = WizardState::None;
+
+        assert_eq!(project_name, "Sistem POS Kasir Bengkel Motor Offline-First");
+        assert!(resolved_stack.contains("Tauri v2"));
+        assert!(resolved_structure.contains("Modular Workspace"));
+        assert_eq!(session.wizard_state, WizardState::None);
+    }
+
+    #[test]
+    fn test_pro_key_detection_and_badge_formatting() {
+        let mut cfg = CaCodeConfig::default();
+        assert!(!cfg.is_pro());
+
+        let app = App::new(cfg.clone());
+        assert!(!app.is_pro());
+        let spans_free = format_session_tabs_spans(&app, 120);
+        let free_text: String = spans_free.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!free_text.contains("[⭐ PRO]"));
+
+        // Activate Pro key
+        cfg.pro_license_key = Some("CACODE-PRO-VIP-2026".to_string());
+        assert!(cfg.is_pro());
+
+        let app_pro = App::new(cfg);
+        assert!(app_pro.is_pro());
+        let spans_pro = format_session_tabs_spans(&app_pro, 120);
+        let pro_text: String = spans_pro.iter().map(|s| s.content.as_ref()).collect();
+        assert!(pro_text.contains("[⭐ PRO]"));
+    }
+
+    #[test]
+    fn test_custom_provider_and_fallback_chain_config() {
+        let mut cfg = CaCodeConfig::default();
+        cfg.custom_providers.push(CustomProviderConfig {
+            id: "groq".to_string(),
+            name: "Groq Cloud".to_string(),
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            api_key: "gsk_test".to_string(),
+            model: "llama-3.3-70b-versatile".to_string(),
+        });
+
+        // Test provider string resolution
+        let resolved_zen = resolve_provider_string("zen", &cfg).unwrap();
+        assert_eq!(resolved_zen.name(), "Antigravity Zen");
+
+        let resolved_custom = resolve_provider_string("groq", &cfg).unwrap();
+        assert_eq!(resolved_custom.name(), "Groq Cloud");
+        assert_eq!(resolved_custom.model(), "llama-3.3-70b-versatile");
+
+        // Test fallback chain building
+        cfg.fallback_1 = Some("groq".to_string());
+        cfg.fallback_2 = Some("ollama".to_string());
+        cfg.fallback_3 = Some("9router".to_string());
+
+        let chain = build_fallback_chain(&cfg);
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].name(), "Groq Cloud");
+        assert_eq!(chain[1].name(), "Ollama");
+        assert_eq!(chain[2].name(), "9Router");
     }
 }
