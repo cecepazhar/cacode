@@ -15,6 +15,7 @@ use ratatui::{
 };
 use rusqlite::Connection;
 use std::fs;
+use std::io;
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
