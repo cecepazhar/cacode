@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 use regex::Regex;
 
-pub const CA_VERSION: &str = "1.0.9";
+pub const CA_VERSION: &str = "1.0.13";
 
 pub type AgentEvents = mpsc::UnboundedSender<AgentEvent>;
 

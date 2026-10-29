@@ -15,9 +15,9 @@ use ratatui::{
 };
 use rusqlite::Connection;
 use std::fs;
-use std::io;
-use std::path::PathBuf;
 use std::env;
+use std::path::PathBuf;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -281,6 +281,23 @@ const WELCOME_LINES: &[&str] = &[
 
 const PAGE_NAMES: &[&str] = &["Chat", "Monitor", "Report", "Skills", "Settings"];
 const MAX_SESSIONS: usize = 9;
+
+/// Generate a concise default name for a new session: "Term N".
+pub fn default_session_name(idx: usize) -> String {
+    format!("Term {}", idx + 1)
+}
+
+/// Truncate a session name to <=12 chars, preserving numeric suffix.
+pub fn short_name(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= 12 {
+        name.to_string()
+    } else {
+        let truncated: String = chars.iter().take(12).collect();
+        // Preserve any trailing digits so "Term 10" -> "Term 10" stays readable
+        truncated
+    }
+}
 
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -828,6 +845,9 @@ struct App {
     monitor_scroll: u16,
     report_scroll: u16,
     spinner_frame: usize,
+    // Host page transition state
+    pub host_step: usize,
+    pub host_last_tick: Instant,
     // Autocomplete state
     autocomplete_idx: usize,
     // Modal picker state
@@ -845,7 +865,7 @@ struct App {
 impl App {
     fn new(config: CaCodeConfig) -> Self {
         let settings = Self::build_settings(&config);
-        let session = ChatSession::new("Session 1".into(), &config);
+        let session = ChatSession::new(default_session_name(0), &config);
         let theme = Theme::from_name(&config.theme);
         let mut app = Self {
             active_page: 0,
@@ -865,6 +885,8 @@ impl App {
             monitor_scroll: 0,
             report_scroll: 0,
             spinner_frame: 0,
+            host_step: 0,
+            host_last_tick: Instant::now(),
             autocomplete_idx: 0,
             modal_picker: ModalPicker::Off,
             modal_idx: 0,
@@ -1236,7 +1258,7 @@ impl App {
         }
         self.session_mut().show_welcome = false;
         let n = self.sessions.len() + 1;
-        let mut session = ChatSession::new(format!("Session {}", n), &self.config);
+        let mut session = ChatSession::new(default_session_name(n), &self.config);
         session.show_welcome = false;
         self.sessions.push(session);
         self.active_session = self.sessions.len() - 1;
@@ -1279,6 +1301,10 @@ impl App {
         }
         if self.active_page == 3 {
             self.refresh_skills();
+        }
+        if self.active_page == 0 {
+            self.host_step = 0;
+            self.host_last_tick = Instant::now();
         }
     }
 
@@ -3046,14 +3072,15 @@ fn format_session_tabs_spans<'a>(app: &'a App, width: u16) -> Vec<Span<'a>> {
         left_spans.push(Span::styled("[⭐ PRO] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     }
     for (i, session) in app.sessions.iter().enumerate() {
+        let label = short_name(&session.name);
         if i == app.active_session {
             left_spans.push(Span::styled(
-                format!("● {} ", session.name),
+                format!("● {} ", label),
                 Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
             ));
         } else {
             left_spans.push(Span::styled(
-                format!("{} ", session.name),
+                format!("{} ", label),
                 Style::default().fg(theme.muted),
             ));
         }
