@@ -108,44 +108,6 @@ impl CaCodeConfig {
     pub fn validate_license_key(key: &str) -> bool {
         parse_ca_license_key(key).is_some()
     }
-}
-
-/// Parse and validate a CA license key.
-/// Returns `Some((product, tier))` on success, `None` on failure.
-fn parse_ca_license_key(key: &str) -> Option<(String, String)> {
-    let upper = key.trim().to_uppercase();
-    let parts: Vec<&str> = upper.split('-').collect();
-    if parts.len() != 3 { return None; }
-    let prefix_tier = parts[0];
-    let rand_part = parts[1];
-    let ck_str = parts[2];
-    if prefix_tier.len() != 6 { return None; }
-    if rand_part.len() != 6 { return None; }
-    if ck_str.len() != 1 { return None; }
-    if !prefix_tier.starts_with("CA") { return None; }
-    let product = &prefix_tier[2..4];
-    let tier = &prefix_tier[4..6];
-    let allowed = ["TM","MK","CD","SH","TB","PS","UI","AA","CF","CB"];
-    if !allowed.contains(&product) { return None; }
-    if tier.parse::<u8>().is_err() { return None; }
-    if !rand_part.chars().all(|c| c.is_ascii_alphanumeric()) { return None; }
-    // Compute checksum (mod‑10)
-    let mut sum: u32 = 0;
-    for ch in upper[..upper.len()-2].chars() {
-        let val = if ch.is_ascii_digit() {
-            (ch as u8 - b'0') as u32
-        } else if ch.is_ascii_uppercase() {
-            (ch as u8 - b'A' + 10) as u32
-        } else {
-            0
-        };
-        sum += val;
-    }
-    let expected_ck = ((10 - (sum % 10)) % 10) as u8;
-    let provided_ck = ck_str.parse::<u8>().ok()?;
-    if expected_ck != provided_ck { return None; }
-    Some((product.to_string(), tier.to_string()))
-}
 
     pub fn config_path() -> Result<PathBuf> {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home directory not found"))?;

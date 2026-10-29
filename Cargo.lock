@@ -207,7 +207,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cacode-app"
-version = "1.0.9"
+version = "1.0.13"
 dependencies = [
  "anyhow",
  "cacode-core",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "cacode-core"
-version = "1.0.9"
+version = "1.0.13"
 dependencies = [
  "anyhow",
  "axum",
