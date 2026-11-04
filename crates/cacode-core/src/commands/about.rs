@@ -14,11 +14,16 @@ pub fn run() -> Result<()> {
     println!("  BYOK execution with strict zero-telemetry.");
     println!();
     println!("Key Features:");
-    println!("  • ReAct Agent Loop with deterministic local tool execution.");
-    println!("  • Local token usage monitor & model cost estimator.");
-    println!("  • Multi-Tab workspace management (Pro).");
-    println!("  • Multi-Level Thinking cognitive engine (Ultra).");
-    println!("  • Turbo concurrency up to 49 sub-agents (Pro).");
+    println!("  • ReAct agent with native tool calling (OpenAI-compatible + Anthropic), streaming,");
+    println!("    retry/backoff, fallback routing and a per-provider circuit breaker.");
+    println!("  • Sandboxed tools: read/write/edit (stale-file check, diff approval, /undo),");
+    println!("    bash (timeouts, background jobs, process-group kill), grep/glob/find_symbol.");
+    println!("  • Permission modes: ask · auto-edit · yolo · read-only.");
+    println!("  • Auto-compaction of long conversations; repo context + symbol map.");
+    println!("  • Local token usage monitor/proxy (:8000) & model-aware cost reports.");
+    println!("  • Multi-Tab sessions running independently (Pro).");
+    println!("  • Parallel subagents via the `task` tool: 5 concurrent (Free), 49 (Pro).");
+    println!("  • Thinking modes Fast / Analytical / Deep (prompt-level guidance).");
     println!();
     Ok(())
 }

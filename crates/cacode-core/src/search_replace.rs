@@ -329,180 +329,171 @@ fn replace_line_range(
     }
 }
 
-/// Applies a single search/replace block to `content`.
+/// Fuzzy fallback acceptance threshold (average per-line similarity).
+pub const FUZZY_THRESHOLD: f64 = 0.90;
+/// Minimum gap between the best and the second-best fuzzy candidate.
+pub const FUZZY_MIN_MARGIN: f64 = 0.10;
+
+/// Applies a single search/replace block to `content` (first and only match).
 ///
-/// Executes matching strategies in order:
+/// Safety rules (a wrong-location patch is worse than a failed patch):
+/// * An empty search block is only accepted when `content` is empty (new file).
+/// * Every strategy must find **exactly one** candidate; multiple candidates
+///   return an `Ambiguous` error asking the model for more context.
+/// * Fuzzy fallback needs ≥ 90 % average similarity **and** a ≥ 10 point lead
+///   over the runner-up window.
+///
+/// Strategies, in order:
 /// 1. Exact string match
 /// 2. Whitespace-flexible match (CRLF/LF normalization and trailing whitespace trimming)
 /// 3. Indentation-tolerant matching (uniform shift)
 /// 4. Fallback line-window fuzzy matching
 pub fn apply_search_replace(content: &str, search: &str, replace: &str) -> Result<String> {
+    apply_search_replace_opts(content, search, replace, false)
+}
+
+/// Like [`apply_search_replace`]; with `replace_all = true` every exact
+/// occurrence is replaced (only the exact / CRLF-normalized strategies honour it).
+pub fn apply_search_replace_opts(content: &str, search: &str, replace: &str, replace_all: bool) -> Result<String> {
     if search.is_empty() {
         if content.is_empty() {
             return Ok(replace.to_string());
         }
-        return Ok(format!("{}{}", replace, content));
+        return Err(anyhow!(
+            "Empty search block is only allowed when creating a new (empty) file. \
+             Provide the exact existing lines you want to replace."
+        ));
     }
 
     // 1. Exact string match
-    if content.contains(search) {
-        return Ok(content.replacen(search, replace, 1));
+    let exact = content.matches(search).count();
+    if exact == 1 || (exact > 1 && replace_all) {
+        return Ok(if replace_all { content.replace(search, replace) } else { content.replacen(search, replace, 1) });
+    }
+    if exact > 1 {
+        return Err(ambiguous(exact, search));
     }
 
     let is_crlf = content.contains("\r\n");
     let norm_content = content.replace("\r\n", "\n");
     let norm_search = search.replace("\r\n", "\n");
     let norm_replace = replace.replace("\r\n", "\n");
+    let restore = |s: String| if is_crlf { s.replace('\n', "\r\n") } else { s };
 
     // 2a. CRLF-normalized exact match
-    if norm_content.contains(&norm_search) {
-        let res = norm_content.replacen(&norm_search, &norm_replace, 1);
-        return Ok(if is_crlf {
-            res.replace('\n', "\r\n")
+    let norm_count = norm_content.matches(&norm_search).count();
+    if norm_count == 1 || (norm_count > 1 && replace_all) {
+        let res = if replace_all {
+            norm_content.replace(&norm_search, &norm_replace)
         } else {
-            res
-        });
+            norm_content.replacen(&norm_search, &norm_replace, 1)
+        };
+        return Ok(restore(res));
+    }
+    if norm_count > 1 {
+        return Err(ambiguous(norm_count, search));
     }
 
     let c_chunks: Vec<&str> = norm_content.split_inclusive('\n').collect();
     let c_lines: Vec<&str> = norm_content.lines().collect();
     let s_lines: Vec<&str> = norm_search.lines().collect();
 
-    if s_lines.is_empty() {
-        return Err(anyhow!("Search content has no lines"));
+    if s_lines.is_empty() || s_lines.iter().all(|l| l.trim().is_empty()) {
+        return Err(anyhow!("Search content has no non-blank lines"));
     }
 
     let m = s_lines.len();
-
-    // 2b. Line-based match with trailing whitespace trimmed per line
-    if c_lines.len() >= m {
-        for i in 0..=(c_lines.len() - m) {
-            let mut matches = true;
-            for k in 0..m {
-                if c_lines[i + k].trim_end() != s_lines[k].trim_end() {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
-                return Ok(replace_line_range(
-                    &norm_content,
-                    &c_chunks,
-                    i,
-                    m,
-                    &norm_replace,
-                    0,
-                    is_crlf,
-                ));
-            }
-        }
-    }
-
-    // 3. Indentation-tolerant matching (uniform relative indentation shift)
-    if c_lines.len() >= m {
-        for i in 0..=(c_lines.len() - m) {
-            let mut trimmed_match = true;
-            for k in 0..m {
-                if c_lines[i + k].trim() != s_lines[k].trim() {
-                    trimmed_match = false;
-                    break;
-                }
-            }
-            if trimmed_match {
-                if let Some(first_non_empty) = s_lines.iter().position(|l| !l.trim().is_empty()) {
-                    let s_indent = s_lines[first_non_empty].len()
-                        - s_lines[first_non_empty].trim_start().len();
-                    let c_indent = c_lines[i + first_non_empty].len()
-                        - c_lines[i + first_non_empty].trim_start().len();
-                    let shift = c_indent as isize - s_indent as isize;
-
-                    let mut uniform = true;
-                    for k in 0..m {
-                        if s_lines[k].trim().is_empty() {
-                            continue;
-                        }
-                        let s_k_indent = s_lines[k].len() - s_lines[k].trim_start().len();
-                        let c_k_indent = c_lines[i + k].len() - c_lines[i + k].trim_start().len();
-                        if c_k_indent as isize - s_k_indent as isize != shift {
-                            uniform = false;
-                            break;
-                        }
-                    }
-
-                    if uniform {
-                        return Ok(replace_line_range(
-                            &norm_content,
-                            &c_chunks,
-                            i,
-                            m,
-                            &norm_replace,
-                            shift,
-                            is_crlf,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Fallback line-window fuzzy match
     if c_lines.len() < m {
         return Err(anyhow!(
-            "Search block ({} lines) is longer than target content ({} lines)",
+            "Search block not found in content: search block ({} lines) is longer than target content ({} lines)",
             m,
             c_lines.len()
         ));
     }
+    let windows = c_lines.len() - m + 1;
 
-    let mut best_index = None;
-    let mut best_score = 0.0;
-    for i in 0..=(c_lines.len() - m) {
-        let mut total_score = 0.0;
-        for k in 0..m {
-            let s = s_lines[k].trim();
-            let c = c_lines[i + k].trim();
-            if s == c {
-                total_score += 1.0;
-            } else {
-                total_score += str_similarity(s, c);
-            }
-        }
-        let score = total_score / m as f64;
-        if score > best_score {
-            best_score = score;
-            best_index = Some(i);
-        }
+    // 2b. Line-based match with trailing whitespace trimmed per line
+    let trailing: Vec<usize> = (0..windows)
+        .filter(|&i| (0..m).all(|k| c_lines[i + k].trim_end() == s_lines[k].trim_end()))
+        .collect();
+    match trailing.len() {
+        1 => return Ok(replace_line_range(&norm_content, &c_chunks, trailing[0], m, &norm_replace, 0, is_crlf)),
+        n if n > 1 => return Err(ambiguous(n, search)),
+        _ => {}
     }
 
-    if best_score >= 0.70 {
-        if let Some(best_i) = best_index {
-            let shift = if let Some(first_idx) = s_lines.iter().position(|l| !l.trim().is_empty()) {
-                let s_ind = s_lines[first_idx].len() - s_lines[first_idx].trim_start().len();
-                let c_ind = c_lines[best_i + first_idx].len()
-                    - c_lines[best_i + first_idx].trim_start().len();
-                c_ind as isize - s_ind as isize
-            } else {
-                0
-            };
-
-            return Ok(replace_line_range(
-                &norm_content,
-                &c_chunks,
-                best_i,
-                m,
-                &norm_replace,
-                shift,
-                is_crlf,
-            ));
+    // 3. Indentation-tolerant matching (uniform relative indentation shift)
+    let first_non_empty = s_lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut indent_hits: Vec<(usize, isize)> = Vec::new();
+    for i in 0..windows {
+        if !(0..m).all(|k| c_lines[i + k].trim() == s_lines[k].trim()) {
+            continue;
         }
+        let shift = indent(c_lines[i + first_non_empty]) as isize - indent(s_lines[first_non_empty]) as isize;
+        let uniform = (0..m)
+            .filter(|&k| !s_lines[k].trim().is_empty())
+            .all(|k| indent(c_lines[i + k]) as isize - indent(s_lines[k]) as isize == shift);
+        if uniform {
+            indent_hits.push((i, shift));
+        }
+    }
+    match indent_hits.len() {
+        1 => {
+            let (i, shift) = indent_hits[0];
+            return Ok(replace_line_range(&norm_content, &c_chunks, i, m, &norm_replace, shift, is_crlf));
+        }
+        n if n > 1 => return Err(ambiguous(n, search)),
+        _ => {}
+    }
+
+    // 4. Fallback line-window fuzzy match (must be confident AND unambiguous)
+    let mut scores: Vec<(usize, f64)> = (0..windows)
+        .map(|i| {
+            let total: f64 = (0..m)
+                .map(|k| {
+                    let (s, c) = (s_lines[k].trim(), c_lines[i + k].trim());
+                    if s == c { 1.0 } else { str_similarity(s, c) }
+                })
+                .sum();
+            (i, total / m as f64)
+        })
+        .collect();
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (best_i, best_score) = scores[0];
+    let runner_up = scores.get(1).map(|s| s.1).unwrap_or(0.0);
+
+    if best_score >= FUZZY_THRESHOLD && best_score - runner_up >= FUZZY_MIN_MARGIN {
+        let shift = indent(c_lines[best_i + first_non_empty]) as isize - indent(s_lines[first_non_empty]) as isize;
+        return Ok(replace_line_range(&norm_content, &c_chunks, best_i, m, &norm_replace, shift, is_crlf));
     }
 
     let snippet: String = search.lines().take(4).collect::<Vec<_>>().join("\n");
+    let reason = if best_score >= FUZZY_THRESHOLD {
+        format!(
+            "ambiguous fuzzy match: best {:.1}% vs runner-up {:.1}% (needs a {:.0}-point lead)",
+            best_score * 100.0,
+            runner_up * 100.0,
+            FUZZY_MIN_MARGIN * 100.0
+        )
+    } else {
+        format!("best fuzzy match: {:.1}%, threshold: {:.0}%", best_score * 100.0, FUZZY_THRESHOLD * 100.0)
+    };
     Err(anyhow!(
-        "Search block not found in content (best fuzzy match: {:.1}%, threshold: 70%). Snippet:\n{}",
-        best_score * 100.0,
+        "Search block not found in content ({}; closest region starts at line {}). Re-read the file and copy the exact lines. Snippet:\n{}",
+        reason,
+        best_i + 1,
         snippet
     ))
+}
+
+fn ambiguous(count: usize, search: &str) -> anyhow::Error {
+    let first = search.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    anyhow!(
+        "Ambiguous: search block matches {} locations (first line: `{}`). Include more surrounding lines so it is unique, or set replace_all=true to change every occurrence.",
+        count,
+        crate::text::truncate_chars(first, 80)
+    )
 }
 
 /// Applies a series of search/replace blocks to a specific file on disk.
@@ -775,5 +766,34 @@ new_func()
         assert_eq!(content_b, "one\nTWO_MOD\nthree\n");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_safety_ambiguous_exact_match_is_rejected() {
+        let c = "fn a() {\n    x += 1;\n}\nfn b() {\n    x += 1;\n}\n";
+        let err = apply_search_replace(c, "    x += 1;\n", "    x += 2;\n").unwrap_err();
+        assert!(err.to_string().contains("Ambiguous"), "{err}");
+        let all = apply_search_replace_opts(c, "    x += 1;\n", "    x += 2;\n", true).unwrap();
+        assert_eq!(all.matches("x += 2").count(), 2);
+    }
+
+    #[test]
+    fn test_safety_fuzzy_does_not_patch_wrong_location() {
+        let c = "let timeout_ms = 500;\nlet retries = 3;\n";
+        let r = apply_search_replace(c, "let timeout_secs = 30;\n", "DELETED\n");
+        assert!(r.is_err(), "must not patch an unrelated line: {r:?}");
+    }
+
+    #[test]
+    fn test_safety_empty_search_rejected_on_existing_content() {
+        assert!(apply_search_replace("fn main() {}\n", "", "GARBAGE\n").is_err());
+        assert_eq!(apply_search_replace("", "", "new\n").unwrap(), "new\n");
+    }
+
+    #[test]
+    fn test_safety_ambiguous_fuzzy() {
+        let c = "    let alpha = compute(1);\n    other();\n    let alpha = compute(2);\n";
+        let r = apply_search_replace(c, "    let alpha = compute(3);\n", "X\n");
+        assert!(r.is_err(), "{r:?}");
     }
 }

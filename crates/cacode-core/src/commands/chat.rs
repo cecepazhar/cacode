@@ -1,90 +1,32 @@
+//! CACode ReAct agent: native tool calling, streaming, typed provider
+//! errors with backoff / failover / circuit breaker, auto-compaction,
+//! permissioned sandboxed tools and parallel subagents.
+
+use crate::events::ApprovalDecision;
+use crate::llm::retry::{CircuitBreaker, RetryPolicy};
+use crate::llm::{self, Credentials, LlmError, LlmRequest, LlmResponse, Timeouts, ToolDef, ToolMode};
+use crate::permission::PermissionMode;
+use crate::text::{clamp_output, estimate_tokens};
+use crate::tools::{self, ToolContext, Workspace};
 use anyhow::{anyhow, Result};
-use reedline::{DefaultPrompt, Reedline, Signal};
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::process::Command;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use walkdir::WalkDir;
-use regex::Regex;
 
-pub const CA_VERSION: &str = "1.0.13";
+pub use crate::events::{AgentEvent, AgentEvents};
+pub use crate::types::{Message, TokenUsage, ToolCall};
 
-pub type AgentEvents = mpsc::UnboundedSender<AgentEvent>;
-
-/// Events streamed from the background ReAct worker back to the TUI,
-/// so the event loop never blocks on LLM calls or tool execution.
-#[derive(Debug, Clone)]
-pub enum AgentEvent {
-    Thinking(String),
-    AssistantChunk(String),
-    ToolStart { tool: String, args: String },
-    ToolOutput { tool: String, output: String, is_error: bool },
-    TurnFinished {
-        usage: TokenUsage,
-        total_calls: usize,
-        duration_ms: u64,
-        history: Vec<Message>,
-        total_usage: TokenUsage,
-        last_usage: TokenUsage,
-    },
-    Error(String),
-    Cancelled,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OpenAIChoice {
-    message: Message,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OpenAIResponse {
-    choices: Vec<OpenAIChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicUsage {
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicResponse {
-    content: Vec<AnthropicContent>,
-    usage: Option<AnthropicUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicContent {
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    typ: String,
-    text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaResponse {
-    message: Message,
-    prompt_eval_count: Option<i64>,
-    eval_count: Option<i64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ToolCall {
-    pub tool: String,
-    pub args: serde_json::Value,
-}
+pub const CA_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const DEFAULT_MAX_STEPS: usize = 25;
+pub const AUTO_COMPACT_RATIO: f64 = 0.80;
+pub const KEEP_RECENT_MESSAGES: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provider {
@@ -124,11 +66,16 @@ impl Provider {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
-    pub total_tokens: i64,
+
+/// How a turn ended (used by subagents and tests).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnOutcome {
+    Finished,
+    StepBudget,
+    LoopDetected,
+    TokenBudget,
+    Cancelled,
+    Failed(String),
 }
 
 #[derive(Clone)]
@@ -142,10 +89,44 @@ pub struct ReActAgent {
     pub user_name: String,
     pub persona: String,
     pub thinking_mode: String,
+    /// Context window of the active model (tokens). Refreshed every call
+    /// unless `context_window_override` is set.
     pub context_window_limit: u64,
+    pub context_window_override: Option<u64>,
     pub last_usage: TokenUsage,
     pub total_usage: TokenUsage,
     pub total_calls: usize,
+    // --- runtime configuration -------------------------------------------
+    pub creds: Credentials,
+    pub permission_mode: PermissionMode,
+    /// Workspace root; `None` = current directory at turn start.
+    pub workspace_root: Option<PathBuf>,
+    pub max_steps: usize,
+    pub max_tokens: u32,
+    pub retry: RetryPolicy,
+    pub timeouts: Timeouts,
+    pub breaker: CircuitBreaker,
+    pub stream: bool,
+    /// Tool mode per provider label, learned at runtime (`ToolsUnsupported`).
+    pub tool_modes: Arc<Mutex<HashMap<String, ToolMode>>>,
+    pub tool_ctx: Option<ToolContext>,
+    /// Max concurrently running subagents (free 5, pro 49).
+    pub subagent_limit: usize,
+    /// Token budget for one turn (subagent watchdog). 0 = unlimited.
+    pub turn_token_budget: i64,
+    pub is_subagent: bool,
+    pub inject_repo_context: bool,
+    pub record_usage: bool,
+    /// Persistent session id (`~/.cacode/sessions/<id>.json`).
+    pub session_id: String,
+    pub session_created: String,
+    pub extensions_announced: bool,
+    /// bubblewrap sandbox for `bash` (applied when the tool context is created).
+    pub sandbox: crate::tools::bash::SandboxConfig,
+    /// Extra domains web_fetch may read without approval.
+    pub web_allow_domains: Vec<String>,
+    /// Save the session after every turn.
+    pub autosave: bool,
 }
 
 impl Default for ReActAgent {
@@ -154,20 +135,28 @@ impl Default for ReActAgent {
     }
 }
 
+fn provider_key(p: &Provider) -> String {
+    p.display_label()
+}
+
 impl ReActAgent {
     pub fn detect_provider() -> Provider {
-        if env::var("ANTHROPIC_API_KEY").is_ok() {
-            let model = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-20240620".into());
+        Self::detect_provider_with(&Credentials::from_env())
+    }
+
+    pub fn detect_provider_with(c: &Credentials) -> Provider {
+        if c.anthropic_key.is_some() {
+            let model = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
             Provider::Anthropic { model }
-        } else if env::var("OPENAI_API_KEY").is_ok() {
+        } else if c.openai_key.is_some() {
             let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into());
             Provider::OpenAI { model }
-        } else if env::var("ANTIGRAVITY_API_KEY").is_ok() || env::var("ANTIGRAVITY_ZEN_API_KEY").is_ok() {
+        } else if c.zen_key.is_some() {
             let model = env::var("ANTIGRAVITY_ZEN_MODEL")
                 .or_else(|_| env::var("ANTIGRAVITY_MODEL"))
                 .unwrap_or_else(|_| "deepseek-v4-flash-free".into());
             Provider::AntigravityZen { model }
-        } else if env::var("OLLAMA_MODEL").is_ok() || env::var("OLLAMA_URL").is_ok() {
+        } else if env::var("OLLAMA_MODEL").is_ok() || c.ollama_url.is_some() {
             let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".into());
             Provider::Ollama { model }
         } else {
@@ -179,32 +168,119 @@ impl ReActAgent {
     }
 
     pub fn new() -> Self {
+        Self::with_credentials(Credentials::from_env())
+    }
+
+    pub fn with_credentials(creds: Credentials) -> Self {
+        let provider = Self::detect_provider_with(&creds);
+        let mode = env::var("CACODE_PERMISSION_MODE").ok().and_then(|m| PermissionMode::parse(&m)).unwrap_or_default();
         Self {
-            client: Client::new(),
+            client: llm::build_client(),
             history: Vec::new(),
-            provider: Self::detect_provider(),
+            context_window_limit: crate::pricing::context_window(provider.model()),
+            provider,
             fallback_chain: Vec::new(),
             max_retries: 3,
             event_tx: None,
             user_name: "Prof. Cecep".into(),
             persona: "You are CACode, an elite sovereign Rust development assistant. The user is Prof. Cecep (Cecep Saeful Azhar Hidayat, ST). Always greet and address him respectfully as 'Prof. Cecep' (e.g. 'Hi Prof. Cecep', 'Siap, Prof. Cecep.'). Be direct, concise, and technically precise.".into(),
             thinking_mode: "Fast".into(),
-            context_window_limit: 200_000,
+            context_window_override: None,
             last_usage: TokenUsage::default(),
             total_usage: TokenUsage::default(),
             total_calls: 0,
+            creds,
+            permission_mode: mode,
+            workspace_root: None,
+            max_steps: env::var("CACODE_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_STEPS),
+            max_tokens: 8192,
+            retry: RetryPolicy::default(),
+            timeouts: Timeouts::default(),
+            breaker: CircuitBreaker::default(),
+            stream: true,
+            tool_modes: Arc::default(),
+            tool_ctx: None,
+            subagent_limit: 5,
+            turn_token_budget: 0,
+            is_subagent: false,
+            inject_repo_context: true,
+            record_usage: true,
+            session_id: crate::sessions::new_id(),
+            extensions_announced: false,
+            sandbox: crate::tools::bash::SandboxConfig::from_settings("auto", &[], true),
+            web_allow_domains: Vec::new(),
+            session_created: chrono::Utc::now().to_rfc3339(),
+            autosave: true,
+        }
+    }
+
+    fn workspace_path(&self) -> PathBuf {
+        let root = self.workspace_root.clone().unwrap_or_else(|| env::current_dir().unwrap_or_default());
+        root.canonicalize().unwrap_or(root)
+    }
+
+    /// Snapshot of this conversation for the session store.
+    pub fn session_record(&self) -> crate::sessions::SessionRecord {
+        crate::sessions::SessionRecord {
+            id: self.session_id.clone(),
+            title: crate::sessions::SessionStore::title_from(&self.history),
+            workspace: self.workspace_path(),
+            created: self.session_created.clone(),
+            updated: chrono::Utc::now().to_rfc3339(),
+            provider: self.provider.display_label(),
+            history: self.history.clone(),
+            total_usage: self.total_usage.clone(),
+        }
+    }
+
+    pub fn save_session(&self, store: &crate::sessions::SessionStore) -> Result<()> {
+        if self.history.is_empty() || self.is_subagent {
+            return Ok(());
+        }
+        store.save(&self.session_record())
+    }
+
+    /// Continue a stored conversation in this agent.
+    pub fn restore_session(&mut self, rec: crate::sessions::SessionRecord) {
+        self.session_id = rec.id;
+        self.session_created = rec.created;
+        self.history = rec.history;
+        self.total_usage = rec.total_usage;
+        // a resumed tool_call without its result would make the next request invalid
+        let pending: Vec<ToolCall> = match self.history.last() {
+            Some(m) if m.role == "assistant" && !m.tool_calls.is_empty() => m.tool_calls.clone(),
+            _ => Vec::new(),
+        };
+        for c in pending {
+            self.history.push(Message::tool_result(&c, "Not executed: the session was interrupted before this tool ran.", true));
         }
     }
 
     pub fn add_user(&mut self, content: &str) {
-        self.history.push(Message { role: "user".into(), content: content.into() });
+        self.history.push(Message::user(content));
     }
 
     pub fn add_assistant(&mut self, content: &str) {
-        self.history.push(Message { role: "assistant".into(), content: content.into() });
+        self.history.push(Message::assistant(content));
     }
 
-    pub fn system_prompt(&self) -> Message {
+    pub fn context_limit(&self) -> u64 {
+        self.context_window_override.unwrap_or_else(|| crate::pricing::context_window(self.provider.model()))
+    }
+
+    fn tool_mode_for(&self, p: &Provider) -> ToolMode {
+        if env::var("CACODE_TOOL_MODE").map(|v| v.eq_ignore_ascii_case("text")).unwrap_or(false) {
+            return ToolMode::Text;
+        }
+        self.tool_modes.lock().ok().and_then(|m| m.get(&provider_key(p)).copied()).unwrap_or(ToolMode::Native)
+    }
+
+    fn text_mode_instructions() -> &'static str {
+        "\n\n# Tool calling (text mode)\nWhen you need tools, output ONLY a JSON array strictly wrapped in a ```json fenced block, e.g.\n```json\n[{\"tool\": \"read_file\", \"args\": {\"path\": \"src/main.rs\"}}]\n```\nYou will receive each result as an `Observation from tool ...` message. You may also edit with Aider blocks:\npath/to/file.rs\n<<<<<<< SEARCH\n[exact old lines]\n=======\n[new lines]\n>>>>>>> REPLACE\nWhen no tool is needed, answer in natural language without any JSON block."
+    }
+
+    /// System prompt for the given tool mode (repo context appended separately).
+    pub fn system_prompt_for(&self, mode: ToolMode, ctx: Option<&ToolContext>) -> String {
         let persona_intro = if !self.persona.is_empty() {
             self.persona.clone()
         } else {
@@ -213,489 +289,362 @@ impl ReActAgent {
                 self.user_name, self.user_name
             )
         };
-
         let thinking_hint = match self.thinking_mode.as_str() {
             "Analytical" => "\n\n[Cognitive Mode: Analytical — analyze problems with structured step-by-step logic before answering or using tools.]",
             "Deep" => "\n\n[Cognitive Mode: Deep Reasoning — apply comprehensive adversarial verification, edge-case proofs, and rigorous architectural checks.]",
             _ => "",
         };
-
-        let content = format!(
-            "{}{}\n\nAvailable tools:\n\
-            1. read_file: {{\"tool\": \"read_file\", \"args\": {{\"path\": \"...\", \"offset\": 1, \"limit\": 200}}}}\n\
-            2. patch_file: {{\"tool\": \"patch_file\", \"args\": {{\"path\": \"...\", \"old_string\": \"...\", \"new_string\": \"...\"}}}}\n\
-            3. search_replace: {{\"tool\": \"search_replace\", \"args\": {{\"path\": \"...\", \"search\": \"...\", \"replace\": \"...\"}}}}\n\
-            4. write_file: {{\"tool\": \"write_file\", \"args\": {{\"path\": \"...\", \"content\": \"...\"}}}}\n\
-            5. bash: {{\"tool\": \"bash\", \"args\": {{\"command\": \"...\"}}}}\n\
-            6. search_files: {{\"tool\": \"search_files\", \"args\": {{\"pattern\": \"...\", \"dir\": \".\"}}}}\n\n\
-            When you need to act, output a JSON array of tool calls strictly wrapped in ```json ... ``` codeblock:\n\
-            ```json\n[\n  {{\"tool\": \"read_file\", \"args\": {{\"path\": \"src/main.rs\"}}}}\n]\n```\n\
-            You can also provide edits using standard Aider search/replace blocks:\n\
-            path/to/file.rs\n\
-            <<<<<<< SEARCH\n\
-            [old code]\n\
-            =======\n\
-            [new code]\n\
-            >>>>>>> REPLACE\n\n\
-            If no tool action is needed, reply normally with natural language.",
-            persona_intro, thinking_hint
+        let specs = match ctx {
+            Some(c) => tools::specs_for(c),
+            None => tools::all_specs(),
+        };
+        let tool_list: String = specs
+            .iter()
+            .map(|s| if mode == ToolMode::Text { format!("- {}: {} Args schema: {}\n", s.name, s.description, s.schema) } else { format!("- {}\n", s.name) })
+            .collect();
+        let mut p = format!(
+            "{persona_intro}{thinking_hint}\n\n# Operating rules\n\
+             - You work inside the user's workspace through tools. Never claim you ran, tested or changed something unless a tool result in this conversation shows it.\n\
+             - Explore before editing: use grep / glob / find_symbol / read_file. Read a file before editing it; copy old_string exactly from read_file output without the line-number prefix.\n\
+             - Prefer small, precise edit_file calls over rewriting whole files.\n\
+             - After changing code, verify with the project's build/test command via bash and report the actual exit code.\n\
+             - Tool results may be truncated (marked). Page with offset/limit or narrow searches instead of re-running blindly.\n\
+             - If a tool fails, read the error, adjust, and retry differently; do not repeat an identical failing call.\n\
+             - Permission mode: {mode_label}. Some actions may be rejected by the user; respect rejections.\n\
+             - Use `task` to parallelise independent read-only investigations.\n\n# Tools\n{tool_list}",
+            mode_label = self.permission_mode.label()
         );
-
-        Message {
-            role: "system".into(),
-            content,
+        if self.permission_mode == PermissionMode::Plan {
+            p.push_str("\n# PLAN MODE\nYou may only read and investigate (read_file, grep, glob, find_symbol, allowlisted bash). Do NOT try to edit files. When you understand the task, call exit_plan_mode with a concise, step-by-step plan (files to change, approach, how you will verify). Wait for approval.\n");
         }
+        if self.is_subagent {
+            p.push_str("\n# You are a SUBAGENT\nYou were spawned by a parent agent for one self-contained task. Work autonomously (no user is watching). When done, reply WITHOUT tool calls and end your final message with a JSON object in a ```json fence: {\"summary\": \"what you found/did\", \"claims\": [\"each factual claim\"], \"files\": [\"paths you inspected or changed\"]}. Only claim tests pass / bugs fixed if a bash result above proves it.\n");
+        }
+        if mode == ToolMode::Text {
+            p.push_str(Self::text_mode_instructions());
+        }
+        p
+    }
+
+    /// Backwards-compatible accessor (native mode, no repo context).
+    pub fn system_prompt(&self) -> Message {
+        Message::system(self.system_prompt_for(ToolMode::Native, self.tool_ctx.as_ref()))
+    }
+
+    /// Legacy helper kept for callers that parse raw provider bodies.
+    pub fn extract_response_content(text: &str) -> Result<(String, TokenUsage)> {
+        let r = crate::llm::sse::parse_full_body(text, crate::llm::Wire::OpenAi).map_err(|e| anyhow!("API error: {}", e))?;
+        Ok((r.content, r.usage))
     }
 
     pub fn record_usage_to_sqlite(model: &str, usage: &TokenUsage) {
-        if usage.total_tokens == 0 {
-            return;
-        }
-        if let Some(home) = dirs::home_dir() {
-            let db_path = home.join(".cacode").join("usage.db");
-            if let Some(parent) = db_path.parent() {
-                let _ = fs::create_dir_all(parent);
+        crate::usage_db::record_agent_usage("", model, usage);
+    }
+
+    // ------------------------------------------------------------ context ----
+
+    /// Get (or lazily create) the session tool context for the current workspace.
+    pub fn ensure_tool_ctx(&mut self) -> Result<ToolContext> {
+        let root = match &self.workspace_root {
+            Some(r) => r.clone(),
+            None => env::current_dir()?,
+        };
+        let root = root.canonicalize().unwrap_or(root);
+        let same_root = self.tool_ctx.as_ref().map(|c| c.workspace.root() == root).unwrap_or(false);
+        if same_root {
+            let mode = self.permission_mode;
+            if let Some(c) = self.tool_ctx.as_mut() {
+                if c.mode() != mode {
+                    c.set_mode(mode);
+                }
             }
-            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000;");
-                let _ = conn.execute(
-                    "CREATE TABLE IF NOT EXISTS token_usage (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp TEXT NOT NULL,
-                        model TEXT NOT NULL,
-                        prompt_tokens INTEGER NOT NULL,
-                        completion_tokens INTEGER NOT NULL,
-                        total_tokens INTEGER NOT NULL,
-                        est_cost REAL NOT NULL
-                    )",
-                    [],
-                );
-                let est_cost = (usage.prompt_tokens as f64 * 2.50 + usage.completion_tokens as f64 * 10.0) / 1_000_000.0;
-                let ts = chrono::Utc::now().to_rfc3339();
-                let _ = conn.execute(
-                    "INSERT INTO token_usage (timestamp, model, prompt_tokens, completion_tokens, total_tokens, est_cost) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![ts, model, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, est_cost],
-                );
+        } else {
+            let mut ctx = ToolContext::new(Workspace::new(&root)?, self.permission_mode);
+            ctx.sandbox = self.sandbox.clone();
+            ctx.web_allowlist.extend(self.web_allow_domains.iter().cloned());
+            self.tool_ctx = Some(if self.is_subagent { ctx } else { ctx.with_extensions() });
+        }
+        Ok(self.tool_ctx.clone().expect("set above"))
+    }
+
+    fn repo_context(&self, ctx: &ToolContext) -> String {
+        if !self.inject_repo_context {
+            return String::new();
+        }
+        let mut guard = match ctx.symbols.lock() {
+            Ok(g) => g,
+            Err(_) => return String::new(),
+        };
+        if guard.is_none() {
+            *guard = Some(crate::symbols::SymbolIndex::load_or_build(ctx.workspace.root()));
+        } else if let Some(idx) = guard.as_mut() {
+            idx.refresh();
+        }
+        let opts = crate::repo_context::RepoContextOptions { map_budget: if self.is_subagent { 1_500 } else { 3_000 }, ..Default::default() };
+        crate::repo_context::build(ctx.workspace.root(), guard.as_ref(), &opts)
+    }
+
+    fn estimate_prompt_tokens(&self, system: &str) -> i64 {
+        estimate_tokens(system)
+            + self.history.iter().map(|m| estimate_tokens(&m.content) + m.tool_calls.iter().map(|c| estimate_tokens(&c.args.to_string()) + 10).sum::<i64>() + 4).sum::<i64>()
+    }
+
+    // ---------------------------------------------------------- LLM calls ----
+
+    fn ordered_providers(&self) -> Vec<Provider> {
+        let mut all = vec![self.provider.clone()];
+        for fb in &self.fallback_chain {
+            if !all.contains(fb) {
+                all.push(fb.clone());
+            }
+        }
+        let (closed, open): (Vec<_>, Vec<_>) = all.into_iter().partition(|p| !self.breaker.is_open(&provider_key(p)));
+        // try healthy providers first; open (cooling-down) ones last rather than never
+        closed.into_iter().chain(open).collect()
+    }
+
+    fn emit(&self, ev: AgentEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(ev);
+        }
+    }
+
+    async fn sleep_or_cancel(d: Duration, cancel: Option<&CancellationToken>) -> bool {
+        match cancel {
+            Some(c) => tokio::select! { _ = tokio::time::sleep(d) => true, _ = c.cancelled() => false },
+            None => {
+                tokio::time::sleep(d).await;
+                true
             }
         }
     }
 
-    pub fn extract_response_content(text: &str) -> Result<(String, TokenUsage)> {
-        let trimmed = text.trim();
-        let mut usage = TokenUsage::default();
+    /// One model call with retry, failover, tool-mode downgrade.
+    /// Returns the response, the provider that served it, and its tool mode.
+    async fn call_model(
+        &mut self,
+        system_extra: &str,
+        tools_on: bool,
+        cancel: Option<&CancellationToken>,
+    ) -> std::result::Result<(LlmResponse, Provider, ToolMode), LlmError> {
+        self.context_window_limit = self.context_limit();
+        let providers = self.ordered_providers();
+        let mut last_err = LlmError::Unavailable("no provider configured".into());
+        let ctx = self.tool_ctx.clone();
+        let tool_defs: Vec<ToolDef> = if tools_on {
+            ctx.as_ref()
+                .map(tools::specs_for)
+                .unwrap_or_else(tools::all_specs)
+                .into_iter()
+                .map(|s| ToolDef { name: s.name, description: s.description, schema: s.schema })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        // 1. Try parsing standard JSON
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(err) = parsed.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                return Err(anyhow!("API error: {}", err));
-            }
-            if let Some(u) = parsed.get("usage") {
-                let p = u.get("prompt_tokens").or_else(|| u.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
-                let c = u.get("completion_tokens").or_else(|| u.get("output_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
-                let t = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(p + c);
-                usage.prompt_tokens = p;
-                usage.completion_tokens = c;
-                usage.total_tokens = t;
-            }
-            if let Some(content) = parsed.get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|a| a.first())
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                if usage.total_tokens == 0 {
-                    usage.completion_tokens = (content.len() / 4).max(1) as i64;
-                    usage.prompt_tokens = 50;
-                    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-                }
-                return Ok((content.to_string(), usage));
-            }
-        }
-
-        // 2. Fallback: Parse Server-Sent Events (SSE chunks starting with "data:")
-        if trimmed.starts_with("data:") || trimmed.contains("\ndata:") {
-            let mut accumulated = String::new();
-            for line in trimmed.lines() {
-                let line = line.trim();
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data == "[DONE]" || data.is_empty() {
+        for (tier, prov) in providers.iter().enumerate() {
+            let key = provider_key(prov);
+            let mut attempt = 0usize;
+            let mut downgraded = false;
+            loop {
+                attempt += 1;
+                let mode = if tools_on { self.tool_mode_for(prov) } else { ToolMode::Native };
+                let system = format!("{}{}", self.system_prompt_for(mode, ctx.as_ref()), system_extra);
+                let req = LlmRequest {
+                    model: prov.model(),
+                    system: &system,
+                    messages: &self.history,
+                    tools: if mode == ToolMode::Native { &tool_defs } else { &[] },
+                    tool_mode: mode,
+                    max_tokens: self.max_tokens,
+                    stream: self.stream,
+                };
+                let tx = self.event_tx.clone();
+                let on_delta = move |d: &str| {
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(AgentEvent::AssistantDelta(d.to_string()));
+                    }
+                };
+                self.total_calls += 1;
+                let res = llm::complete(&self.client, prov, &self.creds, &req, self.timeouts, &on_delta).await;
+                match res {
+                    Ok(r) => {
+                        self.breaker.reset(&key);
+                        if tier > 0 {
+                            self.emit(AgentEvent::Thinking(format!("↪ served by fallback {}", prov.display_label())));
+                        }
+                        return Ok((r, prov.clone(), mode));
+                    }
+                    Err(LlmError::ToolsUnsupported(m)) if !downgraded => {
+                        downgraded = true;
+                        if let Ok(mut tm) = self.tool_modes.lock() {
+                            tm.insert(key.clone(), ToolMode::Text);
+                        }
+                        self.emit(AgentEvent::Thinking(format!("{} rejected native tools ({}); switching to text tool-mode", prov.name(), crate::text::truncate_chars(&m, 80))));
+                        attempt -= 1;
                         continue;
                     }
-                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(err) = chunk.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                            return Err(anyhow!("Stream error: {}", err));
-                        }
-                        if let Some(u) = chunk.get("usage") {
-                            let p = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let c = u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let t = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(p + c);
-                            if t > 0 {
-                                usage.prompt_tokens = p;
-                                usage.completion_tokens = c;
-                                usage.total_tokens = t;
+                    Err(e) => {
+                        let retry = e.retryable() && attempt < self.max_retries.max(1);
+                        last_err = e.clone();
+                        if retry {
+                            let d = self.retry.delay(attempt, &e);
+                            self.emit(AgentEvent::Thinking(format!("{} — {} (retry {}/{} in {:.1}s)", prov.name(), crate::text::truncate_chars(&e.to_string(), 120), attempt, self.max_retries, d.as_secs_f64())));
+                            if !Self::sleep_or_cancel(d, cancel).await {
+                                return Err(LlmError::Network("cancelled".into()));
                             }
+                            continue;
                         }
-                        if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
-                            if let Some(first) = choices.first() {
-                                if let Some(content) = first.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
-                                    accumulated.push_str(content);
-                                } else if let Some(content) = first.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                                    accumulated.push_str(content);
-                                }
-                            }
+                        if !e.failover() {
+                            return Err(e);
                         }
+                        break;
                     }
                 }
             }
-            if !accumulated.is_empty() {
-                if usage.total_tokens == 0 {
-                    usage.completion_tokens = (accumulated.len() / 4).max(1) as i64;
-                    usage.prompt_tokens = 50;
-                    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-                }
-                return Ok((accumulated, usage));
+            self.breaker.trip(&key, self.retry.cooldown);
+            if let Some(next) = providers.get(tier + 1) {
+                let msg = format!("⚠️ {} failed ({}). Failing over to Fallback Tier {} ({})", prov.name(), crate::text::truncate_chars(&last_err.to_string(), 120), tier + 1, next.name());
+                self.emit(AgentEvent::Thinking(msg));
             }
         }
-
-        Err(anyhow!(
-            "Invalid response from model: {}",
-            text.chars().take(200).collect::<String>()
-        ))
+        Err(last_err)
     }
 
+    fn account(&mut self, prov: &Provider, usage: &TokenUsage) {
+        self.last_usage = usage.clone();
+        self.total_usage.add(usage);
+        if self.record_usage {
+            crate::usage_db::record_agent_usage(prov.name(), prov.model(), usage);
+        }
+    }
+
+    /// Plain completion without tools or history (summaries, legacy callers).
+    pub async fn call_llm(&mut self, user_input: &str) -> Result<String> {
+        let saved = std::mem::replace(&mut self.history, vec![Message::user(user_input)]);
+        let res = self.call_model("", false, None).await;
+        self.history = saved;
+        let (r, prov, _) = res.map_err(|e| anyhow!("All providers failed (primary + {} fallbacks). Last error: {}", self.fallback_chain.len(), e))?;
+        self.account(&prov, &r.usage);
+        Ok(r.content)
+    }
+
+    // --------------------------------------------------------- compaction ----
+
+    fn render_for_summary(msgs: &[Message]) -> String {
+        msgs.iter()
+            .map(|m| {
+                let mut s = format!("[{}{}]: {}", m.role, m.name.as_deref().map(|n| format!(" {}", n)).unwrap_or_default(), if m.role == "tool" { clamp_output(&m.content, 2_000, 40) } else { m.content.clone() });
+                for c in &m.tool_calls {
+                    s.push_str(&format!("\n  -> call {}({})", c.tool, crate::text::truncate_chars(&c.args.to_string(), 300)));
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Index where the kept tail starts: a plain user message, so no tool
+    /// call is ever separated from its result.
+    fn compaction_split(&self, keep_recent: usize) -> usize {
+        let n = self.history.len();
+        let mut i = n.saturating_sub(keep_recent);
+        while i > 0 && !(self.history[i].role == "user") {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Summarise everything but the recent tail. `force` ignores the threshold.
+    /// Returns a status line when something was compacted.
+    pub async fn compact(&mut self, force: bool) -> Result<Option<String>> {
+        let limit = self.context_limit() as i64;
+        let est = self.estimate_prompt_tokens("");
+        if !force && (est as f64) < limit as f64 * AUTO_COMPACT_RATIO {
+            return Ok(None);
+        }
+        let mut split = self.compaction_split(KEEP_RECENT_MESSAGES);
+        if split == 0 && self.history.len() > 2 {
+            // a single giant turn: keep only from the latest user message
+            split = self.compaction_split(1);
+        }
+        if split == 0 {
+            // nothing safe to summarise: shrink old tool outputs instead
+            let mut shrunk = 0;
+            let n = self.history.len();
+            for m in self.history.iter_mut().take(n.saturating_sub(2)) {
+                if m.role == "tool" && m.content.len() > 4_000 {
+                    m.content = clamp_output(&m.content, 4_000, 80);
+                    shrunk += 1;
+                }
+            }
+            return Ok((shrunk > 0).then(|| format!("Shrunk {} large tool outputs", shrunk)));
+        }
+        let old: Vec<Message> = self.history[..split].to_vec();
+        let before_tokens = est;
+        let transcript = Self::render_for_summary(&old);
+        // chunk so each summarisation request itself fits in the window
+        let chunk_chars = ((limit as f64 * 0.45) * 3.5).clamp(8_000.0, 400_000.0) as usize;
+        let mut summary = String::new();
+        let mut rest = transcript.as_str();
+        while !rest.is_empty() {
+            let cut = crate::text::floor_char_boundary(rest, chunk_chars.min(rest.len()));
+            let (chunk, tail) = rest.split_at(cut.max(1).min(rest.len()));
+            rest = tail;
+            let prompt = format!(
+                "You compress coding-agent conversations. Produce a dense technical briefing that preserves: the user's goals and constraints, decisions made, files read/changed (exact paths), commands run with their exit codes, errors still open, and the current next step. Never invent facts. Begin with '[COMPACTED CONTEXT SUMMARY]'.\n\n{}Conversation segment:\n{}",
+                if summary.is_empty() { String::new() } else { format!("Summary so far (merge it in):\n{}\n\n", summary) },
+                chunk
+            );
+            summary = self.call_llm(&prompt).await?;
+        }
+        let kept: Vec<Message> = self.history[split..].to_vec();
+        self.history = vec![
+            Message::user(format!("{}\n\n(The conversation above this point was compacted automatically.)", summary)),
+            Message::assistant("Understood — continuing from the compacted summary."),
+        ];
+        self.history.extend(kept);
+        let after = self.estimate_prompt_tokens("");
+        Ok(Some(format!(
+            "Compacted {} older messages: ~{} → ~{} tokens ({}% of {} window)",
+            split,
+            before_tokens,
+            after,
+            (after * 100) / limit.max(1),
+            limit
+        )))
+    }
+
+    /// `/compress` entry point.
     pub async fn compress_history(&mut self) -> Result<String> {
         if self.history.len() <= 2 {
             return Ok("Context memory is already compact (less than 3 messages).".into());
         }
-        let total_chars_before: usize = self.history.iter().map(|m| m.content.len()).sum();
-        let old_count = self.history.len();
-
-        let mut transcript = String::new();
-        for m in &self.history {
-            transcript.push_str(&format!("[{}]: {}\n", m.role, m.content));
-        }
-
-        let prompt = format!(
-            "Summarize this conversation context into a dense, high-signal technical briefing. \
-            Extract all essential requirements, decisions, active file paths, and current progress. \
-            Begin with '[COMPACTED CONTEXT SUMMARY]'.\n\n{}",
-            transcript
-        );
-
-        let summary = self.call_llm(&prompt).await?;
-        let last_user = self.history.iter().rev().find(|m| m.role == "user").cloned();
-
-        self.history.clear();
-        self.history.push(Message {
-            role: "assistant".into(),
-            content: summary,
-        });
-        if let Some(u) = last_user {
-            self.history.push(u);
-        }
-
-        let total_chars_after: usize = self.history.iter().map(|m| m.content.len()).sum();
-        let pct = (total_chars_before.saturating_sub(total_chars_after) * 100)
-            .checked_div(total_chars_before)
-            .unwrap_or(0);
-
-        Ok(format!(
-            "Compressed {} messages into compact summary (~{}% character reduction). Context window optimized.",
-            old_count, pct
-        ))
-    }
-
-    pub async fn call_single_provider(
-        &self,
-        provider: &Provider,
-        msgs: &[Message],
-    ) -> Result<(String, TokenUsage)> {
-        match provider {
-            Provider::OpenAI { model } => {
-                let api_key = env::var("OPENAI_API_KEY")?;
-                let base_url = env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
-                let base = base_url.trim_end_matches('/');
-                let endpoint = if base.ends_with("/v1") {
-                    format!("{}/chat/completions", base)
-                } else {
-                    format!("{}/v1/chat/completions", base)
-                };
-                let resp = self.client
-                    .post(&endpoint)
-                    .bearer_auth(api_key)
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "messages": msgs,
-                        "stream": false
-                    }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let bytes = resp.bytes().await?;
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                if !status.is_success() {
-                    return Err(anyhow!(
-                        "OpenAI HTTP {} (endpoint: {}) — {}",
-                        status,
-                        endpoint,
-                        text.chars().take(500).collect::<String>()
-                    ));
-                }
-                Self::extract_response_content(&text)
-            }
-            Provider::Anthropic { model } => {
-                let api_key = env::var("ANTHROPIC_API_KEY")?;
-                let non_system_msgs: Vec<_> = msgs.iter()
-                    .filter(|m| m.role != "system")
-                    .map(|m| serde_json::json!({
-                        "role": m.role,
-                        "content": m.content
-                    }))
-                    .collect();
-                let resp = self.client
-                    .post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "max_tokens": 4096,
-                        "system": self.system_prompt().content,
-                        "messages": non_system_msgs,
-                    }))
-                    .send()
-                    .await?
-                    .json::<AnthropicResponse>()
-                    .await?;
-                let txt = resp.content.into_iter().filter_map(|c| c.text).collect::<Vec<_>>().join("\n");
-                let usage = if let Some(u) = resp.usage {
-                    let prompt = u.input_tokens.unwrap_or(0);
-                    let comp = u.output_tokens.unwrap_or(0);
-                    TokenUsage {
-                        prompt_tokens: prompt,
-                        completion_tokens: comp,
-                        total_tokens: prompt + comp,
-                    }
-                } else {
-                    let comp = (txt.len() / 4).max(1) as i64;
-                    TokenUsage {
-                        prompt_tokens: 50,
-                        completion_tokens: comp,
-                        total_tokens: 50 + comp,
-                    }
-                };
-                Ok((txt, usage))
-            }
-            Provider::Ollama { model } => {
-                let base_url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
-                let endpoint = format!("{}/api/chat", base_url.trim_end_matches('/'));
-                let resp = self.client
-                    .post(&endpoint)
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "messages": msgs,
-                        "stream": false
-                    }))
-                    .send()
-                    .await?
-                    .json::<OllamaResponse>()
-                    .await?;
-                let txt = resp.message.content;
-                let usage = if let (Some(p), Some(c)) = (resp.prompt_eval_count, resp.eval_count) {
-                    TokenUsage {
-                        prompt_tokens: p,
-                        completion_tokens: c,
-                        total_tokens: p + c,
-                    }
-                } else {
-                    let comp = (txt.len() / 4).max(1) as i64;
-                    TokenUsage {
-                        prompt_tokens: 50,
-                        completion_tokens: comp,
-                        total_tokens: 50 + comp,
-                    }
-                };
-                Ok((txt, usage))
-            }
-            Provider::Router9 { model } => {
-                let base_url = env::var("ROUTER9_URL").unwrap_or_else(|_| "http://localhost:20128".into());
-                let api_key = env::var("ROUTER9_API_KEY").unwrap_or_else(|_| "dummy".into());
-                let base = base_url.trim_end_matches('/');
-                let endpoint = if base.ends_with("/v1") || base.ends_with("/api") {
-                    format!("{}/chat/completions", base)
-                } else {
-                    format!("{}/v1/chat/completions", base)
-                };
-                let resp = self.client
-                    .post(&endpoint)
-                    .bearer_auth(api_key)
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "messages": msgs,
-                        "stream": false
-                    }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let bytes = resp.bytes().await?;
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                if !status.is_success() {
-                    return Err(anyhow!(
-                        "9router HTTP {} (endpoint: {}) — {}",
-                        status,
-                        endpoint,
-                        text.chars().take(500).collect::<String>()
-                    ));
-                }
-                Self::extract_response_content(&text)
-            }
-            Provider::AntigravityZen { model } => {
-                let api_key = env::var("ANTIGRAVITY_API_KEY")
-                    .or_else(|_| env::var("ANTIGRAVITY_ZEN_API_KEY"))
-                    .unwrap_or_else(|_| "dummy".into());
-                let endpoint = "https://antigravity.ai/zen/v1/chat/completions";
-                let resp = self.client
-                    .post(endpoint)
-                    .bearer_auth(api_key)
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "messages": msgs,
-                        "stream": false
-                    }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let bytes = resp.bytes().await?;
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                if !status.is_success() {
-                    return Err(anyhow!(
-                        "Antigravity Zen HTTP {} (endpoint: {}) — {}",
-                        status,
-                        endpoint,
-                        text.chars().take(500).collect::<String>()
-                    ));
-                }
-                Self::extract_response_content(&text)
-            }
-            Provider::Custom { name, base_url, api_key, model } => {
-                let base = base_url.trim_end_matches('/');
-                let endpoint = if base.ends_with("/v1") || base.ends_with("/api") {
-                    format!("{}/chat/completions", base)
-                } else {
-                    format!("{}/v1/chat/completions", base)
-                };
-                let mut req = self.client.post(&endpoint);
-                if !api_key.is_empty() {
-                    req = req.bearer_auth(api_key);
-                }
-                let resp = req
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "messages": msgs,
-                        "stream": false
-                    }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let bytes = resp.bytes().await?;
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                if !status.is_success() {
-                    return Err(anyhow!(
-                        "{} HTTP {} (endpoint: {}) — {}",
-                        name,
-                        status,
-                        endpoint,
-                        text.chars().take(500).collect::<String>()
-                    ));
-                }
-                Self::extract_response_content(&text)
-            }
+        match self.compact(true).await? {
+            Some(s) => Ok(s),
+            None => Ok("Nothing to compact.".into()),
         }
     }
 
-    pub async fn call_llm(&mut self, user_input: &str) -> Result<String> {
-        self.total_calls += 1;
-        let mut msgs = vec![self.system_prompt()];
-        msgs.extend(self.history.clone());
-        msgs.push(Message { role: "user".into(), content: user_input.into() });
-
-        let mut providers_to_try = vec![self.provider.clone()];
-        for fb in &self.fallback_chain {
-            if !providers_to_try.contains(fb) {
-                providers_to_try.push(fb.clone());
-            }
-        }
-
-        let max_retries = self.max_retries.max(1);
-        let mut last_error = anyhow!("No provider available");
-
-        for tier_idx in 0..providers_to_try.len() {
-            let current_prov = providers_to_try[tier_idx].clone();
-            let mut success_res: Option<(String, TokenUsage)> = None;
-
-            for attempt in 1..=max_retries {
-                match self.call_single_provider(&current_prov, &msgs).await {
-                    Ok(res) => {
-                        success_res = Some(res);
-                        break;
-                    }
-                    Err(err) => {
-                        last_error = err;
-                        if attempt < max_retries {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        }
-                    }
-                }
-            }
-
-            if let Some((content, usage)) = success_res {
-                if tier_idx > 0 {
-                    self.provider = current_prov.clone();
-                }
-
-                self.last_usage = usage.clone();
-                self.total_usage.prompt_tokens += usage.prompt_tokens;
-                self.total_usage.completion_tokens += usage.completion_tokens;
-                self.total_usage.total_tokens += usage.total_tokens;
-
-                Self::record_usage_to_sqlite(current_prov.model(), &usage);
-                return Ok(content);
-            }
-
-            // Retries exhausted for this tier; log failover event
-            if tier_idx + 1 < providers_to_try.len() {
-                let prev_name = current_prov.name();
-                let next_prov = &providers_to_try[tier_idx + 1];
-                let next_name = next_prov.name();
-                let failover_msg = format!(
-                    "⚠️ {} failed (retries exhausted). Failing over to Fallback Tier {} ({})",
-                    prev_name,
-                    tier_idx + 1,
-                    next_name
-                );
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx.send(AgentEvent::Thinking(failover_msg.clone()));
-                }
-                eprintln!("{}", failover_msg);
-            }
-        }
-
-        Err(anyhow!(
-            "All providers failed (primary + {} fallbacks). Last error: {}",
-            self.fallback_chain.len(),
-            last_error
-        ))
-    }
-
+    /// Text-mode tool-call parser (```json fences, bare JSON arrays, Aider
+    /// SEARCH/REPLACE blocks). Used when the provider has no native tools or
+    /// the model ignored them.
     pub fn parse_tool_calls(&self, content: &str) -> Vec<ToolCall> {
-        let json_block_re = Regex::new(r"(?s)```json\s*(\[.*?\])\s*```").unwrap();
-        if let Some(caps) = json_block_re.captures(content) {
+        static FENCE: OnceLock<Regex> = OnceLock::new();
+        let json_block_re = FENCE.get_or_init(|| Regex::new(r"(?s)```json\s*(\[.*?\]|\{.*?\})\s*```").expect("static regex"));
+        let mut fenced = Vec::new();
+        for caps in json_block_re.captures_iter(content) {
             if let Some(mat) = caps.get(1) {
-                if let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(mat.as_str()) {
-                    return calls;
+                let raw = mat.as_str();
+                if let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(raw) {
+                    fenced.extend(calls);
+                } else if let Ok(call) = serde_json::from_str::<ToolCall>(raw) {
+                    fenced.push(call);
                 }
             }
+        }
+        if !fenced.is_empty() {
+            return fenced;
         }
         if let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(content.trim()) {
             return calls;
@@ -710,6 +659,7 @@ impl ReActAgent {
             for block in sr_blocks {
                 if let Some(path) = block.file_path {
                     calls.push(ToolCall {
+                        id: String::new(),
                         tool: "search_replace".to_string(),
                         args: serde_json::json!({
                             "path": path,
@@ -727,482 +677,464 @@ impl ReActAgent {
         Vec::new()
     }
 
+
+    /// Synchronous legacy entry point (tests, scripts): runs one tool call
+    /// with a fresh yolo context rooted at the current directory.
     pub fn exec_tool(&self, call: &ToolCall) -> Result<String> {
-        match call.tool.as_str() {
-            "read_file" => {
-                let path = call.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing path"))?;
-                let offset = call.args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                let limit = call.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-                let text = fs::read_to_string(path)?;
-                let lines: Vec<&str> = text.lines().skip(offset.saturating_sub(1)).take(limit).collect();
-                Ok(lines.join("\n"))
+        let ctx = ToolContext::new(Workspace::current_dir()?, PermissionMode::Yolo);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        rt.block_on(tools::execute(&ctx, call))
+    }
+
+    // --------------------------------------------------------------- turn ----
+
+    fn tool_calls_from(&self, resp: &LlmResponse, mode: ToolMode, step: usize) -> Vec<ToolCall> {
+        let mut calls = resp.tool_calls.clone();
+        if calls.is_empty() && (mode == ToolMode::Text || resp.content.contains("```json") || resp.content.contains("<<<<<<< SEARCH")) {
+            calls = self.parse_tool_calls(&resp.content);
+        }
+        for (i, c) in calls.iter_mut().enumerate() {
+            if c.id.is_empty() {
+                c.id = format!("call_{}_{}", step + 1, i + 1);
             }
-            "write_file" => {
-                let path = call.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing path"))?;
-                let content = call.args.get("content").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing content"))?;
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    fs::create_dir_all(parent)?;
+        }
+        calls
+    }
+
+    async fn run_one_tool(ctx: &ToolContext, call: &ToolCall) -> (String, bool) {
+        if call.args.get("__invalid_json__").is_some() {
+            return (format!("Error: arguments for `{}` were not valid JSON ({}). Re-send the call with valid JSON arguments.", call.tool, call.args["__parse_error__"]), true);
+        }
+        match tools::execute(ctx, call).await {
+            Ok(out) => (out, false),
+            Err(e) => (format!("Error: {}", e), true),
+        }
+    }
+
+    /// Core loop shared by the TUI worker, the REPL and subagents.
+    pub async fn run_loop(
+        &mut self,
+        mut steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        cancel: CancellationToken,
+    ) -> TurnOutcome {
+        let mut ctx = match self.ensure_tool_ctx() {
+            Ok(c) => c,
+            Err(e) => return TurnOutcome::Failed(format!("workspace error: {}", e)),
+        };
+        ctx.events = self.event_tx.clone();
+        ctx.cancel = cancel.clone();
+        if !self.is_subagent {
+            ctx.subagents = Some(Arc::new(crate::subagent::SubagentRuntime::new(self, self.subagent_limit)));
+        }
+        self.tool_ctx = Some(ctx.clone());
+        if !self.extensions_announced && !self.is_subagent {
+            self.extensions_announced = true;
+            if let Some(m) = &ctx.mcp {
+                for line in m.ensure_started().await {
+                    self.emit(AgentEvent::Thinking(line));
                 }
-                fs::write(path, content)?;
-                Ok(format!("Successfully wrote {} bytes to {}", content.len(), path))
             }
-            "patch_file" => {
-                let path = call.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing path"))?;
-                let old_str = call.args.get("old_string").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing old_string"))?;
-                let new_str = call.args.get("new_string").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing new_string"))?;
-                let content = fs::read_to_string(path)?;
-                let patched = crate::search_replace::apply_search_replace(&content, old_str, new_str)?;
-                fs::write(path, patched)?;
-                Ok(format!("Successfully patched {}", path))
+            for e in &ctx.hooks.errors {
+                self.emit(AgentEvent::Thinking(format!("hooks: {}", e)));
             }
-            "search_replace" => {
-                let path = call.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing path"))?;
-                let search = call.args.get("search").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing search"))?;
-                let replace = call.args.get("replace").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing replace"))?;
-                let content = fs::read_to_string(path)?;
-                let patched = crate::search_replace::apply_search_replace(&content, search, replace)?;
-                fs::write(path, patched)?;
-                Ok(format!("Successfully applied search/replace to {}", path))
+            if !ctx.trusted {
+                let ignored = crate::trust::project_exec_files(ctx.workspace.root());
+                if !ignored.is_empty() {
+                    self.emit(AgentEvent::Thinking(format!("Ignoring project {} — workspace not trusted (run /trust or --trust-workspace)", ignored.join(", "))));
+                }
             }
-            "bash" => {
-                let cmd = call.args.get("command").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing command"))?;
-                let output = Command::new("sh").arg("-c").arg(cmd).output()?;
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Ok(format!("Exit: {}\nStdout:\n{}\nStderr:\n{}", output.status, stdout, stderr))
+        } else if let Some(m) = &ctx.mcp {
+            m.ensure_started().await;
+        }
+        let turn_start_tokens = self.total_usage.total_tokens;
+        let mut last_sig = String::new();
+        let mut repeats = 0usize;
+
+        for step in 0..self.max_steps.max(1) {
+            if cancel.is_cancelled() {
+                return TurnOutcome::Cancelled;
             }
-            "search_files" => {
-                let pattern = call.args.get("pattern").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Missing pattern"))?;
-                let dir = call.args.get("dir").and_then(|v| v.as_str()).unwrap_or(".");
-                let re = Regex::new(pattern)?;
-                let mut matches = Vec::new();
-                for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file() {
-                        let path = entry.path();
-                        if let Ok(content) = fs::read_to_string(path) {
-                            if re.is_match(&content) {
-                                matches.push(path.display().to_string());
+            if let Some(rx) = steering_rx.as_mut() {
+                while let Ok(steer) = rx.try_recv() {
+                    self.history.push(Message::user(format!("[Steering / mid-turn instruction from the user] {}", steer)));
+                }
+            }
+            self.emit(AgentEvent::Thinking(format!("ReAct step {} / {}", step + 1, self.max_steps)));
+
+            // auto-compact before the request would overflow
+            let repo = self.repo_context(&ctx);
+            let extra = if repo.is_empty() { String::new() } else { format!("\n\n{}", repo) };
+            let sys_est = estimate_tokens(&extra) + 2_000;
+            if (self.estimate_prompt_tokens("") + sys_est) as f64 > self.context_limit() as f64 * AUTO_COMPACT_RATIO {
+                match self.compact(true).await {
+                    Ok(Some(msg)) => self.emit(AgentEvent::Compacted(msg)),
+                    Ok(None) => {}
+                    Err(e) => self.emit(AgentEvent::Thinking(format!("auto-compact failed: {}", e))),
+                }
+            }
+
+            let mut overflow_retry = false;
+            let (resp, prov, mode) = loop {
+                let res = tokio::select! {
+                    _ = cancel.cancelled() => return TurnOutcome::Cancelled,
+                    r = self.call_model(&extra, true, Some(&cancel)) => r,
+                };
+                match res {
+                    Ok(v) => break v,
+                    Err(LlmError::ContextOverflow(m)) if !overflow_retry => {
+                        overflow_retry = true;
+                        self.emit(AgentEvent::Thinking(format!("context overflow reported by provider ({}); compacting", crate::text::truncate_chars(&m, 80))));
+                        match self.compact(true).await {
+                            Ok(Some(msg)) => self.emit(AgentEvent::Compacted(msg)),
+                            _ => return TurnOutcome::Failed(format!("context window exceeded and compaction could not help: {}", m)),
+                        }
+                    }
+                    Err(e) => {
+                        if cancel.is_cancelled() {
+                            return TurnOutcome::Cancelled;
+                        }
+                        return TurnOutcome::Failed(format!("All providers failed (primary + {} fallbacks). Last error: {}", self.fallback_chain.len(), e));
+                    }
+                }
+            };
+            self.account(&prov, &resp.usage);
+
+            let calls = self.tool_calls_from(&resp, mode, step);
+            let mut assistant = Message::assistant(resp.content.clone());
+            assistant.tool_calls = calls.clone();
+            self.history.push(assistant);
+            self.emit(AgentEvent::AssistantChunk(resp.content.clone()));
+
+            if calls.is_empty() {
+                if resp.stop_reason.as_deref() == Some("length") || resp.stop_reason.as_deref() == Some("max_tokens") {
+                    self.emit(AgentEvent::Thinking("model hit max_tokens; answer may be cut off".into()));
+                }
+                return TurnOutcome::Finished;
+            }
+
+            // loop guard: identical tool calls 3 steps in a row
+            let sig = calls.iter().map(|c| format!("{}:{}", c.tool, c.args)).collect::<Vec<_>>().join("|");
+            if sig == last_sig {
+                repeats += 1;
+            } else {
+                repeats = 0;
+                last_sig = sig;
+            }
+
+            let all_tasks = calls.len() > 1 && calls.iter().all(|c| c.tool == "task");
+            if all_tasks {
+                for c in &calls {
+                    self.emit(AgentEvent::ToolStart { tool: c.tool.clone(), args: c.args.to_string() });
+                }
+                let futs = calls.iter().map(|c| {
+                    let ctx = ctx.clone();
+                    let c = c.clone();
+                    async move { (c.clone(), Self::run_one_tool(&ctx, &c).await) }
+                });
+                let results = tokio::select! {
+                    r = futures_util::future::join_all(futs) => r,
+                    _ = cancel.cancelled() => {
+                        for c in &calls {
+                            self.history.push(Message::tool_result(c, "Cancelled by user", true));
+                        }
+                        return TurnOutcome::Cancelled;
+                    }
+                };
+                for (c, (out, is_err)) in results {
+                    self.emit(AgentEvent::ToolOutput { tool: c.tool.clone(), output: out.clone(), is_error: is_err });
+                    self.history.push(Message::tool_result(&c, out, is_err));
+                }
+            } else {
+                for (i, c) in calls.iter().enumerate() {
+                    self.emit(AgentEvent::ToolStart { tool: c.tool.clone(), args: c.args.to_string() });
+                    let (out, is_err) = if repeats >= 2 {
+                        (format!("Error: this exact `{}` call was already made {} times with the same arguments. Change approach.", c.tool, repeats + 1), true)
+                    } else {
+                        tokio::select! {
+                            r = Self::run_one_tool(&ctx, c) => r,
+                            _ = cancel.cancelled() => {
+                                for rest in &calls[i..] {
+                                    self.history.push(Message::tool_result(rest, "Cancelled by user before completion", true));
+                                }
+                                return TurnOutcome::Cancelled;
                             }
                         }
-                    }
+                    };
+                    self.emit(AgentEvent::ToolOutput { tool: c.tool.clone(), output: out.clone(), is_error: is_err });
+                    self.history.push(Message::tool_result(c, out, is_err));
                 }
-                Ok(matches.join("\n"))
             }
-            other => Err(anyhow!("Unknown tool: {}", other)),
+            let live_mode = ctx.mode();
+            if live_mode != self.permission_mode {
+                self.permission_mode = live_mode;
+            }
+            if repeats >= 3 {
+                self.history.push(Message::assistant("[Stopped: the same tool call repeated without progress.]"));
+                return TurnOutcome::LoopDetected;
+            }
+            if self.turn_token_budget > 0 && self.total_usage.total_tokens - turn_start_tokens > self.turn_token_budget {
+                return TurnOutcome::TokenBudget;
+            }
+        }
+        TurnOutcome::StepBudget
+    }
+
+    /// Drop every clone of the event sender (agent, tool context, subagent
+    /// runtime) so a front-end's `rx.recv()` loop can terminate.
+    pub fn detach_events(&mut self) {
+        self.event_tx = None;
+        if let Some(ctx) = self.tool_ctx.as_mut() {
+            ctx.events = None;
+            ctx.subagents = None;
         }
     }
 
-    pub async fn step(&mut self, input: &str) -> Result<()> {
-        if input.trim().is_empty() {
-            return Ok(());
+    fn sync_event(&self) -> AgentEvent {
+        AgentEvent::HistorySync {
+            history: self.history.clone(),
+            total_usage: self.total_usage.clone(),
+            last_usage: self.last_usage.clone(),
+            total_calls: self.total_calls,
         }
-
-        if input.starts_with('/') {
-            match input.trim() {
-                "/help" => {
-                    println!("Slash commands:");
-                    println!("  /help     - Show this help summary");
-                    println!("  /clear    - Clear conversation memory");
-                    println!("  /exit     - Exit REPL session");
-                    return Ok(());
-                }
-                "/clear" => {
-                    self.history.clear();
-                    println!("Session context cleared.");
-                    return Ok(());
-                }
-                "/exit" => {
-                    println!("Goodbye.");
-                    std::process::exit(0);
-                }
-                cmd => {
-                    println!("Unknown command: {}", cmd);
-                    return Ok(());
-                }
-            }
-        }
-
-        self.add_user(input);
-
-        let mut current_prompt = input.to_string();
-        for _ in 0..5 {
-            println!("Thinking...");
-            let response = self.call_llm(&current_prompt).await?;
-            let tool_calls = self.parse_tool_calls(&response);
-
-            if tool_calls.is_empty() {
-                println!("\n{}\n", response);
-                self.add_assistant(&response);
-                break;
-            } else {
-                println!("\n{}\n", response);
-                self.add_assistant(&response);
-
-                let mut tool_results = Vec::new();
-                for call in tool_calls {
-                    println!("[Tool: {}] Args: {}", call.tool, call.args);
-                    match self.exec_tool(&call) {
-                        Ok(res) => {
-                            println!("[Tool Result]:\n{}", res);
-                            tool_results.push(format!("Tool '{}' output:\n{}", call.tool, res));
-                        }
-                        Err(e) => {
-                            println!("[Tool Error]: {}", e);
-                            tool_results.push(format!("Tool '{}' error: {}", call.tool, e));
-                        }
-                    }
-                }
-                current_prompt = format!("Observation/Tool Results:\n{}", tool_results.join("\n\n"));
-            }
-        }
-
-        Ok(())
     }
 
-    /// Non-blocking ReAct turn worker. Intended to be spawned on the Tokio
-    /// runtime so that the synchronous TUI event loop can keep rendering and
-    /// ingesting keys. Streams events through `events`, accepts mid-turn
-    /// steering instructions through `steering_rx`, and is aborted
-    /// immediately by `cancel`.
+    /// Non-blocking ReAct turn worker for front-ends. Streams events through
+    /// `events`, accepts mid-turn steering through `steering_rx`, aborted by `cancel`.
     pub async fn run_turn(
         &mut self,
         prompt: String,
         events: AgentEvents,
-        mut steering_rx: mpsc::UnboundedReceiver<String>,
+        steering_rx: mpsc::UnboundedReceiver<String>,
         cancel: CancellationToken,
     ) {
         let started = Instant::now();
         self.event_tx = Some(events.clone());
         self.add_user(&prompt);
-        let mut current_prompt = prompt;
-
-        for step in 0..5 {
-            if cancel.is_cancelled() {
+        let turn_usage_start = self.total_usage.clone();
+        let outcome = self.run_loop(Some(steering_rx), cancel).await;
+        if self.autosave {
+            let _ = self.save_session(&crate::sessions::SessionStore::open_default());
+        }
+        let mut turn_usage = self.total_usage.clone();
+        turn_usage.prompt_tokens -= turn_usage_start.prompt_tokens;
+        turn_usage.completion_tokens -= turn_usage_start.completion_tokens;
+        turn_usage.total_tokens -= turn_usage_start.total_tokens;
+        match outcome {
+            TurnOutcome::Cancelled => {
+                let _ = events.send(self.sync_event());
                 let _ = events.send(AgentEvent::Cancelled);
-                return;
             }
-
-            // Mid-run steering: fold any pending instruction into this step.
-            while let Ok(steer) = steering_rx.try_recv() {
-                self.add_user(&format!("[Steering / Mid-turn] {}", steer));
-                current_prompt = format!(
-                    "{}\n\n[Steering / Mid-turn] Incorporate this user instruction into your next reasoning step:\n{}",
-                    current_prompt, steer
-                );
+            TurnOutcome::Failed(e) => {
+                let _ = events.send(self.sync_event());
+                let _ = events.send(AgentEvent::Error(e));
             }
-
-            let _ = events.send(AgentEvent::Thinking(format!("ReAct step {} / 5", step + 1)));
-
-            let call = async {
-                self.call_llm(&current_prompt).await
-            };
-            let response = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let _ = events.send(AgentEvent::Cancelled);
-                    return;
+            other => {
+                if other != TurnOutcome::Finished {
+                    let note = match other {
+                        TurnOutcome::StepBudget => format!("⏸ Reached the step budget ({} ReAct steps). Send 'lanjut' / 'continue' to keep going.", self.max_steps),
+                        TurnOutcome::LoopDetected => "⏸ Stopped: the agent repeated the same tool call without progress.".into(),
+                        TurnOutcome::TokenBudget => "⏸ Stopped: token budget for this turn exhausted.".into(),
+                        _ => String::new(),
+                    };
+                    let _ = events.send(AgentEvent::AssistantChunk(note));
                 }
-                res = call => res,
-            };
-
-            match response {
-                Ok(resp) => {
-                    let tool_calls = self.parse_tool_calls(&resp);
-
-                    if tool_calls.is_empty() {
-                        self.add_assistant(&resp);
-                        let _ = events.send(AgentEvent::AssistantChunk(resp));
-                        let _ = events.send(AgentEvent::TurnFinished {
-                            usage: self.last_usage.clone(),
-                            total_calls: self.total_calls,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            history: self.history.clone(),
-                            total_usage: self.total_usage.clone(),
-                            last_usage: self.last_usage.clone(),
-                        });
-                        return;
-                    }
-
-                    self.add_assistant(&resp);
-                    let _ = events.send(AgentEvent::AssistantChunk(resp));
-
-                    let mut tool_results = Vec::new();
-                    for call in &tool_calls {
-                        let args_str = serde_json::to_string(&call.args).unwrap_or_default();
-                        let _ = events.send(AgentEvent::ToolStart {
-                            tool: call.tool.clone(),
-                            args: args_str,
-                        });
-
-                        let tool = call.clone();
-                        let tool_cancel = cancel.clone();
-                        let tool_name = tool.tool.clone();
-                        let exec_result: Result<String> = tokio::select! {
-                            _ = tool_cancel.cancelled() => Err(anyhow!("Cancelled by user")),
-                            res = tokio::task::spawn_blocking(move || {
-                                // exec_tool is a sync fn; call it on the blocking pool.
-                                ReActAgent::exec_tool_static(&tool)
-                            }) => match res {
-                                Ok(inner) => inner,
-                                Err(join_err) => Err(anyhow!("Join error: {}", join_err)),
-                            },
-                        };
-
-                        match exec_result {
-                            Ok(out) => {
-                                let _ = events.send(AgentEvent::ToolOutput {
-                                    tool: tool_name.clone(),
-                                    output: out.clone(),
-                                    is_error: false,
-                                });
-                                tool_results.push(format!("Tool '{}' output:\n{}", tool_name, out));
-                            }
-                            Err(e) => {
-                                let _ = events.send(AgentEvent::ToolOutput {
-                                    tool: tool_name.clone(),
-                                    output: e.to_string(),
-                                    is_error: true,
-                                });
-                                tool_results.push(format!("Tool '{}' error: {}", tool_name, e));
-                            }
-                        }
-                    }
-
-                    current_prompt = format!("Observation/Tool Results:\n{}", tool_results.join("\n\n"));
-                }
-                Err(e) => {
-                    let _ = events.send(AgentEvent::Error(e.to_string()));
-                    return;
-                }
+                let _ = events.send(AgentEvent::TurnFinished {
+                    usage: turn_usage,
+                    total_calls: self.total_calls,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    history: self.history.clone(),
+                    total_usage: self.total_usage.clone(),
+                    last_usage: self.last_usage.clone(),
+                });
             }
         }
-
-        // Exhausted step budget: emit whatever we have.
-        let _ = events.send(AgentEvent::TurnFinished {
-            usage: self.last_usage.clone(),
-            total_calls: self.total_calls,
-            duration_ms: started.elapsed().as_millis() as u64,
-            history: self.history.clone(),
-            total_usage: self.total_usage.clone(),
-            last_usage: self.last_usage.clone(),
-        });
+        self.detach_events();
     }
+}
 
-    /// `exec_tool` runs on the blocking pool; a small static shim lets the
-    /// spawned task call it without needing a live `&self`.
-    fn exec_tool_static(call: &ToolCall) -> Result<String> {
-        let agent = Self {
-            client: Client::new(),
-            ..Default::default()
-        };
-        agent.exec_tool(call)
+// ------------------------------------------------------------------ REPL ----
+
+fn print_event(ev: &AgentEvent, streamed: &mut bool) {
+    match ev {
+        AgentEvent::Thinking(s) => eprintln!("\x1b[2m· {}\x1b[0m", s),
+        AgentEvent::AssistantDelta(d) => {
+            *streamed = true;
+            print!("{}", d);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+        AgentEvent::AssistantChunk(c) => {
+            if !*streamed && !c.is_empty() {
+                println!("{}", c);
+            } else if *streamed {
+                println!();
+            }
+            *streamed = false;
+        }
+        AgentEvent::ToolStart { tool, args } => println!("\x1b[36m⚙ {}\x1b[0m {}", tool, crate::text::truncate_chars(args, 160)),
+        AgentEvent::ToolOutput { output, is_error, .. } => {
+            let color = if *is_error { "31" } else { "2" };
+            println!("\x1b[{}m{}\x1b[0m", color, clamp_output(output, 2_000, 25));
+        }
+        AgentEvent::Compacted(m) => println!("\x1b[33m🗜 {}\x1b[0m", m),
+        AgentEvent::Subagent { id, description, status } => println!("\x1b[35m⑂ subagent #{} {} — {:?}\x1b[0m", id, description, status),
+        AgentEvent::Error(e) => eprintln!("\x1b[31mError: {}\x1b[0m", e),
+        AgentEvent::Cancelled => println!("[cancelled]"),
+        AgentEvent::TurnFinished { usage, duration_ms, .. } => {
+            println!("\x1b[2m— {} tokens{} · {:.1}s\x1b[0m", usage.total_tokens, if usage.estimated { " (est.)" } else { "" }, *duration_ms as f64 / 1000.0)
+        }
+        AgentEvent::Todos(t) => {
+            for e in t {
+                let mark = match e.status.as_str() { "completed" => "☑", "in_progress" => "▸", _ => "☐" };
+                println!("\x1b[2m{} {}\x1b[0m", mark, e.content);
+            }
+        }
+        AgentEvent::ModeChanged(m) => println!("\x1b[33m🔐 permission mode → {}\x1b[0m", m.label()),
+        AgentEvent::ApprovalRequired(_) | AgentEvent::HistorySync { .. } => {}
+    }
+}
+
+fn ask_approval_stdin(t: &crate::events::ApprovalTicket) -> ApprovalDecision {
+    use std::io::{BufRead, Write};
+    println!("\n\x1b[1;33m⚠ Approval needed:\x1b[0m {}", t.request.summary);
+    if let Some(d) = &t.request.diff {
+        for l in clamp_output(d, 12_000, 200).lines() {
+            let c = if l.starts_with('+') && !l.starts_with("+++") { "32" } else if l.starts_with('-') && !l.starts_with("---") { "31" } else if l.starts_with("@@") { "36" } else { "0" };
+            println!("\x1b[{}m{}\x1b[0m", c, l);
+        }
+    }
+    print!("[y] yes  [a] always (this session)  [n] no  › ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" | "ya" => ApprovalDecision::Approve,
+        "a" | "always" => ApprovalDecision::ApproveAlways,
+        other => ApprovalDecision::Reject(if other.is_empty() || other == "n" || other == "no" { None } else { Some(other.to_string()) }),
     }
 }
 
 pub async fn run() -> Result<()> {
-    println!("CACode Sovereign ReAct Agent Chat REPL");
-    println!("Type /help for slash commands or /exit to quit.\n");
+    use reedline::{DefaultPrompt, FileBackedHistory, Reedline, Signal};
+    println!("CACode {} — Sovereign ReAct Agent REPL", CA_VERSION);
+    println!("Type /help for commands, Ctrl+D to quit.\n");
 
+    let cfg = crate::config::CaCodeConfig::load().unwrap_or_default();
+    let mut agent = ReActAgent::with_credentials(Credentials::from_config(&cfg));
+    if let Some(m) = PermissionMode::parse(&cfg.permission_mode) {
+        agent.permission_mode = m;
+    }
+    agent.subagent_limit = if cfg.is_pro() { 49 } else { 5 };
+    agent.sandbox = cfg.sandbox_config();
+    agent.web_allow_domains = cfg.web_allow_domains.clone();
+    let hist_path = dirs::home_dir().unwrap_or_default().join(".cacode").join("repl_history.txt");
+    let _ = std::fs::create_dir_all(hist_path.parent().unwrap_or(std::path::Path::new(".")));
     let mut line_editor = Reedline::create();
+    if let Ok(h) = FileBackedHistory::with_file(5_000, hist_path) {
+        line_editor = line_editor.with_history(Box::new(h));
+    }
     let prompt = DefaultPrompt::default();
-    let mut agent = ReActAgent::new();
 
     loop {
         let sig = line_editor.read_line(&prompt);
-        match sig {
-            Ok(Signal::Success(buffer)) => {
-                if let Err(e) = agent.step(&buffer).await {
-                    eprintln!("Error: {}", e);
-                }
-            }
-            Ok(Signal::CtrlC) => {
-                println!("\n(Interrupted. Type /exit to quit)");
-            }
-            Ok(Signal::CtrlD) => {
-                println!("\nExiting CACode REPL.");
-                break;
-            }
-            Ok(_) => {}
+        let buffer = match sig {
+            Ok(Signal::Success(b)) => b,
+            Ok(Signal::CtrlC) => continue,
+            Ok(Signal::CtrlD) => break,
+            Ok(_) => continue,
             Err(err) => {
                 eprintln!("REPL Error: {}", err);
                 break;
             }
+        };
+        let input: String = buffer.trim().to_string();
+        let input = input.as_str();
+        if input.is_empty() {
+            continue;
+        }
+        match input.split_whitespace().next().unwrap_or("") {
+            "/help" => {
+                println!("/clear  /compress  /undo  /mode <ask|auto-edit|yolo|read-only>  /exit");
+                continue;
+            }
+            "/clear" => {
+                agent.history.clear();
+                println!("Session context cleared.");
+                continue;
+            }
+            "/exit" | "/quit" => break,
+            "/compress" => {
+                match agent.compress_history().await {
+                    Ok(m) => println!("{}", m),
+                    Err(e) => eprintln!("Compression failed: {}", e),
+                }
+                continue;
+            }
+            "/undo" => {
+                match agent.ensure_tool_ctx().and_then(|c| c.undo.undo_last()) {
+                    Ok(m) => println!("{}", m),
+                    Err(e) => eprintln!("{}", e),
+                }
+                continue;
+            }
+            "/mode" => {
+                match input.split_whitespace().nth(1).and_then(PermissionMode::parse) {
+                    Some(m) => {
+                        agent.permission_mode = m;
+                        println!("Permission mode: {}", m.label());
+                    }
+                    None => println!("Permission mode: {} (usage: /mode ask|auto-edit|yolo|read-only)", agent.permission_mode.label()),
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        let ctrlc = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                c2.cancel();
+            }
+        });
+        let mut worker = agent.clone();
+        let owned = input_owned(input);
+        let handle = tokio::spawn(async move {
+            worker.run_turn(owned, tx, steer_rx, cancel).await;
+            worker.detach_events();
+            worker
+        });
+        let mut streamed = false;
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::ApprovalRequired(t) = &ev {
+                let t = t.clone();
+                let d = tokio::task::spawn_blocking(move || {
+                    let d = ask_approval_stdin(&t);
+                    t.respond(d.clone());
+                    d
+                })
+                .await;
+                if d.is_err() {
+                    break;
+                }
+                continue;
+            }
+            print_event(&ev, &mut streamed);
+        }
+        ctrlc.abort();
+        if let Ok(w) = handle.await {
+            agent = w;
         }
     }
-
+    println!("Exiting CACode REPL.");
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_detect_provider_antigravity() {
-        env::remove_var("ANTHROPIC_API_KEY");
-        env::remove_var("OPENAI_API_KEY");
-        env::set_var("ANTIGRAVITY_API_KEY", "zen-test-key");
-        env::set_var("ANTIGRAVITY_ZEN_MODEL", "mimo-v2.5-free");
-
-        let p = ReActAgent::detect_provider();
-        match p {
-            Provider::AntigravityZen { model } => {
-                assert_eq!(model, "mimo-v2.5-free");
-            }
-            _ => panic!("Expected Provider::AntigravityZen, got {:?}", p),
-        }
-
-        env::remove_var("ANTIGRAVITY_API_KEY");
-        env::remove_var("ANTIGRAVITY_ZEN_MODEL");
-    }
-
-    #[test]
-    fn test_extract_response_content_openai_format() {
-        let json_body = r#"{
-            "id": "chatcmpl-test",
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": "Hello from Zen model!"
-                    }
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 12,
-                "completion_tokens": 8,
-                "total_tokens": 20
-            }
-        }"#;
-
-        let (content, usage) = ReActAgent::extract_response_content(json_body).unwrap();
-        assert_eq!(content, "Hello from Zen model!");
-        assert_eq!(usage.prompt_tokens, 12);
-        assert_eq!(usage.completion_tokens, 8);
-        assert_eq!(usage.total_tokens, 20);
-    }
-
-    #[test]
-    fn test_parse_tool_calls_json() {
-        let agent = ReActAgent::new();
-        let content = "```json\n[\n  {\"tool\": \"read_file\", \"args\": {\"path\": \"src/main.rs\"}}\n]\n```";
-        let calls = agent.parse_tool_calls(content);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool, "read_file");
-        assert_eq!(calls[0].args["path"], "src/main.rs");
-    }
-
-    #[test]
-    fn test_parse_tool_calls_aider_search_replace_autodetect() {
-        let agent = ReActAgent::new();
-        let content = r#"
-Here is the patch you requested:
-
-crates/cacode-core/src/lib.rs
-<<<<<<< SEARCH
-pub mod commands;
-=======
-pub mod commands;
-pub mod search_replace;
->>>>>>> REPLACE
-"#;
-        let calls = agent.parse_tool_calls(content);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool, "search_replace");
-        assert_eq!(calls[0].args["path"], "crates/cacode-core/src/lib.rs");
-        assert_eq!(calls[0].args["search"], "pub mod commands;\n");
-        assert_eq!(calls[0].args["replace"], "pub mod commands;\npub mod search_replace;\n");
-    }
-
-    #[test]
-    fn test_exec_tool_search_replace_and_patch_file() {
-        let agent = ReActAgent::new();
-        let temp_dir = std::env::temp_dir().join(format!("cacode_chat_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        fs::create_dir_all(&temp_dir).unwrap();
-        let test_file = temp_dir.join("test.txt");
-        fs::write(&test_file, "hello   \nworld\n").unwrap();
-
-        // Test patch_file with whitespace tolerance (content has trailing spaces on hello)
-        let patch_call = ToolCall {
-            tool: "patch_file".into(),
-            args: serde_json::json!({
-                "path": test_file.to_string_lossy(),
-                "old_string": "hello\nworld\n",
-                "new_string": "greetings\nworld\n",
-            }),
-        };
-        let res = agent.exec_tool(&patch_call).unwrap();
-        assert!(res.contains("Successfully patched"));
-        assert_eq!(fs::read_to_string(&test_file).unwrap(), "greetings\nworld\n");
-
-        // Test search_replace tool
-        let sr_call = ToolCall {
-            tool: "search_replace".into(),
-            args: serde_json::json!({
-                "path": test_file.to_string_lossy(),
-                "search": "greetings",
-                "replace": "welcome",
-            }),
-        };
-        let res2 = agent.exec_tool(&sr_call).unwrap();
-        assert!(res2.contains("Successfully applied search/replace"));
-        assert_eq!(fs::read_to_string(&test_file).unwrap(), "welcome\nworld\n");
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_custom_provider_display_and_helpers() {
-        let p = Provider::Custom {
-            name: "Xiaomi DeepSeek".into(),
-            base_url: "https://api.xiaomi.com/v1".into(),
-            api_key: "xm-key".into(),
-            model: "deepseek-v3".into(),
-        };
-        assert_eq!(p.name(), "Xiaomi DeepSeek");
-        assert_eq!(p.model(), "deepseek-v3");
-        assert_eq!(p.display_label(), "Xiaomi DeepSeek (deepseek-v3)");
-
-        // Serialization
-        let serialized = serde_json::to_string(&p).unwrap();
-        let deserialized: Provider = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized, p);
-    }
-
-    #[tokio::test]
-    async fn test_fallback_chain_failover_event_logging() {
-        let mut agent = ReActAgent::new();
-        agent.max_retries = 1;
-        // Primary provider points to an invalid/unreachable host
-        agent.provider = Provider::Custom {
-            name: "FailingPrimary".into(),
-            base_url: "http://127.0.0.1:59998".into(),
-            api_key: "dummy".into(),
-            model: "fail-model".into(),
-        };
-        // Fallback tier 1 also unreachable
-        let fallback_1 = Provider::Custom {
-            name: "FailingFallback1".into(),
-            base_url: "http://127.0.0.1:59999".into(),
-            api_key: "dummy".into(),
-            model: "fail-fb1".into(),
-        };
-        agent.fallback_chain = vec![fallback_1];
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        agent.event_tx = Some(tx);
-
-        let res = agent.call_llm("test failover").await;
-        assert!(res.is_err(), "Expected error when all providers fail");
-
-        // Verify failover event was emitted
-        let mut received_failover_event = false;
-        while let Ok(evt) = rx.try_recv() {
-            if let AgentEvent::Thinking(ref msg) = evt {
-                if msg.contains("FailingPrimary failed") && msg.contains("Fallback Tier 1") {
-                    received_failover_event = true;
-                }
-            }
-        }
-        assert!(received_failover_event, "Failover event should be logged when primary fails");
-    }
+fn input_owned(s: &str) -> String {
+    s.to_string()
 }
+
+#[cfg(test)]
+mod tests;
