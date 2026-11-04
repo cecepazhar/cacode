@@ -1,16 +1,11 @@
 use anyhow::Result;
-use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     backend::CrosstermBackend,
-    buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Row, Table, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use rusqlite::Connection;
@@ -29,165 +24,14 @@ use cacode_core::permission::PermissionMode;
 use cacode_core::text::truncate_chars;
 use crate::config::{CaCodeConfig, CustomProviderConfig};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThemePreset {
-    Classic,
-    TokyoNight,
-    Nord,
-    OneDark,
-    HighContrast,
-    Light,
-}
+/// Theme objects come from CATUI (shared CA Family TUI kit). Legacy names
+/// (`classic`, `tokyo`, `nord`, `onedark`, `contrast`, `light`) still resolve.
+pub use catui::{Theme, ThemePreset};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Theme {
-    pub preset: ThemePreset,
-    pub name: &'static str,
-    pub bg: Color,
-    pub card_bg: Color,
-    pub pill_bg: Color,
-    pub accent: Color,
-    pub accent_dim: Color,
-    pub text: Color,
-    pub text_soft: Color,
-    pub muted: Color,
-    pub border: Color,
-    pub success: Color,
-    pub warning: Color,
-    pub error: Color,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self::classic()
-    }
-}
-
-impl Theme {
-    pub fn classic() -> Self {
-        Self {
-            preset: ThemePreset::Classic,
-            name: "Classic",
-            bg: Color::Rgb(5, 8, 15),
-            card_bg: Color::Rgb(11, 17, 32),
-            pill_bg: Color::Rgb(10, 16, 32),
-            accent: Color::Rgb(59, 130, 246),
-            accent_dim: Color::Rgb(6, 182, 212),
-            text: Color::Rgb(248, 250, 252),
-            text_soft: Color::Rgb(226, 232, 240),
-            muted: Color::Rgb(100, 116, 139),
-            border: Color::Rgb(30, 41, 59),
-            success: Color::Rgb(34, 197, 94),
-            warning: Color::Rgb(245, 158, 11),
-            error: Color::Rgb(239, 68, 68),
-        }
-    }
-
-    pub fn tokyo_night() -> Self {
-        Self {
-            preset: ThemePreset::TokyoNight,
-            name: "TokyoNight",
-            bg: Color::Rgb(26, 27, 38),
-            card_bg: Color::Rgb(31, 35, 53),
-            pill_bg: Color::Rgb(36, 40, 59),
-            accent: Color::Rgb(122, 162, 247),
-            accent_dim: Color::Rgb(187, 154, 247),
-            text: Color::Rgb(192, 202, 245),
-            text_soft: Color::Rgb(169, 177, 214),
-            muted: Color::Rgb(86, 95, 137),
-            border: Color::Rgb(59, 66, 97),
-            success: Color::Rgb(158, 206, 106),
-            warning: Color::Rgb(224, 175, 104),
-            error: Color::Rgb(247, 118, 142),
-        }
-    }
-
-    pub fn nord() -> Self {
-        Self {
-            preset: ThemePreset::Nord,
-            name: "Nord",
-            bg: Color::Rgb(46, 52, 64),
-            card_bg: Color::Rgb(59, 66, 82),
-            pill_bg: Color::Rgb(67, 76, 94),
-            accent: Color::Rgb(136, 192, 208),
-            accent_dim: Color::Rgb(129, 161, 193),
-            text: Color::Rgb(236, 239, 244),
-            text_soft: Color::Rgb(229, 233, 240),
-            muted: Color::Rgb(100, 116, 139),
-            border: Color::Rgb(76, 86, 106),
-            success: Color::Rgb(163, 190, 140),
-            warning: Color::Rgb(235, 203, 139),
-            error: Color::Rgb(191, 97, 106),
-        }
-    }
-
-    pub fn one_dark() -> Self {
-        Self {
-            preset: ThemePreset::OneDark,
-            name: "OneDark",
-            bg: Color::Rgb(33, 37, 43),
-            card_bg: Color::Rgb(40, 44, 52),
-            pill_bg: Color::Rgb(44, 49, 58),
-            accent: Color::Rgb(97, 175, 239),
-            accent_dim: Color::Rgb(198, 120, 221),
-            text: Color::Rgb(171, 178, 191),
-            text_soft: Color::Rgb(220, 223, 228),
-            muted: Color::Rgb(92, 99, 112),
-            border: Color::Rgb(62, 68, 81),
-            success: Color::Rgb(152, 195, 121),
-            warning: Color::Rgb(229, 192, 123),
-            error: Color::Rgb(224, 108, 117),
-        }
-    }
-
-    pub fn high_contrast() -> Self {
-        Self {
-            preset: ThemePreset::HighContrast,
-            name: "HighContrast",
-            bg: Color::Rgb(0, 0, 0),
-            card_bg: Color::Rgb(10, 10, 10),
-            pill_bg: Color::Rgb(23, 23, 23),
-            accent: Color::Rgb(250, 204, 21),
-            accent_dim: Color::Rgb(255, 255, 255),
-            text: Color::Rgb(255, 255, 255),
-            text_soft: Color::Rgb(245, 245, 245),
-            muted: Color::Rgb(163, 163, 163),
-            border: Color::Rgb(250, 204, 21),
-            success: Color::Rgb(74, 222, 128),
-            warning: Color::Rgb(250, 204, 21),
-            error: Color::Rgb(248, 113, 113),
-        }
-    }
-
-    pub fn light() -> Self {
-        Self {
-            preset: ThemePreset::Light,
-            name: "Light",
-            bg: Color::Rgb(248, 250, 252),
-            card_bg: Color::Rgb(255, 255, 255),
-            pill_bg: Color::Rgb(241, 245, 249),
-            accent: Color::Rgb(37, 99, 235),
-            accent_dim: Color::Rgb(2, 132, 199),
-            text: Color::Rgb(15, 23, 42),
-            text_soft: Color::Rgb(51, 65, 85),
-            muted: Color::Rgb(100, 116, 139),
-            border: Color::Rgb(203, 213, 225),
-            success: Color::Rgb(22, 163, 74),
-            warning: Color::Rgb(217, 119, 6),
-            error: Color::Rgb(220, 38, 38),
-        }
-    }
-
-    pub fn from_name(name: &str) -> Self {
-        match name.trim().to_lowercase().as_str() {
-            "tokyo" | "tokyonight" | "tokyo-night" => Self::tokyo_night(),
-            "nord" => Self::nord(),
-            "onedark" | "one-dark" => Self::one_dark(),
-            "contrast" | "highcontrast" | "high-contrast" => Self::high_contrast(),
-            "light" => Self::light(),
-            _ => Self::classic(),
-        }
-    }
+/// Resolve a theme for CACode; unknown names fall back to `midnight`
+/// (CACode's historical "classic" look).
+pub fn cacode_theme(name: &str) -> Theme {
+    Theme::from_name_or(name, ThemePreset::Midnight).for_app("cacode").adapted()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,11 +104,6 @@ pub fn build_fallback_chain(config: &CaCodeConfig) -> Vec<Provider> {
     chain
 }
 
-const BRAND: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
-const TEXT: Color = Color::White;
-const GRAY: Color = Color::Rgb(180, 180, 190);
-const BG_BLACK: Color = Color::Rgb(0, 0, 0);
 
 const LOGO: &[&str] = &[
     r"  ██████╗ █████╗  ██████╗ ██████╗ ██████╗ ███████╗",
@@ -304,7 +143,6 @@ pub fn short_name(name: &str) -> String {
     }
 }
 
-const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/models", "Interactive AI model picker"),
@@ -355,38 +193,6 @@ const THINKING_MODES: &[(&str, &str)] = &[
     ("Analytical", "🔍 Multi-step analytical reasoning & verification"),
     ("Deep", "🧠 Deep cognitive reasoning & edge-case proofs"),
 ];
-
-#[allow(dead_code)]
-struct BorderlessLayout {
-    divider_y: Option<u16>,
-}
-
-#[allow(dead_code)]
-impl BorderlessLayout {
-    fn new() -> Self { Self { divider_y: None } }
-    fn with_divider(mut self, y: u16) -> Self { self.divider_y = Some(y); self }
-    fn inner(&self, area: Rect) -> Rect { area }
-}
-
-impl Widget for BorderlessLayout {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 2 || area.height < 2 { return; }
-        let x1 = area.x;
-        let x2 = area.x + area.width.saturating_sub(1);
-        let y1 = area.y;
-        let style = Style::default().fg(DIM);
-
-        // Render subtle horizontal divider above input prompt
-        if let Some(dy) = self.divider_y {
-            let div_y = y1 + dy;
-            if div_y > y1 && div_y < y1 + area.height {
-                for x in x1..=x2 {
-                    buf.set_string(x, div_y, "─", style);
-                }
-            }
-        }
-    }
-}
 
 #[derive(Clone)]
 struct ChatMessage {
@@ -952,7 +758,7 @@ impl App {
     fn new(config: CaCodeConfig) -> Self {
         let settings = Self::build_settings(&config);
         let session = ChatSession::new(default_session_name(0), &config);
-        let theme = Theme::from_name(&config.theme);
+        let theme = cacode_theme(&config.theme);
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let mut app = Self {
             active_page: 0,
@@ -1775,11 +1581,11 @@ impl App {
     }
 }
 
-/// Restore the terminal (raw mode, alternate screen, paste mode).
-pub fn restore_terminal() {
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
-}
+/// Terminal options for CACode: alt screen + bracketed paste, no mouse
+/// capture (keeps native text selection in the chat).
+pub const TERMINAL_OPTIONS: catui::terminal::TerminalOptions =
+    catui::terminal::TerminalOptions { mouse: false, bracketed_paste: true, alternate_screen: true };
+
 
 #[derive(Default)]
 pub struct TuiOptions {
@@ -1827,18 +1633,10 @@ impl App {
 pub async fn run_tui(opts: TuiOptions) -> Result<()> {
     let config = CaCodeConfig::load().unwrap_or_default();
 
-    // A panic anywhere must never leave the user's terminal in raw mode.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        default_hook(info);
-    }));
-
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // CATUI TerminalSession: raw mode + alt screen + paste, restored on drop
+    // and on panic (a panic must never leave the terminal in raw mode).
+    let mut session = catui::terminal::TerminalSession::enter(TERMINAL_OPTIONS)?;
+    let terminal = &mut session.terminal;
 
     let mut app = App::new(config);
     if let Some(m) = opts.permission_mode {
@@ -1852,10 +1650,9 @@ pub async fn run_tui(opts: TuiOptions) -> Result<()> {
     if let Some(rec) = opts.resume {
         app.resume_into_active(rec);
     }
-    let result = event_loop(&mut terminal, &mut app).await;
+    let result = event_loop(terminal, &mut app).await;
 
-    restore_terminal();
-    let _ = terminal.show_cursor();
+    session.restore()?;
     result
 }
 
@@ -1874,17 +1671,17 @@ async fn event_loop(
             app.spinner_frame += 1;
         }
         if event::poll(std::time::Duration::from_millis(50))? {
-            let ev = event::read()?;
-            if let Event::Paste(text) = &ev {
+            // catui::event::map drops key-release events (Windows).
+            let Some(ev) = catui::event::map(event::read()?) else {
+                continue;
+            };
+            if let catui::event::AppEvent::Paste(text) = &ev {
                 if app.active_page == 0 {
                     handle_paste(app, text);
                 }
                 continue;
             }
-            if let Event::Key(key) = ev {
-                if key.kind == crossterm::event::KeyEventKind::Release {
-                    continue;
-                }
+            if let catui::event::AppEvent::Key(key) = ev {
                 if handle_global_key(app, key) {
                     continue;
                 }
@@ -2713,12 +2510,17 @@ async fn handle_chat_key(
                             app.session_mut().messages.push(ChatMessage::plain(
                                 "system",
                                 format!(
-                                    "Available Themes:\n  • classic      - CACode near-black, vivid blue, cyan\n  • tokyo        - Deep indigo/purple, cyan/blue, magenta, soft green\n  • nord         - Arctic slate-blue, frost blue, ice cyan, snow white\n  • onedark      - Atom dark gray, blue, purple, amber\n  • contrast     - High-contrast pure black, stark bright yellow, white\n  • light        - Paper slate, dark text, royal blue, border\n\nActive Theme: {}\nUsage: /theme <classic|tokyo|nord|onedark|contrast|light>",
+                                    "Available Themes (CATUI):\n{}\n\nActive Theme: {}\nUsage: /theme <name>   (legacy: classic, tokyo, onedark, contrast, light)",
+                                    ThemePreset::ALL
+                                        .iter()
+                                        .map(|p| format!("  • {:<14} {}", p.id(), p.label()))
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
                                     current_theme
                                 ),
                             ));
                         } else {
-                            let new_theme = Theme::from_name(arg);
+                            let new_theme = cacode_theme(arg);
                             app.theme = new_theme;
                             app.config.theme = arg.to_lowercase();
                             let _ = app.config.save();
@@ -3468,14 +3270,14 @@ fn draw_page_tabs(f: &mut Frame, app: &App, area: Rect) {
         let style = if i == app.active_page {
             Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme.muted)
+            Style::default().fg(theme.text_muted)
         };
         spans.push(Span::styled(format!("{}:{} ", i + 1, name), style));
         if i < PAGE_NAMES.len() - 1 {
             spans.push(Span::styled("┃ ", Style::default().fg(theme.border)));
         }
     }
-    spans.push(Span::styled("│ [Ctrl+1..5 / F1..F5 / ⇆ Tab]", Style::default().fg(theme.muted)));
+    spans.push(Span::styled("│ [Ctrl+1..5 / F1..F5 / ⇆ Tab]", Style::default().fg(theme.text_muted)));
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg)), area);
 }
 
@@ -3496,7 +3298,7 @@ fn format_session_tabs_spans<'a>(app: &'a App, width: u16) -> Vec<Span<'a>> {
         } else {
             left_spans.push(Span::styled(
                 format!("{} ", label),
-                Style::default().fg(theme.muted),
+                Style::default().fg(theme.text_muted),
             ));
         }
         if i < app.sessions.len() - 1 || app.sessions.len() < MAX_SESSIONS {
@@ -3504,11 +3306,11 @@ fn format_session_tabs_spans<'a>(app: &'a App, width: u16) -> Vec<Span<'a>> {
         }
     }
     if app.sessions.len() < MAX_SESSIONS {
-        left_spans.push(Span::styled("+ (Ctrl+T) ", Style::default().fg(theme.accent_dim)));
+        left_spans.push(Span::styled("+ (Ctrl+T) ", Style::default().fg(theme.accent_alt)));
     }
 
     let right_spans = vec![
-        Span::styled("[Tab / ⇆ Switch · Ctrl+W Close] ", Style::default().fg(theme.muted)),
+        Span::styled("[Tab / ⇆ Switch · Ctrl+W Close] ", Style::default().fg(theme.text_muted)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.width()).sum();
@@ -3551,7 +3353,7 @@ fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
     for row in WELCOME_LINES {
         if row.contains("Sovereign") {
             let mut spans = vec![
-                Span::styled(*row, Style::default().fg(theme.accent_dim).add_modifier(Modifier::BOLD)),
+                Span::styled(*row, Style::default().fg(theme.accent_alt).add_modifier(Modifier::BOLD)),
             ];
             if app.is_pro() {
                 spans.push(Span::styled("  [⭐ PRO ACTIVE]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
@@ -3560,7 +3362,7 @@ fn draw_welcome(f: &mut Frame, app: &App, area: Rect) {
         } else if row.starts_with("  •") {
             lines.push(Line::from(Span::styled(*row, Style::default().fg(theme.text_soft))));
         } else {
-            lines.push(Line::from(Span::styled(*row, Style::default().fg(theme.muted))));
+            lines.push(Line::from(Span::styled(*row, Style::default().fg(theme.text_muted))));
         }
     }
 
@@ -3578,8 +3380,8 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     let card_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent_dim))
-        .style(Style::default().bg(theme.pill_bg));
+        .border_style(Style::default().fg(theme.accent_alt))
+        .style(Style::default().bg(theme.surface_elevated));
     f.render_widget(card_block, area);
 
     if area.height < 5 || area.width < 10 {
@@ -3591,7 +3393,7 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     // Line 1: Input text or placeholder
     let show_placeholder = session.input.is_empty();
     let content_style = if show_placeholder {
-        Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC)
+        Style::default().fg(theme.text_muted).add_modifier(Modifier::ITALIC)
     } else {
         Style::default().fg(theme.text_soft)
     };
@@ -3604,7 +3406,7 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
         },
     ]);
     f.render_widget(
-        Paragraph::new(line1).style(Style::default().bg(theme.pill_bg)),
+        Paragraph::new(line1).style(Style::default().bg(theme.surface_elevated)),
         Rect {
             x: area.x + 2,
             y: area.y + 1,
@@ -3617,7 +3419,7 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     let divider = "─".repeat(inner_width);
     let line2 = Line::from(Span::styled(divider, Style::default().fg(theme.border)));
     f.render_widget(
-        Paragraph::new(line2).style(Style::default().bg(theme.pill_bg)),
+        Paragraph::new(line2).style(Style::default().bg(theme.surface_elevated)),
         Rect {
             x: area.x + 2,
             y: area.y + 2,
@@ -3637,14 +3439,14 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
         Span::styled(" ", Style::default()),
         Span::styled(format!("{} ", model), Style::default().fg(theme.text_soft)),
         Span::styled(" ", Style::default()),
-        Span::styled(provider, Style::default().fg(theme.accent_dim)),
+        Span::styled(provider, Style::default().fg(theme.accent_alt)),
     ];
 
     let right_spans = vec![
-        Span::styled("tab", Style::default().fg(theme.accent_dim)),
-        Span::styled(" switch agent · ", Style::default().fg(theme.muted)),
-        Span::styled("ctrl+p", Style::default().fg(theme.accent_dim)),
-        Span::styled(" commands", Style::default().fg(theme.muted)),
+        Span::styled("tab", Style::default().fg(theme.accent_alt)),
+        Span::styled(" switch agent · ", Style::default().fg(theme.text_muted)),
+        Span::styled("ctrl+p", Style::default().fg(theme.accent_alt)),
+        Span::styled(" commands", Style::default().fg(theme.text_muted)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -3659,7 +3461,7 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
 
     let line3 = Line::from(footer_spans);
     f.render_widget(
-        Paragraph::new(line3).style(Style::default().bg(theme.pill_bg)),
+        Paragraph::new(line3).style(Style::default().bg(theme.surface_elevated)),
         Rect {
             x: area.x + 2,
             y: area.y + 3,
@@ -3690,7 +3492,7 @@ fn keywords_for(lang: &str) -> &'static [&'static str] {
 pub fn highlight_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
     let base = Style::default().fg(theme.text);
     if lang == "diff" || lang == "patch" {
-        let st = if line.starts_with('+') { Style::default().fg(theme.success) } else if line.starts_with('-') { Style::default().fg(theme.error) } else if line.starts_with("@@") { Style::default().fg(theme.accent) } else { base };
+        let st = if line.starts_with('+') { Style::default().fg(theme.success) } else if line.starts_with('-') { Style::default().fg(theme.danger) } else if line.starts_with("@@") { Style::default().fg(theme.accent) } else { base };
         return vec![Span::styled(line.to_string(), st)];
     }
     let kws = keywords_for(lang);
@@ -3701,7 +3503,7 @@ pub fn highlight_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'s
     let kw_style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
     let str_style = Style::default().fg(theme.success);
     let num_style = Style::default().fg(theme.warning);
-    let com_style = Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC);
+    let com_style = Style::default().fg(theme.text_muted).add_modifier(Modifier::ITALIC);
     let mut spans = Vec::new();
     let mut buf = String::new();
     let chars: Vec<char> = line.chars().collect();
@@ -3837,7 +3639,7 @@ fn draw_mention_popup(f: &mut Frame, app: &App, input_area: Rect) {
         .enumerate()
         .map(|(i, m)| {
             let sel = i == app.autocomplete_idx % matches.len();
-            let style = if sel { Style::default().fg(Color::Black).bg(BRAND).add_modifier(Modifier::BOLD) } else { Style::default().fg(GRAY).bg(Color::Rgb(15, 15, 20)) };
+            let style = if sel { Style::default().fg(Color::Black).bg(app.theme.accent).add_modifier(Modifier::BOLD) } else { Style::default().fg(app.theme.text_soft).bg(Color::Rgb(15, 15, 20)) };
             ListItem::new(Line::from(Span::styled(format!("{} @{}", if sel { "▸" } else { " " }, m), style)))
         })
         .collect();
@@ -3853,7 +3655,7 @@ fn diff_lines<'a>(diff: &'a str, theme: &Theme) -> Vec<Line<'a>> {
             } else if l.starts_with('+') {
                 Style::default().fg(theme.success)
             } else if l.starts_with('-') {
-                Style::default().fg(theme.error)
+                Style::default().fg(theme.danger)
             } else if l.starts_with("@@") {
                 Style::default().fg(theme.accent)
             } else {
@@ -3880,11 +3682,11 @@ fn draw_approval(f: &mut Frame, app: &App, ticket: &ApprovalTicket, screen: Rect
         .border_style(Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
         .title(title)
         .title_alignment(Alignment::Center)
-        .style(Style::default().bg(theme.card_bg));
+        .style(Style::default().bg(theme.surface));
     f.render_widget(block, rect);
     let inner = Rect { x: rect.x + 2, y: rect.y + 1, width: rect.width.saturating_sub(4), height: rect.height.saturating_sub(2) };
     let mut lines = vec![
-        Line::from(vec![Span::styled(format!("{}: ", req.tool), Style::default().fg(theme.muted)), Span::styled(req.summary.clone(), Style::default().fg(theme.text).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(format!("{}: ", req.tool), Style::default().fg(theme.text_muted)), Span::styled(req.summary.clone(), Style::default().fg(theme.text).add_modifier(Modifier::BOLD))]),
         Line::from(""),
     ];
     if let Some(d) = &req.diff {
@@ -3894,61 +3696,27 @@ fn draw_approval(f: &mut Frame, app: &App, ticket: &ApprovalTicket, screen: Rect
     let body_h = inner.height.saturating_sub(footer_h);
     let max_scroll = (lines.len() as u16).saturating_sub(body_h);
     let scroll = app.approval_scroll.min(max_scroll);
-    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).style(Style::default().bg(theme.card_bg)), Rect { height: body_h, ..inner });
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).style(Style::default().bg(theme.surface)), Rect { height: body_h, ..inner });
     let footer = Line::from(vec![
         Span::styled("[y] Approve", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
         Span::raw("   "),
         Span::styled("[a] Always (this session)", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::raw("   "),
-        Span::styled("[n] Reject", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+        Span::styled("[n] Reject", Style::default().fg(theme.danger).add_modifier(Modifier::BOLD)),
         Span::raw("   "),
-        Span::styled("↑↓ PgUp/PgDn scroll", Style::default().fg(theme.muted)),
+        Span::styled("↑↓ PgUp/PgDn scroll", Style::default().fg(theme.text_muted)),
     ]);
-    f.render_widget(Paragraph::new(vec![Line::from(""), footer]).style(Style::default().bg(theme.card_bg)), Rect { y: inner.y + body_h, height: footer_h, ..inner });
+    f.render_widget(Paragraph::new(vec![Line::from(""), footer]).style(Style::default().bg(theme.surface)), Rect { y: inner.y + body_h, height: footer_h, ..inner });
 }
 
 fn draw_exit_confirmation(f: &mut Frame, app: &App, screen: Rect) {
-    let theme = &app.theme;
-    let modal_w = 54u16.min(screen.width.saturating_sub(2));
-    let modal_h = 7u16.min(screen.height);
-    let x = screen.x + (screen.width.saturating_sub(modal_w)) / 2;
-    let y = screen.y + (screen.height.saturating_sub(modal_h)) / 2;
-    let modal_rect = Rect { x, y, width: modal_w, height: modal_h };
-
-    f.render_widget(Clear, modal_rect);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
-        .title(" Exit Confirmation ")
-        .title_alignment(Alignment::Center)
-        .style(Style::default().bg(theme.card_bg));
-    f.render_widget(block, modal_rect);
-
-    let inner_area = Rect {
-        x: modal_rect.x + 1,
-        y: modal_rect.y + 1,
-        width: modal_rect.width.saturating_sub(2),
-        height: modal_rect.height.saturating_sub(2),
-    };
-
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Are you sure you want to quit CACode?",
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        )).alignment(Alignment::Center),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("[Y] Yes, Exit", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
-            Span::raw("        "),
-            Span::styled("[N] Cancel", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
-        ]).alignment(Alignment::Center),
-    ];
-
-    let p = Paragraph::new(lines).style(Style::default().bg(theme.card_bg));
-    f.render_widget(p, inner_area);
+    f.render_widget(
+        catui::widgets::ConfirmDialog::new(&app.theme, "Exit Confirmation", "Are you sure you want to quit CACode?")
+            .labels("Y: Yes, Exit", "N: Cancel")
+            .selected(catui::widgets::ConfirmChoice::Cancel)
+            .severity(catui::Status::Warning),
+        screen,
+    );
 }
 
 fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
@@ -4024,7 +3792,7 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     let ctx_bar_w = (inner.width as usize).saturating_sub(10).clamp(8, 20);
     let ctx_filled = ((pct / 100.0) * ctx_bar_w as f64).round() as usize;
     let ctx_color = if pct >= 80.0 {
-        theme.error
+        theme.danger
     } else if pct >= 50.0 {
         theme.warning
     } else {
@@ -4052,9 +3820,9 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("│ ", Style::default().fg(theme.border)),
-        Span::styled("Total: ", Style::default().fg(theme.muted)),
+        Span::styled("Total: ", Style::default().fg(theme.text_muted)),
         Span::styled(fmt_num(total_tok), Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
-        Span::styled("   Cost: ", Style::default().fg(theme.muted)),
+        Span::styled("   Cost: ", Style::default().fg(theme.text_muted)),
         Span::styled(cost_str, Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(vec![
@@ -4072,7 +3840,7 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("│ ", Style::default().fg(theme.border)),
         Span::styled(format!("Step {}/5 ", current_step), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
         Span::styled("[", Style::default().fg(theme.border)),
-        Span::styled("█".repeat(step_filled), Style::default().fg(theme.accent_dim)),
+        Span::styled("█".repeat(step_filled), Style::default().fg(theme.accent_alt)),
         Span::styled("░".repeat(step_bar_w.saturating_sub(step_filled)), Style::default().fg(theme.border)),
         Span::styled("] ", Style::default().fg(theme.border)),
         Span::styled(format!("{}%", step_pct), Style::default().fg(theme.text_soft)),
@@ -4113,14 +3881,14 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     if fb_chain.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("│ ", Style::default().fg(theme.border)),
-            Span::styled("  No fallbacks configured", Style::default().fg(theme.muted)),
+            Span::styled("  No fallbacks configured", Style::default().fg(theme.text_muted)),
         ]));
     } else {
         for (i, fb) in fb_chain.iter().take(3).enumerate() {
             lines.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(theme.border)),
                 Span::styled(format!("  F{}: {:<13}", i + 1, fb.name()), Style::default().fg(theme.text_soft)),
-                Span::styled(" [Ready]", Style::default().fg(theme.accent_dim)),
+                Span::styled(" [Ready]", Style::default().fg(theme.accent_alt)),
             ]));
         }
     }
@@ -4157,12 +3925,12 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     if items_to_display.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("│ ", Style::default().fg(theme.border)),
-            Span::styled("• No active tasks", Style::default().fg(theme.muted)),
+            Span::styled("• No active tasks", Style::default().fg(theme.text_muted)),
         ]));
     } else {
         let max_items = (inner.height as usize).saturating_sub(20).clamp(2, 5);
         let first_active_idx = items_to_display.iter().position(|t| !t.done);
-        let spinner = SPINNER_CHARS[app.spinner_frame % SPINNER_CHARS.len()];
+        let spinner = catui::widgets::Spinner::frame(app.spinner_frame);
 
         for (i, item) in items_to_display.iter().take(max_items).enumerate() {
             let max_w = (inner.width as usize).saturating_sub(8);
@@ -4177,7 +3945,7 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(theme.border)),
                     Span::styled("[✓] ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
-                    Span::styled(display_text, Style::default().fg(theme.muted).add_modifier(Modifier::CROSSED_OUT)),
+                    Span::styled(display_text, Style::default().fg(theme.text_muted).add_modifier(Modifier::CROSSED_OUT)),
                 ]));
             } else if Some(i) == first_active_idx {
                 let bullet = if app.is_thinking {
@@ -4193,7 +3961,7 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(theme.border)),
-                    Span::styled("[ ] ", Style::default().fg(theme.muted)),
+                    Span::styled("[ ] ", Style::default().fg(theme.text_muted)),
                     Span::styled(display_text, Style::default().fg(theme.text_soft)),
                 ]));
             }
@@ -4203,12 +3971,12 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     // Card 7: Footer
     lines.push(Line::from(vec![
         Span::styled("└─ ", Style::default().fg(theme.border)),
-        Span::styled("^C", Style::default().fg(theme.accent_dim)),
-        Span::styled(" cancel · ", Style::default().fg(theme.muted)),
-        Span::styled("Tab", Style::default().fg(theme.accent_dim)),
-        Span::styled(" tab · ", Style::default().fg(theme.muted)),
-        Span::styled("Esc", Style::default().fg(theme.accent_dim)),
-        Span::styled(" exit", Style::default().fg(theme.muted)),
+        Span::styled("^C", Style::default().fg(theme.accent_alt)),
+        Span::styled(" cancel · ", Style::default().fg(theme.text_muted)),
+        Span::styled("Tab", Style::default().fg(theme.accent_alt)),
+        Span::styled(" tab · ", Style::default().fg(theme.text_muted)),
+        Span::styled("Esc", Style::default().fg(theme.accent_alt)),
+        Span::styled(" exit", Style::default().fg(theme.text_muted)),
     ]));
 
     let p = Paragraph::new(lines).style(Style::default().bg(theme.bg));
@@ -4256,13 +4024,13 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
                 let tool_name = parts[0];
                 let tool_args = if parts.len() > 1 { parts[1] } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled("  ┌─ ⚙️ Action: ", Style::default().fg(theme.accent_dim)),
+                    Span::styled("  ┌─ ⚙️ Action: ", Style::default().fg(theme.accent_alt)),
                     Span::styled(tool_name.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
                     Span::styled(" ──────────────────────────", Style::default().fg(theme.border)),
                 ]));
                 if !tool_args.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("  │  Args: ", Style::default().fg(theme.muted)),
+                        Span::styled("  │  Args: ", Style::default().fg(theme.text_muted)),
                         Span::styled(tool_args.to_string(), Style::default().fg(theme.text_soft)),
                     ]));
                 }
@@ -4292,13 +4060,13 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
                 if let Some(badge) = msg_lines.next() {
                     lines.push(Line::from(vec![
                         Span::styled("  ↳ ", Style::default().fg(theme.border)),
-                        Span::styled(format!("[✗ Error: {}]", badge), Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("[✗ Error: {}]", badge), Style::default().fg(theme.danger).add_modifier(Modifier::BOLD)),
                     ]));
                 }
                 for l in msg_lines {
                     lines.push(Line::from(vec![
                         Span::styled("    │ ", Style::default().fg(theme.border)),
-                        Span::styled(l.to_string(), Style::default().fg(theme.error)),
+                        Span::styled(l.to_string(), Style::default().fg(theme.danger)),
                     ]));
                 }
                 lines.push(Line::from(""));
@@ -4315,16 +4083,16 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
                             code_lang = lang.to_lowercase();
                             let lang_tag = if lang.is_empty() { "code" } else { lang };
                             lines.push(Line::from(vec![
-                                Span::styled("  ╭── ", Style::default().fg(theme.accent_dim)),
+                                Span::styled("  ╭── ", Style::default().fg(theme.accent_alt)),
                                 Span::styled(lang_tag.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-                                Span::styled(" ────────────────────", Style::default().fg(theme.accent_dim)),
+                                Span::styled(" ────────────────────", Style::default().fg(theme.accent_alt)),
                             ]));
                         } else {
                             in_code_block = false;
-                            lines.push(Line::from(Span::styled("  ╰────────────────────────────", Style::default().fg(theme.accent_dim))));
+                            lines.push(Line::from(Span::styled("  ╰────────────────────────────", Style::default().fg(theme.accent_alt))));
                         }
                     } else if in_code_block {
-                        let mut spans = vec![Span::styled("  │ ", Style::default().fg(theme.accent_dim))];
+                        let mut spans = vec![Span::styled("  │ ", Style::default().fg(theme.accent_alt))];
                         spans.extend(highlight_code_line(line, &code_lang, theme));
                         lines.push(Line::from(spans));
                     } else {
@@ -4343,7 +4111,7 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
                     );
                     lines.push(Line::from(Span::styled(
                         tag,
-                        Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+                        Style::default().fg(theme.text_muted).add_modifier(Modifier::DIM),
                     )));
                 }
                 lines.push(Line::from(""));
@@ -4351,7 +4119,7 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
             _ => {
                 let unescaped = unescape_newlines(&msg.content);
                 for line in unescaped.lines() {
-                    let styled_spans = render_styled_line(line, Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC));
+                    let styled_spans = render_styled_line(line, Style::default().fg(theme.text_muted).add_modifier(Modifier::ITALIC));
                     lines.push(Line::from(styled_spans));
                 }
                 lines.push(Line::from(""));
@@ -4400,14 +4168,14 @@ fn draw_autocomplete_popup(f: &mut Frame, app: &App, input_area: Rect) {
         .map(|(i, (cmd, desc))| {
             let sel = i == (app.autocomplete_idx % matches.len());
             let (pfx, style) = if sel {
-                ("▸ ", Style::default().fg(Color::Black).bg(BRAND).add_modifier(Modifier::BOLD))
+                ("▸ ", Style::default().fg(Color::Black).bg(app.theme.accent).add_modifier(Modifier::BOLD))
             } else {
-                ("  ", Style::default().fg(GRAY).bg(Color::Rgb(15, 15, 20)))
+                ("  ", Style::default().fg(app.theme.text_soft).bg(Color::Rgb(15, 15, 20)))
             };
             let line = Line::from(vec![
                 Span::styled(pfx, style),
                 Span::styled(format!("{:<12}", cmd), style),
-                Span::styled(format!(" {}", desc), if sel { style } else { Style::default().fg(DIM).bg(Color::Rgb(15, 15, 20)) }),
+                Span::styled(format!(" {}", desc), if sel { style } else { Style::default().fg(app.theme.text_muted).bg(Color::Rgb(15, 15, 20)) }),
             ]);
             ListItem::new(line)
         })
@@ -4426,11 +4194,11 @@ fn draw_modal_picker(f: &mut Frame, app: &App, screen: Rect) {
                 let pfx = if sel { "▸ " } else { "  " };
                 let tag = if is_current { " [active]" } else { "" };
                 let style = if sel {
-                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                    Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)
                 } else if is_current {
                     Style::default().fg(Color::Green)
                 } else {
-                    Style::default().fg(GRAY)
+                    Style::default().fg(app.theme.text_soft)
                 };
                 Line::from(vec![
                     Span::styled(pfx, style),
@@ -4447,16 +4215,16 @@ fn draw_modal_picker(f: &mut Frame, app: &App, screen: Rect) {
                 let pfx = if sel { "▸ " } else { "  " };
                 let tag = if is_current { " [active]" } else { "" };
                 let style = if sel {
-                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                    Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)
                 } else if is_current {
                     Style::default().fg(Color::Green)
                 } else {
-                    Style::default().fg(GRAY)
+                    Style::default().fg(app.theme.text_soft)
                 };
                 Line::from(vec![
                     Span::styled(pfx, style),
                     Span::styled(format!("{:<14}", mode), style),
-                    Span::styled(format!(" — {}", desc), if sel { style } else { Style::default().fg(DIM) }),
+                    Span::styled(format!(" — {}", desc), if sel { style } else { Style::default().fg(app.theme.text_muted) }),
                     Span::styled(tag, Style::default().fg(Color::Green)),
                 ])
             }).collect();
@@ -4484,7 +4252,7 @@ fn draw_modal_picker(f: &mut Frame, app: &App, screen: Rect) {
 
     let header = Paragraph::new(Line::from(Span::styled(
         title,
-        Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+        Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
     )));
     f.render_widget(header, Rect { height: 1, ..inner });
 
@@ -4499,12 +4267,12 @@ fn draw_modal_picker(f: &mut Frame, app: &App, screen: Rect) {
     f.render_widget(List::new(list_items), list_area);
 
     let help = Paragraph::new(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(BRAND)),
-        Span::styled(" navigate  ", Style::default().fg(DIM)),
-        Span::styled("Enter", Style::default().fg(BRAND)),
-        Span::styled(" select  ", Style::default().fg(DIM)),
-        Span::styled("Esc", Style::default().fg(BRAND)),
-        Span::styled(" cancel", Style::default().fg(DIM)),
+        Span::styled("↑↓", Style::default().fg(app.theme.accent)),
+        Span::styled(" navigate  ", Style::default().fg(app.theme.text_muted)),
+        Span::styled("Enter", Style::default().fg(app.theme.accent)),
+        Span::styled(" select  ", Style::default().fg(app.theme.text_muted)),
+        Span::styled("Esc", Style::default().fg(app.theme.accent)),
+        Span::styled(" cancel", Style::default().fg(app.theme.text_muted)),
     ]));
     f.render_widget(help, Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner });
 }
@@ -4513,17 +4281,17 @@ fn draw_monitor_content(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 3 { return; }
 
     let title = Line::from(vec![
-        Span::styled(" ◉ ", Style::default().fg(BRAND)),
-        Span::styled("Token Usage Monitor", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-        Span::styled("   (press ", Style::default().fg(DIM)),
-        Span::styled("r", Style::default().fg(BRAND)),
-        Span::styled(" to refresh, Esc to back)", Style::default().fg(DIM)),
+        Span::styled(" ◉ ", Style::default().fg(app.theme.accent)),
+        Span::styled("Token Usage Monitor", Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("   (press ", Style::default().fg(app.theme.text_muted)),
+        Span::styled("r", Style::default().fg(app.theme.accent)),
+        Span::styled(" to refresh, Esc to back)", Style::default().fg(app.theme.text_muted)),
     ]);
-    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(app.theme.bg)), Rect { height: 1, ..area });
 
     if app.usage_rows.is_empty() {
         let msg = "No usage data recorded yet. Start monitor proxy via `cacode monitor --endpoint <url>`";
-        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM))).style(Style::default().bg(BG_BLACK));
+        let p = Paragraph::new(Span::styled(msg, Style::default().fg(app.theme.text_muted))).style(Style::default().bg(app.theme.bg));
         f.render_widget(p, Rect { y: area.y + 2, height: 1, ..area });
         return;
     }
@@ -4536,7 +4304,7 @@ fn draw_monitor_content(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let header = Row::new(vec!["Timestamp", "Model", "Tokens", "Cost ($)"])
-        .style(Style::default().fg(BRAND).add_modifier(Modifier::BOLD));
+        .style(Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app.usage_rows.iter().map(|r| {
         let ts = if r.timestamp.len() > 19 { &r.timestamp[..19] } else { &r.timestamp };
@@ -4546,7 +4314,7 @@ fn draw_monitor_content(f: &mut Frame, app: &App, area: Rect) {
             format!("{}", r.total_tokens),
             format!("{:.6}", r.est_cost),
         ])
-        .style(Style::default().fg(GRAY))
+        .style(Style::default().fg(app.theme.text_soft))
     }).collect();
 
     let widths = [
@@ -4559,7 +4327,7 @@ fn draw_monitor_content(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
-        .style(Style::default().bg(BG_BLACK));
+        .style(Style::default().bg(app.theme.bg));
 
     f.render_widget(table, table_area);
 }
@@ -4568,23 +4336,23 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 3 { return; }
 
     let title = Line::from(vec![
-        Span::styled(" 📊 ", Style::default().fg(BRAND)),
-        Span::styled("Usage Report (per-model aggregation)", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-        Span::styled("   (press ", Style::default().fg(DIM)),
-        Span::styled("r", Style::default().fg(BRAND)),
-        Span::styled(" to refresh, Esc to back)", Style::default().fg(DIM)),
+        Span::styled(" 📊 ", Style::default().fg(app.theme.accent)),
+        Span::styled("Usage Report (per-model aggregation)", Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("   (press ", Style::default().fg(app.theme.text_muted)),
+        Span::styled("r", Style::default().fg(app.theme.accent)),
+        Span::styled(" to refresh, Esc to back)", Style::default().fg(app.theme.text_muted)),
     ]);
-    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(app.theme.bg)), Rect { height: 1, ..area });
 
     if app.report_rows.is_empty() {
         let msg = "No usage data to aggregate.";
-        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM))).style(Style::default().bg(BG_BLACK));
+        let p = Paragraph::new(Span::styled(msg, Style::default().fg(app.theme.text_muted))).style(Style::default().bg(app.theme.bg));
         f.render_widget(p, Rect { y: area.y + 2, height: 1, ..area });
         return;
     }
 
     let header = Row::new(vec!["Model", "Calls", "Prompt", "Completion", "Total", "Cost ($)"])
-        .style(Style::default().fg(BRAND).add_modifier(Modifier::BOLD));
+        .style(Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app.report_rows.iter().map(|r| {
         Row::new(vec![
@@ -4595,7 +4363,7 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
             format!("{}", r.total_tokens),
             format!("{:.6}", r.est_cost),
         ])
-        .style(Style::default().fg(GRAY))
+        .style(Style::default().fg(app.theme.text_soft))
     }).collect();
 
     let total_calls: i64 = app.report_rows.iter().map(|r| r.calls).sum();
@@ -4614,7 +4382,7 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
             format!("{}", total_tok),
             format!("{:.6}", total_cost),
         ])
-        .style(Style::default().fg(BRAND).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD))
     );
 
     let widths = [
@@ -4630,7 +4398,7 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(all_rows, widths)
         .header(header)
         .column_spacing(1)
-        .style(Style::default().bg(BG_BLACK));
+        .style(Style::default().bg(app.theme.bg));
 
     let table_rect = Rect {
         x: area.x,
@@ -4645,10 +4413,10 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
         let heat_title_y = table_rect.y + table_rect.height + 1;
         if heat_title_y + 3 < area.y + area.height {
             let heat_header = Line::from(vec![
-                Span::styled(" 📈 ", Style::default().fg(BRAND)),
-                Span::styled("Daily Traffic Heatmap & Top Model Analytics (last 14 days)", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
+                Span::styled(" 📈 ", Style::default().fg(app.theme.accent)),
+                Span::styled("Daily Traffic Heatmap & Top Model Analytics (last 14 days)", Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
             ]);
-            f.render_widget(Paragraph::new(heat_header).style(Style::default().bg(BG_BLACK)), Rect {
+            f.render_widget(Paragraph::new(heat_header).style(Style::default().bg(app.theme.bg)), Rect {
                 x: area.x,
                 y: heat_title_y,
                 width: area.width,
@@ -4670,7 +4438,7 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
                 "Most Used Model: {} ({:.1}% of total tokens)  │  Total Sessions/Days Logged: {}",
                 top_model_name, top_model_share, app.daily_rows.len()
             );
-            f.render_widget(Paragraph::new(Span::styled(top_msg, Style::default().fg(Color::Yellow))).style(Style::default().bg(BG_BLACK)), Rect {
+            f.render_widget(Paragraph::new(Span::styled(top_msg, Style::default().fg(Color::Yellow))).style(Style::default().bg(app.theme.bg)), Rect {
                 x: area.x,
                 y: heat_title_y + 1,
                 width: area.width,
@@ -4683,15 +4451,15 @@ fn draw_report_content(f: &mut Frame, app: &App, area: Rect) {
                     break;
                 }
                 let bar_line = Line::from(vec![
-                    Span::styled(format!("{:<10}", row.day), Style::default().fg(GRAY)),
-                    Span::styled(format!("{:>5}", row.calls), Style::default().fg(DIM)),
-                    Span::styled(" calls  │  ", Style::default().fg(DIM)),
+                    Span::styled(format!("{:<10}", row.day), Style::default().fg(app.theme.text_soft)),
+                    Span::styled(format!("{:>5}", row.calls), Style::default().fg(app.theme.text_muted)),
+                    Span::styled(" calls  │  ", Style::default().fg(app.theme.text_muted)),
                     Span::styled(format!("{:>10}", row.tokens), Style::default().fg(Color::White)),
-                    Span::styled(" tokens │  ", Style::default().fg(DIM)),
+                    Span::styled(" tokens │  ", Style::default().fg(app.theme.text_muted)),
                     Span::styled(format!("${:.4}  ", row.cost), Style::default().fg(Color::Green)),
-                    Span::styled(row.bar.as_str(), Style::default().fg(BRAND)),
+                    Span::styled(row.bar.as_str(), Style::default().fg(app.theme.accent)),
                 ]);
-                f.render_widget(Paragraph::new(bar_line).style(Style::default().bg(BG_BLACK)), Rect {
+                f.render_widget(Paragraph::new(bar_line).style(Style::default().bg(app.theme.bg)), Rect {
                     x: area.x,
                     y: bar_y,
                     width: area.width,
@@ -4706,15 +4474,15 @@ fn draw_skills_content(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 3 { return; }
 
     let title = Line::from(vec![
-        Span::styled(" ⚡ ", Style::default().fg(BRAND)),
-        Span::styled("Skills Library (~/.cacode/skills/)", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-        Span::styled("   (Enter load into chat, Esc back)", Style::default().fg(DIM)),
+        Span::styled(" ⚡ ", Style::default().fg(app.theme.accent)),
+        Span::styled("Skills Library (~/.cacode/skills/)", Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("   (Enter load into chat, Esc back)", Style::default().fg(app.theme.text_muted)),
     ]);
-    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(app.theme.bg)), Rect { height: 1, ..area });
 
     if app.skills.is_empty() {
         let msg = "No skills saved yet. Use `/skill add <name>` in chat to save prompt templates.";
-        let p = Paragraph::new(Span::styled(msg, Style::default().fg(DIM))).style(Style::default().bg(BG_BLACK));
+        let p = Paragraph::new(Span::styled(msg, Style::default().fg(app.theme.text_muted))).style(Style::default().bg(app.theme.bg));
         f.render_widget(p, Rect { y: area.y + 2, height: 1, ..area });
         return;
     }
@@ -4727,12 +4495,12 @@ fn draw_skills_content(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let header = Row::new(vec!["", "Skill Name", "Created", "Description"])
-        .style(Style::default().fg(BRAND).add_modifier(Modifier::BOLD));
+        .style(Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app.skills.iter().enumerate().map(|(i, s)| {
         let sel = i == app.skill_selected;
         let pfx = if sel { "▸ " } else { "  " };
-        let style = if sel { Style::default().fg(BRAND).add_modifier(Modifier::BOLD) } else { Style::default().fg(GRAY) };
+        let style = if sel { Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD) } else { Style::default().fg(app.theme.text_soft) };
 
         Row::new(vec![
             pfx.to_string(),
@@ -4753,7 +4521,7 @@ fn draw_skills_content(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
-        .style(Style::default().bg(BG_BLACK));
+        .style(Style::default().bg(app.theme.bg));
 
     f.render_widget(table, table_area);
 }
@@ -4762,10 +4530,10 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 4 { return; }
 
     let title = Line::from(vec![
-        Span::styled(" ⚙  BYOK Settings & Configuration ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
-        Span::styled(" (Esc to back)", Style::default().fg(DIM)),
+        Span::styled(" ⚙  BYOK Settings & Configuration ", Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" (Esc to back)", Style::default().fg(app.theme.text_muted)),
     ]);
-    f.render_widget(Paragraph::new(title).style(Style::default().bg(BG_BLACK)), Rect { height: 1, ..area });
+    f.render_widget(Paragraph::new(title).style(Style::default().bg(app.theme.bg)), Rect { height: 1, ..area });
 
     let list_area = Rect {
         x: area.x,
@@ -4793,18 +4561,18 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
         let pfx = if sel { if app.settings.editing { "✎ " } else { "▸ " } } else { "  " };
         let style = if sel {
             if app.settings.editing { Style::default().fg(Color::Yellow) }
-            else { Style::default().fg(BRAND).add_modifier(Modifier::BOLD) }
-        } else { Style::default().fg(TEXT) };
+            else { Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD) }
+        } else { Style::default().fg(app.theme.text) };
 
         ListItem::new(Line::from(vec![
             Span::styled(pfx, style),
             Span::styled(format!("{:20}", field.label), style),
-            Span::styled(" │ ", Style::default().fg(DIM)),
+            Span::styled(" │ ", Style::default().fg(app.theme.text_muted)),
             Span::styled(display, style),
         ]))
     }).collect();
 
-    f.render_widget(List::new(items).style(Style::default().bg(BG_BLACK)), list_area);
+    f.render_widget(List::new(items).style(Style::default().bg(app.theme.bg)), list_area);
 
     let help_area = Rect {
         x: area.x,
@@ -4814,26 +4582,26 @@ fn draw_settings_content(f: &mut Frame, app: &App, area: Rect) {
     };
     let help = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(BRAND)),
-            Span::styled(" navigate  ", Style::default().fg(DIM)),
-            Span::styled("Enter", Style::default().fg(BRAND)),
-            Span::styled(" edit  ", Style::default().fg(DIM)),
-            Span::styled("s", Style::default().fg(BRAND)),
-            Span::styled(" save  ", Style::default().fg(DIM)),
-            Span::styled("b", Style::default().fg(BRAND)),
-            Span::styled(" backup  ", Style::default().fg(DIM)),
-            Span::styled("r", Style::default().fg(BRAND)),
-            Span::styled(" restore  ", Style::default().fg(DIM)),
-            Span::styled("t", Style::default().fg(BRAND)),
-            Span::styled(" test  ", Style::default().fg(DIM)),
-            Span::styled("Esc", Style::default().fg(BRAND)),
-            Span::styled(" back to chat", Style::default().fg(DIM)),
+            Span::styled("↑↓", Style::default().fg(app.theme.accent)),
+            Span::styled(" navigate  ", Style::default().fg(app.theme.text_muted)),
+            Span::styled("Enter", Style::default().fg(app.theme.accent)),
+            Span::styled(" edit  ", Style::default().fg(app.theme.text_muted)),
+            Span::styled("s", Style::default().fg(app.theme.accent)),
+            Span::styled(" save  ", Style::default().fg(app.theme.text_muted)),
+            Span::styled("b", Style::default().fg(app.theme.accent)),
+            Span::styled(" backup  ", Style::default().fg(app.theme.text_muted)),
+            Span::styled("r", Style::default().fg(app.theme.accent)),
+            Span::styled(" restore  ", Style::default().fg(app.theme.text_muted)),
+            Span::styled("t", Style::default().fg(app.theme.accent)),
+            Span::styled(" test  ", Style::default().fg(app.theme.text_muted)),
+            Span::styled("Esc", Style::default().fg(app.theme.accent)),
+            Span::styled(" back to chat", Style::default().fg(app.theme.text_muted)),
         ]),
         Line::from(Span::styled(
             if app.status_msg.is_empty() { "" } else { &app.status_msg },
             Style::default().fg(Color::Green),
         )),
-    ]).style(Style::default().bg(BG_BLACK));
+    ]).style(Style::default().bg(app.theme.bg));
     f.render_widget(help, help_area);
 }
 
@@ -4847,7 +4615,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
             4 => "↑↓ navigate • Enter edit • s save • ⇆ Tab/F1-F5 switch page • Esc back to chat",
             _ => "↑↓ navigate • ⇆ Tab/F1-F5 switch page • Esc back to chat",
         };
-        let line = Line::from(Span::styled(hint, Style::default().fg(theme.muted)));
+        let line = Line::from(Span::styled(hint, Style::default().fg(theme.text_muted)));
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme.bg)),
             area,
@@ -4856,7 +4624,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
     }
 
     let session = app.session();
-    let text_col = if app.is_thinking { theme.accent_dim } else { theme.text_soft };
+    let text_col = if app.is_thinking { theme.accent_alt } else { theme.text_soft };
     let has_image = detect_image_reference(&session.input).is_some();
 
     if app.is_thinking && !session.input.is_empty() {
@@ -4871,12 +4639,12 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.accent))
-            .style(Style::default().bg(theme.pill_bg));
+            .style(Style::default().bg(theme.surface_elevated));
 
         if has_image {
             steer_block = steer_block.title(
                 Line::from(vec![
-                    Span::styled(" [🖼️ Image] ", Style::default().fg(theme.accent_dim).add_modifier(Modifier::BOLD))
+                    Span::styled(" [🖼️ Image] ", Style::default().fg(theme.accent_alt).add_modifier(Modifier::BOLD))
                 ]).alignment(Alignment::Right)
             );
         }
@@ -4896,7 +4664,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         }
 
         f.render_widget(
-            Paragraph::new(rendered_lines).style(Style::default().bg(theme.pill_bg)),
+            Paragraph::new(rendered_lines).style(Style::default().bg(theme.surface_elevated)),
             Rect {
                 x: area.x + 2,
                 y: inner_y,
@@ -4911,7 +4679,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         Some((cx.min(area.x + area.width.saturating_sub(2)), cy))
     } else if app.is_thinking {
         // Rotating braille spinner without leading '>'
-        let spinner = SPINNER_CHARS[app.spinner_frame % SPINNER_CHARS.len()];
+        let spinner = catui::widgets::Spinner::frame(app.spinner_frame);
         let line = Line::from(vec![
             Span::styled(
                 format!("{} ", spinner),
@@ -4919,17 +4687,17 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
             ),
             Span::styled(
                 "Thinking... · Type to steer · Ctrl+C to cancel",
-                Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC),
+                Style::default().fg(theme.text_muted).add_modifier(Modifier::ITALIC),
             ),
         ]);
         let thinking_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.accent))
-            .style(Style::default().bg(theme.pill_bg));
+            .style(Style::default().bg(theme.surface_elevated));
         f.render_widget(thinking_block, area);
         f.render_widget(
-            Paragraph::new(line).style(Style::default().bg(theme.pill_bg)),
+            Paragraph::new(line).style(Style::default().bg(theme.surface_elevated)),
             Rect {
                 x: area.x + 2,
                 y: area.y + 1,
@@ -4943,7 +4711,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         let (row, col) = get_cursor_coords(&session.input, session.cursor_pos);
         let show_placeholder = session.input.is_empty();
         let content_style = if show_placeholder {
-            Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC)
+            Style::default().fg(theme.text_muted).add_modifier(Modifier::ITALIC)
         } else {
             Style::default().fg(text_col)
         };
@@ -4951,13 +4719,13 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         let mut input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent_dim))
-            .style(Style::default().bg(theme.pill_bg));
+            .border_style(Style::default().fg(theme.accent_alt))
+            .style(Style::default().bg(theme.surface_elevated));
 
         if has_image {
             input_block = input_block.title(
                 Line::from(vec![
-                    Span::styled(" [🖼️ Image] ", Style::default().fg(theme.accent_dim).add_modifier(Modifier::BOLD))
+                    Span::styled(" [🖼️ Image] ", Style::default().fg(theme.accent_alt).add_modifier(Modifier::BOLD))
                 ]).alignment(Alignment::Right)
             );
         }
@@ -4978,7 +4746,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) -> Option<(u16, u16)> {
         };
 
         f.render_widget(
-            Paragraph::new(rendered_lines).style(Style::default().bg(theme.pill_bg)),
+            Paragraph::new(rendered_lines).style(Style::default().bg(theme.surface_elevated)),
             Rect {
                 x: area.x + 2,
                 y: inner_y,
@@ -5017,34 +4785,34 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
     let mut left_spans = vec![
         Span::styled(format!(" {} ", cwd_str), Style::default().fg(theme.text_soft)),
-        Span::styled("· ", Style::default().fg(theme.muted)),
+        Span::styled("· ", Style::default().fg(theme.text_muted)),
         Span::styled(format!("{} ", status_dot), Style::default().fg(status_color)),
         Span::styled(format!("{} ", status_label), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-        Span::styled("· ", Style::default().fg(theme.muted)),
+        Span::styled("· ", Style::default().fg(theme.text_muted)),
         Span::styled(format!("{} ", model), Style::default().fg(theme.text_soft).add_modifier(Modifier::BOLD)),
-        Span::styled("· ", Style::default().fg(theme.muted)),
-        Span::styled(format!("{} ", provider), Style::default().fg(theme.accent_dim)),
+        Span::styled("· ", Style::default().fg(theme.text_muted)),
+        Span::styled(format!("{} ", provider), Style::default().fg(theme.accent_alt)),
     ];
 
     if app.is_pro() {
-        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.text_muted)));
         left_spans.push(Span::styled("[⭐ PRO] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     }
 
     if app.sessions.len() > 1 {
         let busy = app.sessions.iter().filter(|s| s.is_busy()).count();
-        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.text_muted)));
         left_spans.push(Span::styled(
             format!("agent {}/{}{} ", app.active_session + 1, app.sessions.len(), if busy > 0 { format!(" ({} running)", busy) } else { String::new() }),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text_muted),
         ));
     }
 
     // live turn telemetry: elapsed, active tool, streaming speed, permission mode
-    left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
-    left_spans.push(Span::styled(format!("🔐 {} ", app.session().agent.permission_mode.label()), Style::default().fg(theme.muted)));
+    left_spans.push(Span::styled("· ", Style::default().fg(theme.text_muted)));
+    left_spans.push(Span::styled(format!("🔐 {} ", app.session().agent.permission_mode.label()), Style::default().fg(theme.text_muted)));
     if let Some(rt) = &app.session().turn {
-        let spin = SPINNER_CHARS[app.spinner_frame % SPINNER_CHARS.len()];
+        let spin = catui::widgets::Spinner::frame(app.spinner_frame);
         let secs = rt.started.elapsed().as_secs_f64();
         let mut t = format!("{} {:.0}s", spin, secs);
         if let Some((tool, since)) = &rt.active_tool {
@@ -5052,19 +4820,19 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         } else if rt.streamed_chars > 0 && secs > 0.0 {
             t.push_str(&format!(" ~{:.0} tok/s", (rt.streamed_chars as f64 / 3.5) / secs));
         }
-        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.text_muted)));
         left_spans.push(Span::styled(format!("{} ", t), Style::default().fg(theme.warning)));
     }
 
     if !app.status_msg.is_empty() {
-        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
-        left_spans.push(Span::styled(format!("{} ", app.status_msg), Style::default().fg(theme.accent_dim)));
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.text_muted)));
+        left_spans.push(Span::styled(format!("{} ", app.status_msg), Style::default().fg(theme.accent_alt)));
     }
 
     let right_spans = vec![
-        Span::styled("/status", Style::default().fg(theme.accent_dim)),
-        Span::styled("  ·  ", Style::default().fg(theme.muted)),
-        Span::styled(format!("v{} ", CA_VERSION), Style::default().fg(theme.muted)),
+        Span::styled("/status", Style::default().fg(theme.accent_alt)),
+        Span::styled("  ·  ", Style::default().fg(theme.text_muted)),
+        Span::styled(format!("v{} ", CA_VERSION), Style::default().fg(theme.text_muted)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -5226,7 +4994,7 @@ mod tests {
 
         let spans2 = format_session_tabs_spans(&app, 120);
         let s1_span = spans2.iter().find(|s| s.content.contains("Term 1")).unwrap();
-        assert_eq!(s1_span.style.fg, Some(app.theme.muted));
+        assert_eq!(s1_span.style.fg, Some(app.theme.text_muted));
         assert!(!s1_span.style.add_modifier.contains(Modifier::BOLD));
 
         let s2_span = spans2.iter().find(|s| s.content.contains("Term 2")).unwrap();
@@ -5354,7 +5122,7 @@ mod tests {
         assert_eq!(tokyo.preset, ThemePreset::TokyoNight);
         assert_eq!(tokyo.bg, Color::Rgb(26, 27, 38)); // #1a1b26
         assert_eq!(tokyo.accent, Color::Rgb(122, 162, 247)); // #7aa2f7
-        assert_eq!(tokyo.accent_dim, Color::Rgb(187, 154, 247)); // #bb9af7
+        assert_eq!(tokyo.accent_alt, Color::Rgb(187, 154, 247)); // #bb9af7
         assert_eq!(tokyo.success, Color::Rgb(158, 206, 106)); // #9ece6a
 
         // Nord
@@ -5380,14 +5148,15 @@ mod tests {
 
         // Light
         let light = Theme::from_name("light");
-        assert_eq!(light.preset, ThemePreset::Light);
+        assert_eq!(light.preset, ThemePreset::CaLight);
         assert_eq!(light.bg, Color::Rgb(248, 250, 252)); // #f8fafc
-        assert_eq!(light.accent, Color::Rgb(37, 99, 235)); // #2563eb
+        // CATUI: `light` now maps to CAUI's light tokens; accent = CAUI brand.
+        assert_eq!(light.accent, catui::tokens::DEFAULT_BRAND.color());
         assert_eq!(light.text, Color::Rgb(15, 23, 42)); // #0f172a
 
         // Classic
         let classic = Theme::from_name("classic");
-        assert_eq!(classic.preset, ThemePreset::Classic);
+        assert_eq!(classic.preset, ThemePreset::Midnight);
         assert_eq!(classic.bg, Color::Rgb(5, 8, 15)); // #05080f
         assert_eq!(classic.accent, Color::Rgb(59, 130, 246)); // #3b82f6
     }

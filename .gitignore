@@ -1,2 +1,5 @@
 /target
 e2e-results/
+
+# override lokal catui
+.cargo/config.toml
