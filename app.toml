@@ -1,6 +1,6 @@
 [app]
 name = "CACode"
-version = "0.3.0"
+version = "1.2.0"
 description = "Sovereign Rust Development CLI & Chat Agent"
 author = "Cecep Saeful Azhar Hidayat, ST"
 license = "MIT OR Apache-2.0"

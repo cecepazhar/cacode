@@ -19,14 +19,14 @@ pub fn run() -> Result<()> {
     println!("     • Features:    Everything in Free, plus:");
     println!("                    - Multi-Tab workspace management (Ctrl+T)");
     println!("                    - Turbo concurrency up to 49 sub-agents");
-    println!("                    - Cross-session memory sync & export");
+    println!("                    - Cross-session memory sync & export (roadmap — not shipped yet)");
     println!();
     println!("  3. Ultra Pro Sovereign Lifetime ($89 USD / one-time):");
     println!("     • Cost:        $89 USD (via Creem checkout)");
     println!("     • Features:    Everything in Pro, plus:");
-    println!("                    - Multi-Level Thinking Engine (Reactive, Analytical, Meta)");
-    println!("                    - Formal proof synthesis & dual-agent debate loops");
-    println!("                    - Priority access to advanced local model optimizations");
+    println!("                    - Thinking modes Fast / Analytical / Deep (prompt-level)");
+    println!("                    - Formal proof synthesis & dual-agent debate loops (roadmap — not shipped yet)");
+    println!("                    - Priority access to advanced local model optimizations (roadmap)");
     println!("--------------------------------------------------------------------------------");
     println!();
     println!("Checkout Link: https://checkout.creem.io/ (Product: SW-CACODE-SOVEREIGN)");

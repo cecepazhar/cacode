@@ -57,7 +57,43 @@ pub struct CaCodeConfig {
     pub fallback_3: Option<String>,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    /// ask | auto-edit | yolo | read-only
+    #[serde(default = "default_permission_mode")]
+    pub permission_mode: String,
+    /// Override the model context window (tokens); 0 = auto from pricing table.
+    #[serde(default)]
+    pub context_window: u64,
+    /// Max ReAct steps per turn.
+    #[serde(default = "default_max_steps")]
+    pub max_steps: usize,
+    /// bash sandbox: auto (bubblewrap if available) | required | off
+    #[serde(default = "default_sandbox")]
+    pub sandbox: String,
+    /// Extra writable paths inside the sandbox (e.g. "~/.m2").
+    #[serde(default)]
+    pub sandbox_writable: Vec<String>,
+    /// Allow network inside the sandbox.
+    #[serde(default = "default_true")]
+    pub sandbox_network: bool,
+    /// Extra domains web_fetch may read without approval.
+    #[serde(default)]
+    pub web_allow_domains: Vec<String>,
 }
+
+fn default_sandbox() -> String { "auto".into() }
+fn default_true() -> bool { true }
+
+impl CaCodeConfig {
+    pub fn sandbox_config(&self) -> crate::tools::bash::SandboxConfig {
+        crate::tools::bash::SandboxConfig::from_settings(&self.sandbox, &self.sandbox_writable, self.sandbox_network)
+    }
+}
+
+fn default_permission_mode() -> String { "ask".into() }
+fn default_max_steps() -> usize { 25 }
+
+/// Config keys whose values are secrets and live in the encrypted vault.
+pub const SECRET_FIELDS: &[&str] = &["openai_api_key", "anthropic_api_key", "router9_api_key", "antigravity_zen_api_key", "pro_license_key"];
 
 fn default_max_retries() -> usize { 3 }
 fn default_theme() -> String { "teal".into() }
@@ -92,6 +128,13 @@ impl Default for CaCodeConfig {
             fallback_2: None,
             fallback_3: None,
             max_retries: default_max_retries(),
+            permission_mode: default_permission_mode(),
+            context_window: 0,
+            max_steps: default_max_steps(),
+            sandbox: default_sandbox(),
+            sandbox_writable: Vec::new(),
+            sandbox_network: true,
+            web_allow_domains: Vec::new(),
         }
     }
 }
@@ -170,23 +213,90 @@ impl CaCodeConfig {
     }
 
     pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
-        if path.exists() {
-            let contents = fs::read_to_string(&path)?;
-            let cfg: CaCodeConfig = toml::from_str(&contents)?;
-            Ok(cfg)
-        } else {
-            Ok(Self::default())
-        }
+        Self::load_from(&Self::config_path()?)
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path()?;
+        self.save_to(&Self::config_path()?)
+    }
+
+    fn secret_slot(&mut self, key: &str) -> Option<&mut Option<String>> {
+        match key {
+            "openai_api_key" => Some(&mut self.openai_api_key),
+            "anthropic_api_key" => Some(&mut self.anthropic_api_key),
+            "router9_api_key" => Some(&mut self.router9_api_key),
+            "antigravity_zen_api_key" => Some(&mut self.antigravity_zen_api_key),
+            "pro_license_key" => Some(&mut self.pro_license_key),
+            _ => None,
+        }
+    }
+
+    /// Load `config.toml` and merge secrets from the encrypted vault next to
+    /// it. Plaintext secrets found in an old config are migrated into the
+    /// vault automatically (the TOML is rewritten without them).
+    pub fn load_from(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = fs::read_to_string(path)?;
+        let mut cfg: CaCodeConfig = toml::from_str(&contents)?;
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let vault = crate::vault::Vault::in_dir(dir);
+        let secrets = vault.load().unwrap_or_default();
+        let has_plaintext = SECRET_FIELDS.iter().any(|k| cfg.clone().secret_slot(k).map(|v| v.as_ref().map(|s| !s.is_empty()).unwrap_or(false)).unwrap_or(false))
+            || cfg.custom_providers.iter().any(|c| !c.api_key.is_empty());
+        for k in SECRET_FIELDS {
+            if let (Some(slot), Some(v)) = (cfg.secret_slot(k), secrets.get(*k)) {
+                if slot.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                    *slot = Some(v.clone());
+                }
+            }
+        }
+        for cp in cfg.custom_providers.iter_mut() {
+            if cp.api_key.is_empty() {
+                if let Some(v) = secrets.get(&format!("custom:{}", cp.id)) {
+                    cp.api_key = v.clone();
+                }
+            }
+        }
+        if has_plaintext {
+            // best effort migration; never fail a load because of it
+            let _ = cfg.save_to(path);
+        }
+        Ok(cfg)
+    }
+
+    /// Write secrets to the vault and the rest to `config.toml` (mode 0600).
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let contents = toml::to_string_pretty(self)?;
-        fs::write(&path, contents)?;
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let vault = crate::vault::Vault::in_dir(dir);
+        let mut secrets = std::collections::BTreeMap::new();
+        let mut public = self.clone();
+        for k in SECRET_FIELDS {
+            if let Some(slot) = public.secret_slot(k) {
+                if let Some(v) = slot.take().filter(|v| !v.is_empty()) {
+                    secrets.insert(k.to_string(), v);
+                }
+            }
+        }
+        for cp in public.custom_providers.iter_mut() {
+            if !cp.api_key.is_empty() {
+                secrets.insert(format!("custom:{}", cp.id), std::mem::take(&mut cp.api_key));
+            }
+        }
+        vault.save(&secrets)?;
+        let contents = toml::to_string_pretty(&public)?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -244,6 +354,10 @@ impl CaCodeConfig {
             ("Fallback Tier 2", "CACODE_FALLBACK_2", "fallback_2", self.fallback_2.clone().unwrap_or_else(|| "(none)".into())),
             ("Fallback Tier 3", "CACODE_FALLBACK_3", "fallback_3", self.fallback_3.clone().unwrap_or_else(|| "(none)".into())),
             ("Max Retries", "CACODE_MAX_RETRIES", "max_retries", self.max_retries.to_string()),
+            ("Permission Mode", "CACODE_PERMISSION_MODE", "permission_mode", self.permission_mode.clone()),
+            ("Max ReAct Steps", "CACODE_MAX_STEPS", "max_steps", self.max_steps.to_string()),
+            ("Bash Sandbox (auto/required/off)", "CACODE_SANDBOX", "sandbox", self.sandbox.clone()),
+            ("Context Window (0=auto)", "CACODE_CONTEXT_WINDOW", "context_window", self.context_window.to_string()),
             ("Custom Providers", "CACODE_CUSTOM_PROVIDERS", "custom_providers", format!("{} configured", self.custom_providers.len())),
             ("OpenAI API Key", "OPENAI_API_KEY", "openai_api_key", Self::mask(&self.effective("OPENAI_API_KEY", &self.openai_api_key))),
             ("OpenAI Base URL", "OPENAI_BASE_URL", "openai_base_url", self.effective("OPENAI_BASE_URL", &self.openai_base_url)),
@@ -261,10 +375,12 @@ impl CaCodeConfig {
     pub fn mask(val: &str) -> String {
         if val.is_empty() {
             "(not set)".to_string()
-        } else if val.len() <= 4 {
+        } else if val.chars().count() <= 4 {
             "****".to_string()
         } else {
-            format!("{}…{}", "*".repeat(val.len().min(12) - 4), &val[val.len() - 4..])
+            let n = val.chars().count();
+            let tail: String = val.chars().skip(n - 4).collect();
+            format!("{}…{}", "*".repeat(n.min(12) - 4), tail)
         }
     }
 
@@ -280,6 +396,34 @@ impl CaCodeConfig {
             "fallback_1" => self.fallback_1 = val,
             "fallback_2" => self.fallback_2 = val,
             "fallback_3" => self.fallback_3 = val,
+            "permission_mode" => {
+                if let Some(v) = val {
+                    if let Some(m) = crate::permission::PermissionMode::parse(&v) {
+                        self.permission_mode = m.label().to_string();
+                    }
+                }
+            }
+            "sandbox" => {
+                if let Some(v) = val {
+                    if ["auto", "required", "off"].contains(&v.as_str()) {
+                        self.sandbox = v;
+                    }
+                }
+            }
+            "context_window" => {
+                if let Some(v) = val {
+                    if let Ok(n) = v.parse::<u64>() {
+                        self.context_window = n;
+                    }
+                }
+            }
+            "max_steps" => {
+                if let Some(v) = val {
+                    if let Ok(n) = v.parse::<usize>() {
+                        self.max_steps = n.clamp(1, 200);
+                    }
+                }
+            }
             "max_retries" => {
                 if let Some(v) = val {
                     if let Ok(n) = v.parse::<usize>() {
@@ -387,7 +531,37 @@ mod tests {
         cfg.pro_license_key = Some("   ".to_string());
         assert!(!cfg.is_pro());
 
+        // Legacy free-form keys are no longer accepted (format CA[PRODUCT][TIER]-[RAND6]-[CK]).
         cfg.pro_license_key = Some("CACODE-PRO-KEY-2026".to_string());
+        assert!(!cfg.is_pro());
+
+        cfg.pro_license_key = Some("CACD99-ABC123-6".to_string());
         assert!(cfg.is_pro());
+        cfg.pro_license_key = Some("CACD99-ABC123-7".to_string());
+        assert!(!cfg.is_pro(), "bad checksum must fail");
+    }
+
+    #[test]
+    fn test_secrets_go_to_vault_not_toml() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        let mut cfg = CaCodeConfig { openai_api_key: Some("sk-live-SECRET".into()), ..Default::default() };
+        cfg.custom_providers.push(CustomProviderConfig { id: "ds".into(), name: "DeepSeek".into(), base_url: "https://api.deepseek.com".into(), api_key: "ds-SECRET".into(), model: "deepseek-chat".into() });
+        cfg.save_to(&path).unwrap();
+        let toml_text = std::fs::read_to_string(&path).unwrap();
+        assert!(!toml_text.contains("SECRET"), "plaintext secret leaked:\n{toml_text}");
+        let back = CaCodeConfig::load_from(&path).unwrap();
+        assert_eq!(back.openai_api_key.as_deref(), Some("sk-live-SECRET"));
+        assert_eq!(back.custom_providers[0].api_key, "ds-SECRET");
+    }
+
+    #[test]
+    fn test_plaintext_config_is_migrated() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        std::fs::write(&path, "anthropic_api_key = \"sk-ant-OLD\"\n").unwrap();
+        let cfg = CaCodeConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.anthropic_api_key.as_deref(), Some("sk-ant-OLD"));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-ant-OLD"));
     }
 }

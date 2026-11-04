@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,13 +16,17 @@ use ratatui::{
 use rusqlite::Connection;
 use std::fs;
 use std::io;
-use std::env;
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use cacode_core::commands::chat::{AgentEvent, Provider, ReActAgent, TokenUsage};
+use cacode_core::commands::chat::{AgentEvent, Message, Provider, ReActAgent, TokenUsage, CA_VERSION};
+use cacode_core::events::{ApprovalDecision, ApprovalTicket, SubagentStatus};
+use cacode_core::llm::Credentials;
+use cacode_core::permission::PermissionMode;
+use cacode_core::text::truncate_chars;
 use crate::config::{CaCodeConfig, CustomProviderConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,13 +329,20 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/test", "🧪 TDD test authoring (unit & integration tests)"),
     ("/qa", "✅ Quality Assurance dual-check sign-off"),
     ("/compress", "🗜️ Compress conversation history (token optimization)"),
+    ("/undo", "↶ Revert the agent's last file edit (exact bytes restored)"),
+    ("/permissions", "🔐 Permission mode (/permissions ask|auto-edit|yolo|read-only)"),
+    ("/jobs", "List background shell jobs started by the agent"),
+    ("/resume", "↺ Resume a saved session (/resume [id])"),
+    ("/plan", "🗺 Plan mode: investigate read-only, approve a plan before edits"),
+    ("/trust", "Trust this workspace (enables project hooks & .mcp.json)"),
+    ("/mcp", "Show MCP servers & tools of this session"),
     ("/context", "📊 Show active context window tokens & usage limit"),
     ("/status", "Show active provider, model, tokens & system stats"),
     ("/sessions", "List all active chat sessions"),
     ("/rename", "Rename current chat session (/rename <name>)"),
     ("/clear", "Clear current conversation memory"),
     ("/export", "Export conversation transcript to Markdown file"),
-    ("/version", "Show CACode version (v1.0.9)"),
+    ("/version", "Show CACode version"),
     ("/reset", "Soft reset agent context window"),
     ("/cd", "Change working directory (/cd <path>)"),
     ("/pwd", "Print current working directory"),
@@ -489,8 +500,8 @@ fn format_tool_action(tool: &str, args_raw: &str) -> (String, String) {
             ("Running command".to_string(), cmd.to_string())
         }
         _ => {
-            let short = if args_raw.len() > 60 {
-                format!("{}…", &args_raw[..60])
+            let short = if args_raw.chars().count() > 60 {
+                truncate_chars(args_raw, 60)
             } else {
                 args_raw.to_string()
             };
@@ -499,13 +510,10 @@ fn format_tool_action(tool: &str, args_raw: &str) -> (String, String) {
     }
 }
 
-fn est_token_cost(provider: &str, prompt: i64, completion: i64) -> f64 {
-    let p_lower = provider.to_lowercase();
-    if p_lower.contains("zen") || p_lower.contains("ollama") {
-        0.0
-    } else {
-        (prompt as f64 * 2.50 + completion as f64 * 10.0) / 1_000_000.0
-    }
+/// Session cost from the shared pricing table (model-aware, not a flat rate).
+/// Unknown models count as $0 here; `cacode report` flags them as `?price`.
+fn est_token_cost(provider: &str, model: &str, prompt: i64, completion: i64) -> f64 {
+    cacode_core::pricing::cost_usd(provider, model, prompt, completion).unwrap_or(0.0)
 }
 
 struct SettingsField {
@@ -539,16 +547,49 @@ pub struct ChatSession {
     pub react_steps: Vec<String>,
     pub todos: Vec<TodoItem>,
     pub wizard_state: WizardState,
+    /// In-flight ReAct turn of THIS session (each tab runs independently).
+    turn: Option<TurnRuntime>,
+    /// Pending approval requests raised by this session's agent.
+    approvals: VecDeque<ApprovalTicket>,
+    /// True while the last assistant message is being streamed into.
+    streaming: bool,
+    /// Large pastes folded into `[Pasted #n …]` placeholders.
+    pastes: Vec<String>,
+}
+
+/// Runtime handles of one background turn.
+struct TurnRuntime {
+    rx: mpsc::UnboundedReceiver<AgentEvent>,
+    steer_tx: mpsc::UnboundedSender<String>,
+    cancel: CancellationToken,
+    started: Instant,
+    active_tool: Option<(String, Instant)>,
+    streamed_chars: usize,
+}
+
+/// Apply config to an agent (credentials, persona, routing, permissions).
+pub fn configure_agent(agent: &mut ReActAgent, config: &CaCodeConfig) {
+    agent.creds = Credentials::from_config(config);
+    agent.user_name = config.user_name.clone();
+    agent.persona = config.system_persona.clone();
+    agent.thinking_mode = config.thinking_mode.clone();
+    agent.fallback_chain = build_fallback_chain(config);
+    agent.max_retries = config.max_retries.max(1);
+    if let Some(m) = PermissionMode::parse(&config.permission_mode) {
+        agent.permission_mode = m;
+    }
+    agent.subagent_limit = if config.is_pro() { 49 } else { 5 };
+    agent.max_steps = config.max_steps.max(1);
+    agent.context_window_override = (config.context_window > 0).then_some(config.context_window);
+    agent.sandbox = config.sandbox_config();
+    agent.web_allow_domains = config.web_allow_domains.clone();
 }
 
 impl ChatSession {
     fn new(name: String, config: &CaCodeConfig) -> Self {
-        let mut agent = ReActAgent::new();
-        agent.user_name = config.user_name.clone();
-        agent.persona = config.system_persona.clone();
-        agent.thinking_mode = config.thinking_mode.clone();
-        agent.fallback_chain = build_fallback_chain(config);
-        agent.max_retries = config.max_retries;
+        let creds = Credentials::from_config(config);
+        let mut agent = ReActAgent::with_credentials(creds);
+        configure_agent(&mut agent, config);
         Self {
             name,
             messages: Vec::new(),
@@ -561,7 +602,25 @@ impl ChatSession {
             react_steps: Vec::new(),
             todos: Vec::new(),
             wizard_state: WizardState::None,
+            turn: None,
+            approvals: VecDeque::new(),
+            streaming: false,
+            pastes: Vec::new(),
         }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.turn.is_some()
+    }
+
+    /// Expand `[Pasted #n …]` placeholders back to their content.
+    fn expand_pastes(&self, input: &str) -> String {
+        let mut out = input.to_string();
+        for (i, p) in self.pastes.iter().enumerate() {
+            let tag = paste_tag(i + 1, p);
+            out = out.replace(&tag, p);
+        }
+        out
     }
 
     pub fn update_todos_from_text(&mut self, text: &str) {
@@ -855,12 +914,38 @@ struct App {
     modal_picker: ModalPicker,
     modal_idx: usize,
     models_cache: Vec<String>,
-    // Non-blocking agent runtime state
-    agent_events_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
-    steering_tx: Option<mpsc::UnboundedSender<String>>,
-    cancel_token: Option<CancellationToken>,
-    agent_turn_session: usize,
+    /// Results of background jobs (e.g. /compress) that must not block the UI.
+    bg_tx: mpsc::UnboundedSender<BgResult>,
+    bg_rx: mpsc::UnboundedReceiver<BgResult>,
+    bg_busy: usize,
+    /// Prompt history shared by all tabs, persisted to ~/.cacode/history.txt.
+    input_history: Vec<String>,
+    history_cursor: Option<usize>,
+    /// Ctrl+R reverse search query (Some = search mode active).
+    history_search: Option<String>,
+    approval_scroll: u16,
+    file_cache: Option<(Instant, Vec<String>)>,
     pub theme: Theme,
+}
+
+/// Messages from background jobs back to the UI thread.
+enum BgResult {
+    Compressed { session: usize, history: Vec<Message>, total_usage: TokenUsage, result: Result<String, String> },
+}
+
+pub fn paste_tag(n: usize, content: &str) -> String {
+    format!("[Pasted #{}: {} lines]", n, content.lines().count())
+}
+
+pub fn history_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cacode").join("history.txt"))
+}
+
+pub fn load_history() -> Vec<String> {
+    history_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|t| t.lines().map(|l| l.replace("\\n", "\n")).filter(|l| !l.trim().is_empty()).collect())
+        .unwrap_or_default()
 }
 
 impl App {
@@ -868,6 +953,7 @@ impl App {
         let settings = Self::build_settings(&config);
         let session = ChatSession::new(default_session_name(0), &config);
         let theme = Theme::from_name(&config.theme);
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let mut app = Self {
             active_page: 0,
             sessions: vec![session],
@@ -892,10 +978,14 @@ impl App {
             modal_picker: ModalPicker::Off,
             modal_idx: 0,
             models_cache: Vec::new(),
-            agent_events_rx: None,
-            steering_tx: None,
-            cancel_token: None,
-            agent_turn_session: 0,
+            bg_tx,
+            bg_rx,
+            bg_busy: 0,
+            input_history: load_history(),
+            history_cursor: None,
+            history_search: None,
+            approval_scroll: 0,
+            file_cache: None,
             theme,
         };
         app.refresh_skills();
@@ -922,22 +1012,25 @@ impl App {
     // ------------------------------------------------------------------
 
     /// Begin a ReAct turn for the active session in a background task.
-    /// Returns immediately; progress is delivered via `agent_events_rx`.
+    /// Returns immediately; progress is delivered through the session's runtime.
     fn start_turn(&mut self, prompt: String) {
-        if self.is_thinking {
+        let session_idx = self.active_session;
+        if self.sessions[session_idx].is_busy() {
             // Already busy: forward it as a mid-turn steering instruction.
             self.steer(prompt);
             return;
         }
-
-        let session_idx = self.active_session;
-        let session_name = self.sessions[session_idx].name.clone();
-        let user_agent = self.sessions[session_idx].agent.clone();
         let config = self.config.clone();
-
-        // Apply session-level settings to the worker's copy so the background
-        // task matches the live UI state.
-        let mut agent = user_agent;
+        let session_name = self.sessions[session_idx].name.clone();
+        // Create the session's tool context here (not in the worker clone) so
+        // read-state, approvals and background jobs persist across turns.
+        if let Err(e) = self.sessions[session_idx].agent.ensure_tool_ctx() {
+            self.sessions[session_idx].messages.push(ChatMessage::plain("system", format!("Workspace error: {}", e)));
+            return;
+        }
+        // Apply live settings to the worker's copy so the background task
+        // matches the UI state.
+        let mut agent = self.sessions[session_idx].agent.clone();
         agent.user_name = config.user_name.clone();
         agent.persona = config.system_persona.clone();
         agent.thinking_mode = config.thinking_mode.clone();
@@ -945,201 +1038,325 @@ impl App {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
         let cancel = CancellationToken::new();
-
-        self.agent_events_rx = Some(ev_rx);
-        self.steering_tx = Some(steer_tx);
-        self.cancel_token = Some(cancel.clone());
-        self.agent_turn_session = session_idx;
-
-        tokio::spawn(async move {
-            agent.run_turn(prompt, ev_tx, steer_rx, cancel).await;
+        tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                agent.run_turn(prompt, ev_tx, steer_rx, cancel).await;
+            }
         });
-
+        let s = &mut self.sessions[session_idx];
+        s.streaming = false;
+        s.turn = Some(TurnRuntime { rx: ev_rx, steer_tx, cancel, started: Instant::now(), active_tool: None, streamed_chars: 0 });
         self.is_thinking = true;
         self.status_msg = format!("{} — reasoning…", session_name);
     }
 
-    /// Forward a mid-run steering instruction to the active worker.
+    /// Forward a mid-run steering instruction to the active session's worker.
     fn steer(&mut self, instruction: String) {
-        if let Some(tx) = &self.steering_tx {
-            let _ = tx.send(instruction);
+        if let Some(rt) = &self.session().turn {
+            let _ = rt.steer_tx.send(instruction);
         }
     }
 
-    /// Cancel the in-flight LLM call / tool execution immediately.
+    /// Cancel the active session's in-flight LLM call / tool execution.
+    /// The worker answers with HistorySync + Cancelled, so nothing is lost.
     fn cancel_turn(&mut self) {
-        if let Some(tok) = self.cancel_token.clone() {
-            tok.cancel();
+        if let Some(rt) = &self.session().turn {
+            rt.cancel.cancel();
+        }
+        for t in self.session_mut().approvals.drain(..) {
+            t.respond(ApprovalDecision::Reject(Some("turn cancelled".into())));
         }
     }
 
-    /// Drains all pending agent events into the owning session.
-    /// Invoked by the event loop on every tick (non-blocking).
-    fn drain_agent_events(&mut self) {
-        // Take ownership of the receiver so we can clear it without a
-        // conflict with the mutable borrow; put it back after processing.
-        let mut rx = match self.agent_events_rx.take() {
-            Some(rx) => rx,
-            None => return,
-        };
+    fn cancel_all_turns(&mut self) {
+        for s in &mut self.sessions {
+            if let Some(rt) = &s.turn {
+                rt.cancel.cancel();
+            }
+            for t in s.approvals.drain(..) {
+                t.respond(ApprovalDecision::Reject(Some("CACode is exiting".into())));
+            }
+        }
+    }
 
-        let mut finished = false;
-        while let Ok(ev) = rx.try_recv() {
-            let target = if self.agent_turn_session < self.sessions.len() {
-                self.agent_turn_session
-            } else {
-                self.active_session
-            };
+    /// Recompute the global busy flag from the active session + background jobs.
+    fn sync_thinking(&mut self) {
+        self.is_thinking = self.session().is_busy() || self.bg_busy > 0;
+    }
 
-            match ev {
-                AgentEvent::Thinking(stage) => {
-                    self.sessions[target].show_welcome = false;
-                    let step_label = format!("● {}", stage);
-                    if self.sessions[target].react_steps.last().map(|s| s.as_str()) != Some(&step_label) {
-                        self.sessions[target].react_steps.push(step_label);
-                    }
-                    if self.sessions[target].react_steps.len() > 50 {
-                        let excess = self.sessions[target].react_steps.len() - 50;
-                        self.sessions[target].react_steps.drain(0..excess);
-                    }
-                    if self.active_session == target {
-                        self.status_msg = format!("{} — {}", self.sessions[target].name, stage);
-                    }
-                }
-                AgentEvent::AssistantChunk(text) => {
-                    self.sessions[target]
-                        .messages
-                        .push(ChatMessage::plain("assistant", text));
-                    self.sessions[target].scroll_offset = 0;
-                }
-                AgentEvent::ToolStart { tool, args } => {
-                    let (action, target_str) = format_tool_action(&tool, &args);
-                    let step_item = if target_str.is_empty() {
-                        format!("● {}", action)
-                    } else {
-                        format!("● {} {}", tool, target_str)
-                    };
-                    self.sessions[target].react_steps.push(step_item);
-                    if self.sessions[target].react_steps.len() > 50 {
-                        let excess = self.sessions[target].react_steps.len() - 50;
-                        self.sessions[target].react_steps.drain(0..excess);
-                    }
-
-                    let disp_action = if target_str.is_empty() {
-                        action
-                    } else {
-                        format!("{} {}", action, target_str)
-                    };
-                    if self.sessions[target].todos.is_empty() || self.sessions[target].todos.iter().all(|t| t.done) {
-                        self.sessions[target].todos.push(TodoItem {
-                            text: disp_action.clone(),
-                            done: false,
-                        });
-                    }
-                    self.sessions[target].messages.push(ChatMessage::plain(
-                        "tool_start",
-                        format!("● {}", disp_action),
-                    ));
-                }
-                AgentEvent::ToolOutput { tool, output, is_error } => {
-                    let mark = if is_error { "✗" } else { "✓" };
-                    if let Some(pos) = self.sessions[target].react_steps.iter().rposition(|s| s.starts_with("●") && s.contains(&tool)) {
-                        let old = &self.sessions[target].react_steps[pos];
-                        let replaced = format!("{} {}", mark, old.trim_start_matches("● ").trim());
-                        self.sessions[target].react_steps[pos] = replaced;
-                    } else if let Some(last) = self.sessions[target].react_steps.last_mut() {
-                        if last.starts_with("●") {
-                            *last = format!("{} {}", mark, last.trim_start_matches("● ").trim());
+    fn drain_bg(&mut self) {
+        while let Ok(r) = self.bg_rx.try_recv() {
+            self.bg_busy = self.bg_busy.saturating_sub(1);
+            match r {
+                BgResult::Compressed { session, history, total_usage, result } => {
+                    if let Some(s) = self.sessions.get_mut(session) {
+                        match result {
+                            Ok(msg) => {
+                                s.agent.history = history;
+                                s.agent.total_usage = total_usage;
+                                s.messages.push(ChatMessage::plain("system", msg));
+                                self.status_msg = "Context compressed ✓".into();
+                            }
+                            Err(e) => {
+                                s.messages.push(ChatMessage::plain("system", format!("Compression failed: {}", e)));
+                                self.status_msg = "Compression failed".into();
+                            }
                         }
                     }
-
-                    if !is_error {
-                        if let Some(t) = self.sessions[target].todos.iter_mut().rfind(|t| !t.done && (t.text.contains(&tool) || tool.contains(&t.text))) {
-                            t.done = true;
-                        }
-                    }
-
-                    let clean_out = unescape_newlines(&output);
-                    let short = if clean_out.len() > 600 {
-                        format!("{}…", &clean_out[..600])
-                    } else {
-                        clean_out
-                    };
-
-                    let (role, content) = if is_error {
-                        ("tool_result_error", format!("[Error: {}]\n{}", tool, short))
-                    } else {
-                        ("tool_result", format!("[Result: {}]\n{}", tool, short))
-                    };
-                    self.sessions[target].messages.push(ChatMessage::plain(role, content));
-                }
-                AgentEvent::TurnFinished {
-                    usage,
-                    total_calls,
-                    duration_ms,
-                    history,
-                    total_usage,
-                    last_usage,
-                } => {
-                    let s = &mut self.sessions[target];
-                    s.agent.history = history;
-                    s.agent.last_usage = last_usage;
-                    s.agent.total_calls = total_calls;
-                    s.total_tokens = total_usage.total_tokens as u64;
-                    s.agent.total_usage = total_usage.clone();
-                    for step in s.react_steps.iter_mut().rev() {
-                        if step.starts_with("●") {
-                            *step = format!("✓ {}", step.trim_start_matches("● ").trim());
-                        }
-                    }
-                    // Attach the token/duration metadata to the last assistant
-                    // message so draw_messages can render the telemetry footer.
-                    if let Some(msg) = s.messages.iter_mut().rev().find(|m| m.role == "assistant") {
-                        msg.tokens = Some(usage);
-                        msg.duration_ms = Some(duration_ms);
-                        let content = msg.content.clone();
-                        s.update_todos_from_text(&content);
-                    }
-                    if self.active_session == target {
-                        self.is_thinking = false;
-                        self.status_msg.clear();
-                    }
-                    finished = true;
-                }
-                AgentEvent::Error(e) => {
-                    let s = &mut self.sessions[target];
-                    s.messages.push(ChatMessage::plain(
-                        "system",
-                        format!("Error: {}", e),
-                    ));
-                    if self.active_session == target {
-                        self.is_thinking = false;
-                        self.status_msg = "Turn failed".into();
-                    }
-                    finished = true;
-                }
-                AgentEvent::Cancelled => {
-                    let s = &mut self.sessions[target];
-                    s.messages.push(ChatMessage::plain(
-                        "system",
-                        "[Interrupted by user (Ctrl+C)]".to_string(),
-                    ));
-                    if self.active_session == target {
-                        self.is_thinking = false;
-                        self.status_msg = "Cancelled".into();
-                    }
-                    finished = true;
                 }
             }
         }
+    }
 
-        // Restore the receiver unless this turn has ended (all channels dropped).
-        if !finished {
-            self.agent_events_rx = Some(rx);
-        } else {
-            // Turn completed: clear all agent runtime state.
-            self.steering_tx = None;
-            self.cancel_token = None;
+    /// Drains pending agent events of every session (non-blocking).
+    fn drain_agent_events(&mut self) {
+        self.drain_bg();
+        for idx in 0..self.sessions.len() {
+            let Some(mut rt) = self.sessions[idx].turn.take() else { continue };
+            let mut finished = false;
+            while let Ok(ev) = rt.rx.try_recv() {
+                if self.apply_event(idx, &mut rt, ev) {
+                    finished = true;
+                }
+            }
+            if !finished && rt.rx.is_closed() && rt.rx.is_empty() {
+                // worker vanished without a terminal event (panic): never stay "busy" forever
+                self.sessions[idx].messages.push(ChatMessage::plain("system", "Error: agent worker stopped unexpectedly".to_string()));
+                finished = true;
+            }
+            if !finished {
+                self.sessions[idx].turn = Some(rt);
+            } else {
+                self.sessions[idx].streaming = false;
+                if idx == self.active_session {
+                    self.status_msg.clear();
+                }
+            }
+        }
+        self.sync_thinking();
+    }
+
+    /// Apply one event to session `target`. Returns true when the turn ended.
+    fn apply_event(&mut self, target: usize, rt: &mut TurnRuntime, ev: AgentEvent) -> bool {
+        let is_active = target == self.active_session;
+        match ev {
+            AgentEvent::Thinking(stage) => {
+                self.sessions[target].show_welcome = false;
+                let step_label = format!("● {}", stage);
+                if self.sessions[target].react_steps.last().map(|s| s.as_str()) != Some(&step_label) {
+                    self.sessions[target].react_steps.push(step_label);
+                }
+                if self.sessions[target].react_steps.len() > 50 {
+                    let excess = self.sessions[target].react_steps.len() - 50;
+                    self.sessions[target].react_steps.drain(0..excess);
+                }
+                if is_active {
+                    self.status_msg = format!("{} — {}", self.sessions[target].name, stage);
+                }
+            }
+            AgentEvent::AssistantDelta(d) => {
+                rt.streamed_chars += d.chars().count();
+                let s = &mut self.sessions[target];
+                if s.streaming {
+                    if let Some(m) = s.messages.last_mut() {
+                        m.content.push_str(&d);
+                    }
+                } else {
+                    s.messages.push(ChatMessage::plain("assistant", d));
+                    s.streaming = true;
+                }
+                s.scroll_offset = 0;
+            }
+            AgentEvent::AssistantChunk(text) => {
+                let s = &mut self.sessions[target];
+                if s.streaming {
+                    if let Some(m) = s.messages.last_mut() {
+                        m.content = text.clone();
+                        if text.trim().is_empty() {
+                            s.messages.pop();
+                        }
+                    }
+                    s.streaming = false;
+                } else if !text.trim().is_empty() {
+                    s.messages.push(ChatMessage::plain("assistant", text));
+                }
+                s.scroll_offset = 0;
+            }
+            AgentEvent::ToolStart { tool, args } => {
+                self.sessions[target].streaming = false;
+                rt.active_tool = Some((tool.clone(), Instant::now()));
+                let (action, target_str) = format_tool_action(&tool, &args);
+                let step_item = if target_str.is_empty() { format!("● {}", action) } else { format!("● {} {}", tool, target_str) };
+                self.sessions[target].react_steps.push(step_item);
+                if self.sessions[target].react_steps.len() > 50 {
+                    let excess = self.sessions[target].react_steps.len() - 50;
+                    self.sessions[target].react_steps.drain(0..excess);
+                }
+                let disp_action = if target_str.is_empty() { action } else { format!("{} {}", action, target_str) };
+                if self.sessions[target].todos.is_empty() || self.sessions[target].todos.iter().all(|t| t.done) {
+                    self.sessions[target].todos.push(TodoItem { text: disp_action.clone(), done: false });
+                }
+                self.sessions[target].messages.push(ChatMessage::plain("tool_start", format!("● {}", disp_action)));
+            }
+            AgentEvent::ToolOutput { tool, output, is_error } => {
+                rt.active_tool = None;
+                let mark = if is_error { "✗" } else { "✓" };
+                if let Some(pos) = self.sessions[target].react_steps.iter().rposition(|s| s.starts_with("●") && s.contains(&tool)) {
+                    let old = &self.sessions[target].react_steps[pos];
+                    let replaced = format!("{} {}", mark, old.trim_start_matches("● ").trim());
+                    self.sessions[target].react_steps[pos] = replaced;
+                } else if let Some(last) = self.sessions[target].react_steps.last_mut() {
+                    if last.starts_with("●") {
+                        *last = format!("{} {}", mark, last.trim_start_matches("● ").trim());
+                    }
+                }
+                if !is_error {
+                    if let Some(t) = self.sessions[target].todos.iter_mut().rfind(|t| !t.done && (t.text.contains(&tool) || tool.contains(&t.text))) {
+                        t.done = true;
+                    }
+                }
+                let clean_out = unescape_newlines(&output);
+                let short = if clean_out.chars().count() > 600 { truncate_chars(&clean_out, 600) } else { clean_out };
+                let (role, content) = if is_error { ("tool_result_error", format!("[Error: {}]\n{}", tool, short)) } else { ("tool_result", format!("[Result: {}]\n{}", tool, short)) };
+                self.sessions[target].messages.push(ChatMessage::plain(role, content));
+            }
+            AgentEvent::ApprovalRequired(ticket) => {
+                let summary = ticket.request.summary.clone();
+                self.sessions[target].approvals.push_back(ticket);
+                self.approval_scroll = 0;
+                self.status_msg = if is_active { format!("⚠ Approval needed: {}", summary) } else { format!("⚠ {} is waiting for approval", self.sessions[target].name) };
+            }
+            AgentEvent::Subagent { id, description, status } => {
+                let line = match status {
+                    SubagentStatus::Started => format!("⑂ subagent #{} started: {}", id, description),
+                    SubagentStatus::Step(n) => format!("⑂ subagent #{} step {}", id, n),
+                    SubagentStatus::Finished { verified } => format!("⑂ subagent #{} finished: {}{}", id, description, if verified { "" } else { " ⚠ unverified" }),
+                    SubagentStatus::Failed(e) => format!("⑂ subagent #{} failed: {}", id, e),
+                };
+                self.sessions[target].react_steps.push(format!("● {}", line));
+            }
+            AgentEvent::Todos(list) => {
+                self.sessions[target].todos = list
+                    .iter()
+                    .map(|t| TodoItem { text: if t.status == "in_progress" { format!("▸ {}", t.content) } else { t.content.clone() }, done: t.status == "completed" })
+                    .collect();
+            }
+            AgentEvent::ModeChanged(m) => {
+                self.sessions[target].agent.permission_mode = m;
+                self.sessions[target].messages.push(ChatMessage::plain("system", format!("🔐 Permission mode → {}", m.label())));
+            }
+            AgentEvent::Compacted(msg) => {
+                self.sessions[target].messages.push(ChatMessage::plain("system", format!("🗜 {}", msg)));
+            }
+            AgentEvent::HistorySync { history, total_usage, last_usage, total_calls } => {
+                let s = &mut self.sessions[target];
+                s.agent.history = history;
+                s.agent.total_usage = total_usage.clone();
+                s.agent.last_usage = last_usage;
+                s.agent.total_calls = total_calls;
+                s.total_tokens = total_usage.total_tokens as u64;
+            }
+            AgentEvent::TurnFinished { usage, total_calls, duration_ms, history, total_usage, last_usage } => {
+                let s = &mut self.sessions[target];
+                s.agent.history = history;
+                s.agent.last_usage = last_usage;
+                s.agent.total_calls = total_calls;
+                s.total_tokens = total_usage.total_tokens as u64;
+                s.agent.total_usage = total_usage.clone();
+                for step in s.react_steps.iter_mut().rev() {
+                    if step.starts_with("●") {
+                        *step = format!("✓ {}", step.trim_start_matches("● ").trim());
+                    }
+                }
+                if let Some(msg) = s.messages.iter_mut().rev().find(|m| m.role == "assistant") {
+                    msg.tokens = Some(usage);
+                    msg.duration_ms = Some(duration_ms);
+                    let content = msg.content.clone();
+                    s.update_todos_from_text(&content);
+                }
+                return true;
+            }
+            AgentEvent::Error(e) => {
+                let s = &mut self.sessions[target];
+                s.messages.push(ChatMessage::plain("system", format!("Error: {}", e)));
+                if is_active {
+                    self.status_msg = "Turn failed".into();
+                }
+                return true;
+            }
+            AgentEvent::Cancelled => {
+                let s = &mut self.sessions[target];
+                s.messages.push(ChatMessage::plain("system", "[Interrupted by user (Ctrl+C) — history kept]".to_string()));
+                if is_active {
+                    self.status_msg = "Cancelled".into();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Run /compress in the background so the UI keeps rendering.
+    fn start_compress(&mut self) {
+        let idx = self.active_session;
+        let mut agent = self.sessions[idx].agent.clone();
+        let tx = self.bg_tx.clone();
+        self.bg_busy += 1;
+        self.status_msg = "Compressing conversation history…".into();
+        tokio::spawn(async move {
+            let result = agent.compress_history().await.map_err(|e| e.to_string());
+            let _ = tx.send(BgResult::Compressed { session: idx, history: agent.history, total_usage: agent.total_usage, result });
+        });
+    }
+
+    /// Answer the oldest pending approval of the active session.
+    fn answer_approval(&mut self, d: ApprovalDecision) {
+        if let Some(t) = self.session_mut().approvals.pop_front() {
+            let label = match &d {
+                ApprovalDecision::Approve => "approved",
+                ApprovalDecision::ApproveAlways => "approved (always for this session)",
+                ApprovalDecision::Reject(_) => "rejected",
+            };
+            let summary = t.request.summary.clone();
+            t.respond(d);
+            self.session_mut().messages.push(ChatMessage::plain("system", format!("{} — {}", summary, label)));
+            self.approval_scroll = 0;
+            self.status_msg = format!("{} {}", summary, label);
+        }
+    }
+
+    /// Workspace files for `@` autocomplete (cached 30 s, ignore-aware).
+    fn workspace_files(&mut self) -> Vec<String> {
+        let fresh = self.file_cache.as_ref().map(|(t, _)| t.elapsed() < Duration::from_secs(30)).unwrap_or(false);
+        if !fresh {
+            let root = std::env::current_dir().unwrap_or_default();
+            let mut files: Vec<String> = cacode_core::tools::search::text_files(&root)
+                .into_iter()
+                .filter_map(|p| p.strip_prefix(&root).ok().map(|r| r.to_string_lossy().to_string()))
+                .collect();
+            files.sort();
+            files.truncate(20_000);
+            self.file_cache = Some((Instant::now(), files));
+        }
+        self.file_cache.as_ref().map(|(_, f)| f.clone()).unwrap_or_default()
+    }
+
+    fn push_history(&mut self, entry: &str) {
+        if entry.trim().is_empty() || self.input_history.last().map(|l| l == entry).unwrap_or(false) {
+            return;
+        }
+        self.input_history.push(entry.to_string());
+        if self.input_history.len() > 2_000 {
+            let excess = self.input_history.len() - 2_000;
+            self.input_history.drain(0..excess);
+        }
+        if let Some(p) = history_path() {
+            if let Some(parent) = p.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let body: String = self.input_history.iter().map(|l| format!("{}\n", l.replace('\n', "\\\\n"))).collect();
+            let _ = fs::write(p, body);
         }
     }
 
@@ -1196,14 +1413,11 @@ impl App {
         }
         match self.config.save() {
             Ok(_) => {
-                self.config.apply_to_env();
                 for s in &mut self.sessions {
-                    s.agent.provider = ReActAgent::detect_provider();
-                    s.agent.user_name = self.config.user_name.clone();
-                    s.agent.persona = self.config.system_persona.clone();
-                    s.agent.thinking_mode = self.config.thinking_mode.clone();
+                    configure_agent(&mut s.agent, &self.config);
+                    s.agent.provider = ReActAgent::detect_provider_with(&s.agent.creds);
                 }
-                self.status_msg = "Saved ~/.cacode/config.toml ✓".into();
+                self.status_msg = "Saved ~/.cacode/config.toml (keys → encrypted vault) ✓".into();
             }
             Err(e) => self.status_msg = format!("Save failed: {}", e),
         }
@@ -1216,7 +1430,15 @@ impl App {
         match dirs::home_dir() {
             Some(home) => {
                 let backup_path = home.join(".cacode").join("backup.toml");
-                match fs::write(&backup_path, toml::to_string_pretty(&self.config).unwrap_or_default()) {
+                // never write secrets in plaintext: they stay in the encrypted vault
+                let mut public = self.config.clone();
+                for k in cacode_core::config::SECRET_FIELDS {
+                    public.set_field(k, String::new());
+                }
+                for cp in public.custom_providers.iter_mut() {
+                    cp.api_key.clear();
+                }
+                match fs::write(&backup_path, toml::to_string_pretty(&public).unwrap_or_default()) {
                     Ok(_) => self.status_msg = format!("Backed up to {}", backup_path.display()),
                     Err(e) => self.status_msg = format!("Backup failed: {}", e),
                 }
@@ -1232,10 +1454,25 @@ impl App {
                 if backup_path.exists() {
                     match fs::read_to_string(&backup_path) {
                         Ok(content) => {
-                            if let Ok(cfg) = toml::from_str::<CaCodeConfig>(&content) {
+                            if let Ok(mut cfg) = toml::from_str::<CaCodeConfig>(&content) {
+                                // backups carry no secrets: keep the current ones
+                                if cfg.openai_api_key.is_none() { cfg.openai_api_key = self.config.openai_api_key.clone(); }
+                                if cfg.anthropic_api_key.is_none() { cfg.anthropic_api_key = self.config.anthropic_api_key.clone(); }
+                                if cfg.router9_api_key.is_none() { cfg.router9_api_key = self.config.router9_api_key.clone(); }
+                                if cfg.antigravity_zen_api_key.is_none() { cfg.antigravity_zen_api_key = self.config.antigravity_zen_api_key.clone(); }
+                                if cfg.pro_license_key.is_none() { cfg.pro_license_key = self.config.pro_license_key.clone(); }
+                                for cp in cfg.custom_providers.iter_mut() {
+                                    if cp.api_key.is_empty() {
+                                        if let Some(cur) = self.config.custom_providers.iter().find(|c| c.id == cp.id) {
+                                            cp.api_key = cur.api_key.clone();
+                                        }
+                                    }
+                                }
                                 self.config = cfg;
                                 let _ = self.config.save();
-                                self.config.apply_to_env();
+                                for s in &mut self.sessions {
+                                    configure_agent(&mut s.agent, &self.config);
+                                }
                                 self.settings = Self::build_settings(&self.config);
                                 self.status_msg = format!("Restored from {}", backup_path.display());
                             } else {
@@ -1258,7 +1495,8 @@ impl App {
             return;
         }
         self.session_mut().show_welcome = false;
-        let n = self.sessions.len() + 1;
+        // default_session_name(idx) is 0-based: the 2nd tab is "Term 2"
+        let n = self.sessions.len();
         let mut session = ChatSession::new(default_session_name(n), &self.config);
         session.show_welcome = false;
         self.sessions.push(session);
@@ -1272,6 +1510,7 @@ impl App {
             return;
         }
         let name = self.sessions[self.active_session].name.clone();
+        self.cancel_turn();
         self.sessions.remove(self.active_session);
         if self.active_session >= self.sessions.len() {
             self.active_session = self.sessions.len() - 1;
@@ -1408,163 +1647,30 @@ impl App {
         }
     }
 
-    fn router9_endpoint() -> String {
-        let base_url = env::var("ROUTER9_URL").unwrap_or_else(|_| "http://localhost:20128".into());
-        let base = base_url.trim_end_matches('/');
-        if base.ends_with("/v1") || base.ends_with("/api") {
-            format!("{}/chat/completions", base)
-        } else {
-            format!("{}/v1/chat/completions", base)
-        }
-    }
-
-    fn openai_endpoint() -> String {
-        let base_url = env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
-        let base = base_url.trim_end_matches('/');
-        if base.ends_with("/v1") {
-            format!("{}/chat/completions", base)
-        } else {
-            format!("{}/v1/chat/completions", base)
-        }
-    }
-
+    /// Real round-trip against the active provider using the same adapter
+    /// the agent uses (no env-var guessing).
     async fn test_connection(&mut self) {
-        let model = self.model_name();
-        let provider = self.provider_name();
-
-        let result: Result<(), String> = match self.provider_name() {
-            "9Router" => {
-                let endpoint = Self::router9_endpoint();
-                let api_key = env::var("ROUTER9_API_KEY").unwrap_or_else(|_| "dummy".into());
-                let body = serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1
-                });
-                match reqwest::Client::new().post(&endpoint)
-                    .bearer_auth(api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            let text = resp.text().await.unwrap_or_default();
-                            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                            if let Some(err) = parsed.get("error") {
-                                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
-                                Err(format!("9router error: {}", msg))
-                            } else {
-                                Ok(())
-                            }
-                        } else {
-                            let text = resp.text().await.unwrap_or_default();
-                            Err(format!("9router HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
-                        }
-                    }
-                    Err(e) => Err(format!("Cannot reach {} : {}", endpoint, e)),
-                }
-            }
-            "OpenAI" => {
-                let endpoint = Self::openai_endpoint();
-                let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-                let body = serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1
-                });
-                match reqwest::Client::new().post(&endpoint)
-                    .bearer_auth(&api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() { Ok(()) }
-                        else {
-                            let text = resp.text().await.unwrap_or_default();
-                            Err(format!("OpenAI HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
-                        }
-                    }
-                    Err(e) => Err(format!("Cannot reach OpenAI: {} (API key set: {})", e, if api_key.is_empty() { "NO" } else { "yes" })),
-                }
-            }
-            "Anthropic" => {
-                let api_key = env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-                if api_key.is_empty() {
-                    Err("ANTHROPIC_API_KEY not set".into())
-                } else {
-                    let body = serde_json::json!({
-                    "model": model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "ping"}]
-                });
-                match reqwest::Client::new()
-                    .post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() { Ok(()) }
-                        else {
-                            let text = resp.text().await.unwrap_or_default();
-                            Err(format!("Anthropic HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
-                        }
-                    }
-                    Err(e) => Err(format!("Cannot reach Anthropic: {}", e)),
-                }
-                }
-            }
-            "Ollama" => {
-                let base_url = env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
-                let endpoint = format!("{}/api/tags", base_url.trim_end_matches('/'));
-                match reqwest::Client::new().get(&endpoint).send().await {
-                    Ok(resp) if resp.status().is_success() => Ok(()),
-                    Ok(resp) => Err(format!("Ollama HTTP {}", resp.status())),
-                    Err(e) => Err(format!("Cannot reach Ollama at {}: {} (is Ollama running?)", base_url, e)),
-                }
-            }
-            "Antigravity Zen" | "AntigravityZen" | "Antigravity" | "Zen" => {
-                let endpoint = "https://antigravity.ai/zen/v1/chat/completions";
-                let api_key = env::var("ANTIGRAVITY_API_KEY")
-                    .or_else(|_| env::var("ANTIGRAVITY_ZEN_API_KEY"))
-                    .unwrap_or_else(|_| "dummy".into());
-                let body = serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1
-                });
-                match reqwest::Client::new().post(endpoint)
-                    .bearer_auth(api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            Ok(())
-                        } else {
-                            let text = resp.text().await.unwrap_or_default();
-                            Err(format!("Antigravity Zen HTTP {} — {}", status, text.chars().take(200).collect::<String>()))
-                        }
-                    }
-                    Err(e) => Err(format!("Cannot reach Antigravity Zen: {}", e)),
-                }
-            }
-            _ => Ok(()),
+        let agent = &self.session().agent;
+        let provider = agent.provider.clone();
+        let creds = Credentials::from_config(&self.config);
+        let msgs = vec![Message::user("ping — reply with: pong")];
+        let req = cacode_core::llm::LlmRequest {
+            model: provider.model(),
+            system: "Reply with the single word pong.",
+            messages: &msgs,
+            tools: &[],
+            tool_mode: cacode_core::llm::ToolMode::Native,
+            max_tokens: 8,
+            stream: false,
         };
-
-        match result {
-            Ok(()) => self.status_msg = format!("✓ {} ({}): connection OK", provider, model),
-            Err(e) => self.status_msg = format!("✗ {} error: {}", provider, e),
-        }
+        let t = cacode_core::llm::Timeouts { first_byte: Duration::from_secs(20), idle: Duration::from_secs(20) };
+        let started = Instant::now();
+        let client = cacode_core::llm::build_client();
+        let res = cacode_core::llm::complete(&client, &provider, &creds, &req, t, &|_: &str| {}).await;
+        self.status_msg = match res {
+            Ok(r) => format!("✓ {}: connection OK in {} ms ({} tokens{})", provider.display_label(), started.elapsed().as_millis(), r.usage.total_tokens, if r.usage.estimated { ", est." } else { "" }),
+            Err(e) => format!("✗ {} error: {}", provider.display_label(), truncate_chars(&e.to_string(), 160)),
+        };
     }
 
     fn refresh_models_cache(&mut self) {
@@ -1669,22 +1775,87 @@ impl App {
     }
 }
 
-pub async fn run_tui() -> Result<()> {
+/// Restore the terminal (raw mode, alternate screen, paste mode).
+pub fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
+}
+
+#[derive(Default)]
+pub struct TuiOptions {
+    pub resume: Option<cacode_core::sessions::SessionRecord>,
+    pub permission_mode: Option<PermissionMode>,
+    pub model: Option<String>,
+}
+
+/// Rebuild the visible transcript from an agent history (resume).
+fn messages_from_history(history: &[Message]) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    for m in history {
+        match m.role.as_str() {
+            "user" => out.push(ChatMessage::plain("user", m.content.clone())),
+            "assistant" if !m.content.trim().is_empty() => out.push(ChatMessage::plain("assistant", m.content.clone())),
+            "tool" => {
+                let name = m.name.clone().unwrap_or_default();
+                let body = truncate_chars(&m.content, 600);
+                if m.is_error {
+                    out.push(ChatMessage::plain("tool_result_error", format!("[Error: {}]\n{}", name, body)));
+                } else {
+                    out.push(ChatMessage::plain("tool_result", format!("[Result: {}]\n{}", name, body)));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+impl App {
+    /// Load a stored session into the active tab.
+    fn resume_into_active(&mut self, rec: cacode_core::sessions::SessionRecord) {
+        let title = rec.title.clone();
+        let id = rec.id.clone();
+        let s = self.session_mut();
+        s.agent.restore_session(rec);
+        s.messages = messages_from_history(&s.agent.history);
+        s.messages.push(ChatMessage::plain("system", format!("↺ Resumed session {} — {}", id, title)));
+        s.total_tokens = s.agent.total_usage.total_tokens as u64;
+        s.show_welcome = false;
+    }
+}
+
+pub async fn run_tui(opts: TuiOptions) -> Result<()> {
     let config = CaCodeConfig::load().unwrap_or_default();
-    config.apply_to_env();
+
+    // A panic anywhere must never leave the user's terminal in raw mode.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
+    if let Some(m) = opts.permission_mode {
+        for s in &mut app.sessions {
+            s.agent.permission_mode = m;
+        }
+    }
+    if let Some(model) = &opts.model {
+        cacode_core::commands::headless::set_model(&mut app.sessions[0].agent.provider, model);
+    }
+    if let Some(rec) = opts.resume {
+        app.resume_into_active(rec);
+    }
     let result = event_loop(&mut terminal, &mut app).await;
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    restore_terminal();
+    let _ = terminal.show_cursor();
     result
 }
 
@@ -1696,16 +1867,24 @@ async fn event_loop(
         app.drain_agent_events();
         terminal.draw(|f| ui(f, app))?;
         if app.should_quit {
-            if let Some(tok) = app.cancel_token.clone() {
-                tok.cancel();
-            }
+            app.cancel_all_turns();
             return Ok(());
         }
-        if app.is_thinking {
+        if app.is_thinking || app.sessions.iter().any(|s| s.is_busy()) {
             app.spinner_frame += 1;
         }
         if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+            if let Event::Paste(text) = &ev {
+                if app.active_page == 0 {
+                    handle_paste(app, text);
+                }
+                continue;
+            }
+            if let Event::Key(key) = ev {
+                if key.kind == crossterm::event::KeyEventKind::Release {
+                    continue;
+                }
                 if handle_global_key(app, key) {
                     continue;
                 }
@@ -1732,6 +1911,22 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 app.show_exit_confirmation = false;
             }
+            _ => {}
+        }
+        return true;
+    }
+
+    // Approval dialog for the active session captures keys until answered.
+    if app.active_page == 0 && !app.session().approvals.is_empty() {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Char('y')) | (_, KeyCode::Char('Y')) | (_, KeyCode::Enter) => app.answer_approval(ApprovalDecision::Approve),
+            (_, KeyCode::Char('a')) | (_, KeyCode::Char('A')) => app.answer_approval(ApprovalDecision::ApproveAlways),
+            (_, KeyCode::Char('n')) | (_, KeyCode::Char('N')) | (_, KeyCode::Esc) => app.answer_approval(ApprovalDecision::Reject(None)),
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => app.cancel_turn(),
+            (_, KeyCode::Up) => app.approval_scroll = app.approval_scroll.saturating_sub(1),
+            (_, KeyCode::Down) => app.approval_scroll = app.approval_scroll.saturating_add(1),
+            (_, KeyCode::PageUp) => app.approval_scroll = app.approval_scroll.saturating_sub(10),
+            (_, KeyCode::PageDown) => app.approval_scroll = app.approval_scroll.saturating_add(10),
             _ => {}
         }
         return true;
@@ -1855,6 +2050,100 @@ async fn handle_chat_key(
         }
     }
 
+    // 2a. Ctrl+R reverse history search
+    if let Some(query) = app.history_search.clone() {
+        match key.code {
+            KeyCode::Esc => {
+                app.history_search = None;
+                app.session_mut().input.clear();
+                app.session_mut().cursor_pos = 0;
+                return Ok(());
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // next older match
+                let cur = app.history_cursor.unwrap_or(app.input_history.len());
+                if let Some(i) = app.input_history[..cur.min(app.input_history.len())].iter().rposition(|h| h.contains(&query)) {
+                    app.history_cursor = Some(i);
+                    let v = app.input_history[i].clone();
+                    app.session_mut().cursor_pos = v.len();
+                    app.session_mut().input = v;
+                }
+                return Ok(());
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let q = format!("{}{}", query, c);
+                if let Some(i) = app.input_history.iter().rposition(|h| h.contains(&q)) {
+                    app.history_cursor = Some(i);
+                    let v = app.input_history[i].clone();
+                    app.session_mut().cursor_pos = v.len();
+                    app.session_mut().input = v;
+                }
+                app.history_search = Some(q);
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                let mut q = query.clone();
+                q.pop();
+                app.history_search = Some(q);
+                return Ok(());
+            }
+            KeyCode::Enter => {} // fall through: submit the matched entry
+            _ => {
+                app.history_search = None;
+            }
+        }
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+        app.history_search = Some(String::new());
+        app.history_cursor = None;
+        app.status_msg = "(reverse-i-search) type to search history · Ctrl+R older · Enter run · Esc cancel".into();
+        return Ok(());
+    }
+
+    // 2b. Prompt history: Alt/Ctrl + Up/Down
+    if (key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL)) && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        if app.input_history.is_empty() {
+            return Ok(());
+        }
+        let n = app.input_history.len();
+        let next = match (key.code, app.history_cursor) {
+            (KeyCode::Up, None) => Some(n - 1),
+            (KeyCode::Up, Some(i)) => Some(i.saturating_sub(1)),
+            (KeyCode::Down, Some(i)) if i + 1 < n => Some(i + 1),
+            _ => None,
+        };
+        app.history_cursor = next;
+        let v = next.map(|i| app.input_history[i].clone()).unwrap_or_default();
+        app.session_mut().cursor_pos = v.len();
+        app.session_mut().input = v;
+        return Ok(());
+    }
+
+    // 2c. @file mention autocomplete (Tab completes, ↑↓ select)
+    if let Some((start, needle)) = mention_at_cursor(&app.session().input, app.session().cursor_pos) {
+        if matches!(key.code, KeyCode::Tab | KeyCode::Up | KeyCode::Down) {
+            let files = app.workspace_files();
+            let matches = match_files(&files, &needle, 8);
+            if !matches.is_empty() {
+                match key.code {
+                    KeyCode::Tab => {
+                        let choice = matches[app.autocomplete_idx % matches.len()].clone();
+                        let pos = app.session().cursor_pos;
+                        let mut input = app.session().input.clone();
+                        input.replace_range(start..pos, &format!("@{} ", choice));
+                        let new_pos = start + choice.len() + 2;
+                        app.session_mut().input = input;
+                        app.session_mut().cursor_pos = new_pos;
+                        app.autocomplete_idx = 0;
+                    }
+                    KeyCode::Up => app.autocomplete_idx = (app.autocomplete_idx + matches.len() - 1) % matches.len(),
+                    _ => app.autocomplete_idx = (app.autocomplete_idx + 1) % matches.len(),
+                }
+                return Ok(());
+            }
+        }
+    }
+
     // 2. Autocomplete navigation when input starts with '/'
     let input_str = app.session().input.clone();
     let is_slash = input_str.starts_with('/');
@@ -1925,18 +2214,9 @@ async fn handle_chat_key(
             return Ok(());
         }
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-            if app.is_thinking {
+            if app.session().is_busy() {
                 app.cancel_turn();
-                app.is_thinking = false;
-                app.status_msg = "Cancelled".into();
-                let idx = app.agent_turn_session.min(app.sessions.len() - 1);
-                app.sessions[idx].messages.push(ChatMessage::plain(
-                    "system",
-                    "[Interrupted by user (Ctrl+C)]".to_string(),
-                ));
-                app.agent_events_rx = None;
-                app.steering_tx = None;
-                app.cancel_token = None;
+                app.status_msg = "Cancelling…".into();
             } else {
                 app.show_exit_confirmation = true;
             }
@@ -1980,8 +2260,13 @@ async fn handle_chat_key(
             return Ok(());
         }
         (_, KeyCode::Enter) => {
-            let input = app.session().input.trim().to_string();
-            if input.is_empty() { return Ok(()); }
+            app.history_search = None;
+            let raw_input = app.session().input.trim().to_string();
+            if raw_input.is_empty() { return Ok(()); }
+            app.push_history(&raw_input);
+            app.history_cursor = None;
+            let input = app.session().expand_pastes(&raw_input);
+            app.session_mut().pastes.clear();
             app.session_mut().input.clear();
             app.session_mut().cursor_pos = 0;
             app.session_mut().show_welcome = false;
@@ -2078,7 +2363,7 @@ async fn handle_chat_key(
             // Mid-turn steering: while a ReAct turn is in flight, a plain
             // message is captured as a `[Steering / Mid-turn]` instruction
             // that the background agent folds into its next reasoning step.
-            if app.is_thinking && !input.starts_with('/') {
+            if app.session().is_busy() && !input.starts_with('/') {
                 app.session_mut()
                     .messages
                     .push(ChatMessage::plain("user", format!("[Steering / Mid-turn] {}", input)));
@@ -2484,12 +2769,13 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/help" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch or configure provider (/provider add|list|<name>)\n  /fallback <1|2|3>  - Configure 3-tier auto-failover routing\n  /theme <name>      - Switch theme preset (classic, tokyo, nord, onedark, contrast, light)\n  /pro [key]         - Pro license activation & feature matrix\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /todo <args>       - Task checklist (/todo add|done|list|clear)\n  /dev, @dev         - Development implementation protocol\n  /prd, @prd         - Interactive PRD authoring wizard\n  /audit, @audit     - Security & architecture whitebox audit\n  /fix, @fix         - Systematic 4-phase bugfix\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /version           - Show version (v1.0.9)\n  /exit              - Quit\nShortcuts: Tab (autocomplete), Ctrl+T (new session), Ctrl+W (close), Esc (back to chat)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", "Available Commands:\n  /providers         - Probe & display local & free providers (Ollama, Zen)\n  /provider <name>   - Switch or configure provider (/provider add|list|<name>)\n  /fallback <1|2|3>  - Configure 3-tier auto-failover routing\n  /theme <name>      - Switch theme preset (classic, tokyo, nord, onedark, contrast, light)\n  /pro [key]         - Pro license activation & feature matrix\n  /models            - Pick model interactively\n  /mode              - Set thinking level (Fast, Analytical, Deep)\n  /settings          - Open BYOK config\n  /monitor           - View token telemetry log\n  /report            - View cost report\n  /skills            - Skills library\n  /todo <args>       - Task checklist (/todo add|done|list|clear)\n  /dev, @dev         - Development implementation protocol\n  /prd, @prd         - Interactive PRD authoring wizard\n  /audit, @audit     - Security & architecture whitebox audit\n  /fix, @fix         - Systematic 4-phase bugfix\n  /status            - Current system status\n  /sessions          - List chat sessions\n  /clear             - Clear chat\n  /export            - Export transcript to Markdown\n  /compress          - Summarise older context (runs in background)\n  /undo              - Revert the agent's last file edit\n  /permissions <m>   - ask | auto-edit | yolo | read-only\n  /jobs              - Background shell jobs\n  /version           - Show version\n  /exit              - Quit\nShortcuts: Tab (autocomplete), @path (file mention), Ctrl+R (history search), Alt/Ctrl+↑↓ (history), Shift+Enter (newline), Ctrl+T (new session), Ctrl+W (close), Ctrl+C (cancel turn), Esc (back to chat)\nApproval dialog: y approve · a always (session) · n reject · ↑↓ scroll diff"));
                         return Ok(());
                     }
                     "/clear" => {
                         app.session_mut().messages.clear();
                         app.session_mut().agent.history.clear();
+                        app.session_mut().agent.session_id = cacode_core::sessions::new_id();
                         app.session_mut().total_tokens = 0;
                         app.session_mut().show_welcome = true;
                         app.session_mut().react_steps.clear();
@@ -2498,31 +2784,146 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/compress" => {
-                        app.is_thinking = true;
-                        app.status_msg = "Compressing conversation history...".into();
-                        terminal.draw(|f| ui(f, app))?;
-                        let res = app.session_mut().agent.compress_history().await;
-                        app.is_thinking = false;
-                        match res {
-                            Ok(msg) => {
-                                app.session_mut().messages.push(ChatMessage::plain("system", msg));
-                                app.status_msg = "Context compressed ✓".into();
+                        if app.session().is_busy() {
+                            app.status_msg = "Wait for the current turn to finish (or Ctrl+C) before /compress".into();
+                            return Ok(());
+                        }
+                        app.start_compress();
+                        return Ok(());
+                    }
+                    "/undo" => {
+                        let res = app.session_mut().agent.ensure_tool_ctx().and_then(|c| c.undo.undo_last());
+                        let msg = match res {
+                            Ok(m) => format!("↶ {}", m),
+                            Err(e) => format!("Undo: {}", e),
+                        };
+                        app.session_mut().messages.push(ChatMessage::plain("system", msg));
+                        return Ok(());
+                    }
+                    "/permissions" | "/perm" => {
+                        if let Some(m) = PermissionMode::parse(arg) {
+                            app.config.permission_mode = m.label().to_string();
+                            let _ = app.config.save();
+                            for s in &mut app.sessions {
+                                s.agent.permission_mode = m;
                             }
-                            Err(e) => {
-                                app.session_mut().messages.push(ChatMessage::plain("system", format!("Compression failed: {}", e)));
-                                app.status_msg = "Compression failed".into();
+                            app.status_msg = format!("Permission mode: {}", m.label());
+                        }
+                        let cur = app.session().agent.permission_mode;
+                        app.session_mut().messages.push(ChatMessage::plain(
+                            "system",
+                            format!(
+                                "Permission mode: {}\n  ask        — confirm every edit (diff shown) and non-allowlisted command\n  auto-edit  — apply edits automatically, confirm commands\n  yolo       — never ask (trusted/CI only)\n  read-only  — deny edits and non-allowlisted commands\nUsage: /permissions <mode>",
+                                cur.label()
+                            ),
+                        ));
+                        return Ok(());
+                    }
+                    "/resume" => {
+                        let store = cacode_core::sessions::SessionStore::open_default();
+                        if app.session().is_busy() {
+                            app.status_msg = "Finish or cancel the current turn first".into();
+                            return Ok(());
+                        }
+                        if arg.is_empty() {
+                            let ws = std::env::current_dir().ok().and_then(|p| p.canonicalize().ok());
+                            let list = store.list(ws.as_deref());
+                            let body = if list.is_empty() {
+                                "No saved sessions for this directory.".to_string()
+                            } else {
+                                let mut b = String::from("Saved sessions (newest first) — /resume <id>:\n");
+                                for s in list.iter().take(15) {
+                                    b.push_str(&format!("  {}  {:>3} msgs  {}\n", s.id, s.messages, s.title));
+                                }
+                                b
+                            };
+                            app.session_mut().messages.push(ChatMessage::plain("system", body));
+                        } else {
+                            match store.load(arg) {
+                                Ok(rec) => app.resume_into_active(rec),
+                                Err(e) => app.session_mut().messages.push(ChatMessage::plain("system", format!("Resume failed: {}", e))),
                             }
                         }
                         return Ok(());
                     }
+                    "/plan" => {
+                        for s in &mut app.sessions {
+                            s.agent.permission_mode = PermissionMode::Plan;
+                        }
+                        app.status_msg = "Plan mode: the agent investigates read-only and asks you to approve a plan".into();
+                        app.session_mut().messages.push(ChatMessage::plain("system", "🗺 Plan mode ON — edits are blocked until you approve the agent's plan (y = ask mode, a = auto-edit). /permissions ask to leave."));
+                        return Ok(());
+                    }
+                    "/trust" => {
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let msg = match cacode_core::trust::trust(&cwd) {
+                            Ok(()) => {
+                                // rebuild tool contexts so hooks / MCP load on the next turn
+                                for s in &mut app.sessions {
+                                    s.agent.tool_ctx = None;
+                                    s.agent.extensions_announced = false;
+                                }
+                                format!("Trusted {} — project hooks (.cacode/hooks.toml) and MCP servers (.mcp.json) load from the next turn.", cwd.display())
+                            }
+                            Err(e) => format!("Trust failed: {}", e),
+                        };
+                        app.session_mut().messages.push(ChatMessage::plain("system", msg));
+                        return Ok(());
+                    }
+                    "/mcp" => {
+                        let body = match app.session().agent.tool_ctx.as_ref() {
+                            Some(c) => {
+                                let mut b = format!("Workspace trusted: {}\nHooks: {} pre_tool, {} post_tool\n", c.trusted, c.hooks.pre.len(), c.hooks.post.len());
+                                match &c.mcp {
+                                    Some(m) => {
+                                        let specs = m.specs();
+                                        b.push_str(&format!("MCP tools ({}):\n", specs.len()));
+                                        for t in specs.iter().take(60) {
+                                            b.push_str(&format!("  {}{}\n", t.name, if t.read_only { " (read-only)" } else { "" }));
+                                        }
+                                    }
+                                    None => b.push_str("No MCP servers configured (~/.cacode/mcp.json, or .mcp.json in a trusted workspace).\n"),
+                                }
+                                b
+                            }
+                            None => "MCP/hooks load when the first turn starts.".into(),
+                        };
+                        app.session_mut().messages.push(ChatMessage::plain("system", body));
+                        return Ok(());
+                    }
+                    "/jobs" => {
+                        let list = app.session().agent.tool_ctx.as_ref().map(|c| c.jobs.list()).unwrap_or_default();
+                        let body = if list.is_empty() {
+                            "No background jobs.".to_string()
+                        } else {
+                            list.iter().map(|(id, cmd, done)| format!("  {} [{}] {}", id, if *done { "done" } else { "running" }, cmd)).collect::<Vec<_>>().join("\n")
+                        };
+                        app.session_mut().messages.push(ChatMessage::plain("system", body));
+                        return Ok(());
+                    }
                     "/context" => {
-                        let last_u = &app.session().agent.last_usage;
-                        let tot_u = &app.session().agent.total_usage;
-                        let limit = app.session().agent.context_window_limit;
-                        let pct = if limit > 0 { (tot_u.total_tokens as f64 / limit as f64) * 100.0 } else { 0.0 };
+                        let agent = &app.session().agent;
+                        let last_u = agent.last_usage.clone();
+                        let tot_u = agent.total_usage.clone();
+                        let limit = agent.context_limit();
+                        // occupancy = what the LAST request actually sent, not the lifetime total
+                        let occupied = last_u.prompt_tokens + last_u.completion_tokens;
+                        let pct = if limit > 0 { (occupied as f64 / limit as f64) * 100.0 } else { 0.0 };
                         let info = format!(
-                            "Context Telemetry:\n  Active Model: {}\n  Last Prompt Tokens: {}\n  Last Completion Tokens: {}\n  Total Tokens Used: {}\n  Context Window Budget: {} tokens (~{:.1}% used)",
-                            app.model_name(), last_u.prompt_tokens, last_u.completion_tokens, tot_u.total_tokens, limit, pct
+                            "Context Telemetry:\n  Active Model: {}\n  Context window: {} tokens\n  Current occupancy (last request): {} tokens (~{:.1}%){}\n  Messages in history: {}\n  Lifetime usage this session: {} tokens ({} in / {} out){}\n  Prompt cache this session: {} tokens read, {} written\n  Auto-compact triggers at {:.0}% of the window",
+                            app.model_name(),
+                            limit,
+                            occupied,
+                            pct,
+                            if last_u.estimated { " (estimated)" } else { "" },
+                            agent.history.len(),
+                            tot_u.total_tokens,
+                            tot_u.prompt_tokens,
+                            tot_u.completion_tokens,
+                            if tot_u.estimated { " — includes estimates" } else { "" },
+                            tot_u.cache_read_tokens,
+                            tot_u.cache_write_tokens,
+                            cacode_core::commands::chat::AUTO_COMPACT_RATIO * 100.0
                         );
                         app.session_mut().messages.push(ChatMessage::plain("system", info));
                         return Ok(());
@@ -2642,7 +3043,7 @@ async fn handle_chat_key(
                         return Ok(());
                     }
                     "/version" => {
-                        app.session_mut().messages.push(ChatMessage::plain("system", "CACode v1.0.9 (Sovereign Rust Agent)"));
+                        app.session_mut().messages.push(ChatMessage::plain("system", format!("CACode v{} (Sovereign Rust Agent)", CA_VERSION)));
                         return Ok(());
                     }
                     s => {
@@ -2661,11 +3062,16 @@ async fn handle_chat_key(
             app.session_mut().update_todos_from_text(&input);
 
             // Append thinking mode hint if active
-            let prompt_to_send = match app.config.thinking_mode.as_str() {
+            let mut prompt_to_send = match app.config.thinking_mode.as_str() {
                 "Analytical" => format!("[Mode: Analytical — break down problem step-by-step before answering]\n\n{}", input),
                 "Deep" => format!("[Mode: Deep Reasoning — explore edge-cases, formal proof, and comprehensive verification]\n\n{}", input),
                 _ => input.clone(),
             };
+            // @path mentions → tell the agent which files the user means
+            let mentioned = mentioned_files(&input);
+            if !mentioned.is_empty() {
+                prompt_to_send.push_str(&format!("\n\n(User referenced these workspace files: {}. Read them with read_file before answering.)", mentioned.join(", ")));
+            }
 
             app.start_turn(prompt_to_send);
         }
@@ -3033,6 +3439,14 @@ fn ui(f: &mut Frame, app: &App) {
     // Draw autocomplete popup if user is typing a slash command
     if app.active_page == 0 && app.modal_picker == ModalPicker::Off && !app.show_exit_confirmation {
         draw_autocomplete_popup(f, app, pill_area);
+        draw_mention_popup(f, app, pill_area);
+    }
+
+    // Approval dialog (diff viewer) for the active session
+    if app.active_page == 0 && !app.show_exit_confirmation {
+        if let Some(t) = app.session().approvals.front() {
+            draw_approval(f, app, t, size);
+        }
     }
 
     // Draw modal picker if active (Models or Thinking Mode)
@@ -3259,6 +3673,240 @@ fn draw_welcome_input_card(f: &mut Frame, app: &App, area: Rect) -> Option<(u16,
     Some((cx, cy))
 }
 
+fn keywords_for(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "rust" | "rs" => &["fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "use", "mod", "match", "if", "else", "for", "while", "loop", "return", "async", "await", "move", "self", "Self", "const", "static", "where", "type", "crate", "super", "as", "in", "ref", "dyn", "unsafe", "true", "false", "Some", "None", "Ok", "Err"],
+        "go" | "golang" => &["func", "package", "import", "var", "const", "type", "struct", "interface", "map", "chan", "go", "defer", "if", "else", "for", "range", "return", "switch", "case", "default", "nil", "true", "false", "err"],
+        "ts" | "typescript" | "js" | "javascript" | "tsx" | "jsx" => &["function", "const", "let", "var", "class", "interface", "type", "export", "import", "from", "return", "if", "else", "for", "while", "async", "await", "new", "this", "true", "false", "null", "undefined"],
+        "py" | "python" => &["def", "class", "import", "from", "return", "if", "elif", "else", "for", "while", "in", "not", "and", "or", "with", "as", "async", "await", "None", "True", "False", "self", "lambda", "yield"],
+        "cs" | "csharp" | "c#" => &["public", "private", "protected", "internal", "class", "struct", "interface", "namespace", "using", "void", "var", "new", "return", "if", "else", "foreach", "for", "async", "await", "static", "readonly", "null", "true", "false", "this"],
+        "sh" | "bash" | "shell" | "zsh" => &["if", "then", "fi", "for", "do", "done", "case", "esac", "function", "export", "local", "return", "echo"],
+        _ => &[],
+    }
+}
+
+/// Lightweight syntax highlighter for fenced code (keywords, strings,
+/// comments, numbers; diff +/- lines). Not a full parser — just readable.
+pub fn highlight_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let base = Style::default().fg(theme.text);
+    if lang == "diff" || lang == "patch" {
+        let st = if line.starts_with('+') { Style::default().fg(theme.success) } else if line.starts_with('-') { Style::default().fg(theme.error) } else if line.starts_with("@@") { Style::default().fg(theme.accent) } else { base };
+        return vec![Span::styled(line.to_string(), st)];
+    }
+    let kws = keywords_for(lang);
+    let comment_start = match lang {
+        "py" | "python" | "sh" | "bash" | "shell" | "zsh" | "toml" | "yaml" | "yml" => "#",
+        _ => "//",
+    };
+    let kw_style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let str_style = Style::default().fg(theme.success);
+    let num_style = Style::default().fg(theme.warning);
+    let com_style = Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC);
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let flush_word = |buf: &mut String, spans: &mut Vec<Span<'static>>| {
+        if buf.is_empty() {
+            return;
+        }
+        let w = std::mem::take(buf);
+        let st = if kws.contains(&w.as_str()) { kw_style } else if w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) { num_style } else { base };
+        spans.push(Span::styled(w, st));
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        let rest: String = chars[i..].iter().collect();
+        if rest.starts_with(comment_start) {
+            flush_word(&mut buf, &mut spans);
+            spans.push(Span::styled(rest, com_style));
+            return spans;
+        }
+        if c == '"' || c == '`' || (c == '\'' && !matches!(lang, "rust" | "rs")) {
+            flush_word(&mut buf, &mut spans);
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != c {
+                if chars[j] == '\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            let end = (j + 1).min(chars.len());
+            spans.push(Span::styled(chars[i..end].iter().collect::<String>(), str_style));
+            i = end;
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            buf.push(c);
+        } else {
+            flush_word(&mut buf, &mut spans);
+            spans.push(Span::styled(c.to_string(), base));
+        }
+        i += 1;
+    }
+    flush_word(&mut buf, &mut spans);
+    spans
+}
+
+/// Insert pasted text; large pastes are folded into a placeholder token.
+fn handle_paste(app: &mut App, text: &str) {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let insert = if text.lines().count() > 8 || text.len() > 2_000 {
+        app.session_mut().pastes.push(text.clone());
+        let n = app.session().pastes.len();
+        paste_tag(n, &text)
+    } else {
+        text
+    };
+    let pos = app.session().cursor_pos;
+    let valid = if app.session().input.is_char_boundary(pos) { pos } else { app.session().input.len() };
+    app.session_mut().input.insert_str(valid, &insert);
+    app.session_mut().cursor_pos = valid + insert.len();
+    app.session_mut().show_welcome = false;
+}
+
+/// `(byte_start, needle)` when the cursor is inside an `@path` token.
+pub fn mention_at_cursor(input: &str, cursor: usize) -> Option<(usize, String)> {
+    let cursor = cursor.min(input.len());
+    if !input.is_char_boundary(cursor) {
+        return None;
+    }
+    let before = &input[..cursor];
+    let start = before.rfind(|c: char| c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
+    let token = &before[start..];
+    let needle = token.strip_prefix('@')?;
+    // @dev / @prd / @audit / @fix are protocol commands, not files
+    if ["dev", "prd", "audit", "fix"].contains(&needle) {
+        return None;
+    }
+    Some((start, needle.to_string()))
+}
+
+pub fn match_files(files: &[String], needle: &str, limit: usize) -> Vec<String> {
+    let n = needle.to_lowercase();
+    let mut scored: Vec<(usize, &String)> = files
+        .iter()
+        .filter_map(|f| {
+            let lf = f.to_lowercase();
+            let name = lf.rsplit('/').next().unwrap_or(&lf).to_string();
+            if n.is_empty() {
+                Some((3, f))
+            } else if name.starts_with(&n) {
+                Some((0, f))
+            } else if lf.starts_with(&n) {
+                Some((1, f))
+            } else if lf.contains(&n) {
+                Some((2, f))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.len().cmp(&b.1.len())));
+    scored.into_iter().take(limit).map(|(_, f)| f.clone()).collect()
+}
+
+/// Files mentioned as `@path` that exist in the current directory.
+pub fn mentioned_files(input: &str) -> Vec<String> {
+    let root = std::env::current_dir().unwrap_or_default();
+    input
+        .split_whitespace()
+        .filter_map(|t| t.strip_prefix('@'))
+        .map(|t| t.trim_end_matches([',', '.', ':', ';', ')']))
+        .filter(|t| !t.is_empty() && root.join(t).is_file())
+        .map(String::from)
+        .collect()
+}
+
+fn draw_mention_popup(f: &mut Frame, app: &App, input_area: Rect) {
+    let session = app.session();
+    let Some((_, needle)) = mention_at_cursor(&session.input, session.cursor_pos) else { return };
+    let Some((_, files)) = app.file_cache.as_ref() else {
+        return;
+    };
+    let matches = match_files(files, &needle, 8);
+    if matches.is_empty() {
+        return;
+    }
+    let width = matches.iter().map(|m| m.chars().count()).max().unwrap_or(10).clamp(20, 70) as u16 + 4;
+    let height = matches.len() as u16;
+    let rect = Rect { x: input_area.x.saturating_add(2), y: input_area.y.saturating_sub(height), width: width.min(f.area().width), height };
+    f.render_widget(Clear, rect);
+    let items: Vec<ListItem> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let sel = i == app.autocomplete_idx % matches.len();
+            let style = if sel { Style::default().fg(Color::Black).bg(BRAND).add_modifier(Modifier::BOLD) } else { Style::default().fg(GRAY).bg(Color::Rgb(15, 15, 20)) };
+            ListItem::new(Line::from(Span::styled(format!("{} @{}", if sel { "▸" } else { " " }, m), style)))
+        })
+        .collect();
+    f.render_widget(List::new(items), rect);
+}
+
+/// Colourised unified diff lines.
+fn diff_lines<'a>(diff: &'a str, theme: &Theme) -> Vec<Line<'a>> {
+    diff.lines()
+        .map(|l| {
+            let style = if l.starts_with("+++") || l.starts_with("---") {
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+            } else if l.starts_with('+') {
+                Style::default().fg(theme.success)
+            } else if l.starts_with('-') {
+                Style::default().fg(theme.error)
+            } else if l.starts_with("@@") {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.text_soft)
+            };
+            Line::from(Span::styled(l, style))
+        })
+        .collect()
+}
+
+fn draw_approval(f: &mut Frame, app: &App, ticket: &ApprovalTicket, screen: Rect) {
+    let theme = &app.theme;
+    let req = &ticket.request;
+    let w = screen.width.saturating_sub(6).min(110);
+    let diff_len = req.diff.as_ref().map(|d| d.lines().count()).unwrap_or(0) as u16;
+    let h = (diff_len + 7).clamp(8, screen.height.saturating_sub(4));
+    let rect = Rect { x: screen.x + (screen.width.saturating_sub(w)) / 2, y: screen.y + (screen.height.saturating_sub(h)) / 2, width: w, height: h };
+    f.render_widget(Clear, rect);
+    let pending = app.session().approvals.len();
+    let title = format!(" ⚠ Approval required{} ", if pending > 1 { format!(" (1 of {})", pending) } else { String::new() });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.warning).add_modifier(Modifier::BOLD))
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .style(Style::default().bg(theme.card_bg));
+    f.render_widget(block, rect);
+    let inner = Rect { x: rect.x + 2, y: rect.y + 1, width: rect.width.saturating_sub(4), height: rect.height.saturating_sub(2) };
+    let mut lines = vec![
+        Line::from(vec![Span::styled(format!("{}: ", req.tool), Style::default().fg(theme.muted)), Span::styled(req.summary.clone(), Style::default().fg(theme.text).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+    ];
+    if let Some(d) = &req.diff {
+        lines.extend(diff_lines(d, theme));
+    }
+    let footer_h = 2u16;
+    let body_h = inner.height.saturating_sub(footer_h);
+    let max_scroll = (lines.len() as u16).saturating_sub(body_h);
+    let scroll = app.approval_scroll.min(max_scroll);
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).style(Style::default().bg(theme.card_bg)), Rect { height: body_h, ..inner });
+    let footer = Line::from(vec![
+        Span::styled("[y] Approve", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled("[a] Always (this session)", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled("[n] Reject", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled("↑↓ PgUp/PgDn scroll", Style::default().fg(theme.muted)),
+    ]);
+    f.render_widget(Paragraph::new(vec![Line::from(""), footer]).style(Style::default().bg(theme.card_bg)), Rect { y: inner.y + body_h, height: footer_h, ..inner });
+}
+
 fn draw_exit_confirmation(f: &mut Frame, app: &App, screen: Rect) {
     let theme = &app.theme;
     let modal_w = 54u16.min(screen.width.saturating_sub(2));
@@ -3354,7 +4002,7 @@ fn draw_sidebar_inspector(f: &mut Frame, app: &App, area: Rect) {
     let total_tok = session.agent.total_usage.total_tokens.max(session.total_tokens as i64);
     let prompt_tok = session.agent.total_usage.prompt_tokens;
     let compl_tok = session.agent.total_usage.completion_tokens;
-    let cost = est_token_cost(app.provider_name(), prompt_tok, compl_tok);
+    let cost = est_token_cost(app.provider_name(), &app.model_name(), prompt_tok, compl_tok);
     let cost_str = if cost == 0.0 { "$0.00".to_string() } else { format!("${:.2}", cost) };
 
     // 3. Progress & Steps
@@ -3573,6 +4221,16 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
 
     for msg in &session.messages {
         match msg.role.as_str() {
+            "user" if msg.content.contains("[Pasted #") => {
+                for (idx, line) in msg.content.lines().enumerate() {
+                    let lead = if idx == 0 { "● " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(lead, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                        Span::styled(line.to_string(), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
             "user" => {
                 let unescaped = unescape_newlines(&msg.content);
                 for (idx, line) in unescaped.lines().enumerate() {
@@ -3648,11 +4306,13 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
             "assistant" => {
                 let unescaped = unescape_newlines(&msg.content);
                 let mut in_code_block = false;
+                let mut code_lang = String::new();
                 for line in unescaped.lines() {
                     if line.trim_start().starts_with("```") {
                         if !in_code_block {
                             in_code_block = true;
                             let lang = line.trim_start().trim_start_matches('`').trim();
+                            code_lang = lang.to_lowercase();
                             let lang_tag = if lang.is_empty() { "code" } else { lang };
                             lines.push(Line::from(vec![
                                 Span::styled("  ╭── ", Style::default().fg(theme.accent_dim)),
@@ -3664,10 +4324,9 @@ fn draw_messages(f: &mut Frame, app: &App, session: &ChatSession, area: Rect) {
                             lines.push(Line::from(Span::styled("  ╰────────────────────────────", Style::default().fg(theme.accent_dim))));
                         }
                     } else if in_code_block {
-                        lines.push(Line::from(vec![
-                            Span::styled("  │ ", Style::default().fg(theme.accent_dim)),
-                            Span::styled(line.to_string(), Style::default().fg(theme.text)),
-                        ]));
+                        let mut spans = vec![Span::styled("  │ ", Style::default().fg(theme.accent_dim))];
+                        spans.extend(highlight_code_line(line, &code_lang, theme));
+                        lines.push(Line::from(spans));
                     } else {
                         let styled_spans = render_styled_line(line, Style::default().fg(theme.text_soft));
                         lines.push(Line::from(styled_spans));
@@ -4373,11 +5032,28 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if app.sessions.len() > 1 {
+        let busy = app.sessions.iter().filter(|s| s.is_busy()).count();
         left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
         left_spans.push(Span::styled(
-            format!("agent {}/{} ", app.active_session + 1, app.sessions.len()),
+            format!("agent {}/{}{} ", app.active_session + 1, app.sessions.len(), if busy > 0 { format!(" ({} running)", busy) } else { String::new() }),
             Style::default().fg(theme.muted),
         ));
+    }
+
+    // live turn telemetry: elapsed, active tool, streaming speed, permission mode
+    left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
+    left_spans.push(Span::styled(format!("🔐 {} ", app.session().agent.permission_mode.label()), Style::default().fg(theme.muted)));
+    if let Some(rt) = &app.session().turn {
+        let spin = SPINNER_CHARS[app.spinner_frame % SPINNER_CHARS.len()];
+        let secs = rt.started.elapsed().as_secs_f64();
+        let mut t = format!("{} {:.0}s", spin, secs);
+        if let Some((tool, since)) = &rt.active_tool {
+            t.push_str(&format!(" ⚙ {} {:.0}s", tool, since.elapsed().as_secs_f64()));
+        } else if rt.streamed_chars > 0 && secs > 0.0 {
+            t.push_str(&format!(" ~{:.0} tok/s", (rt.streamed_chars as f64 / 3.5) / secs));
+        }
+        left_spans.push(Span::styled("· ", Style::default().fg(theme.muted)));
+        left_spans.push(Span::styled(format!("{} ", t), Style::default().fg(theme.warning)));
     }
 
     if !app.status_msg.is_empty() {
@@ -4388,7 +5064,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let right_spans = vec![
         Span::styled("/status", Style::default().fg(theme.accent_dim)),
         Span::styled("  ·  ", Style::default().fg(theme.muted)),
-        Span::styled("v1.0.9 ", Style::default().fg(theme.muted)),
+        Span::styled(format!("v{} ", CA_VERSION), Style::default().fg(theme.muted)),
     ];
 
     let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -4434,11 +5110,14 @@ mod tests {
 
     #[test]
     fn test_est_token_cost() {
-        let zen_cost = est_token_cost("Antigravity Zen", 1000, 1000);
+        let zen_cost = est_token_cost("Antigravity Zen", "deepseek-v4-flash-free", 1000, 1000);
         assert_eq!(zen_cost, 0.0);
 
-        let paid_cost = est_token_cost("OpenAI", 1_000_000, 1_000_000);
+        let paid_cost = est_token_cost("OpenAI", "gpt-4o", 1_000_000, 1_000_000);
         assert!((paid_cost - 12.5).abs() < 1e-4);
+        // model-aware: Claude Sonnet is not billed at gpt-4o rates
+        let claude = est_token_cost("Anthropic", "claude-sonnet-4-20250514", 1_000_000, 1_000_000);
+        assert!((claude - 18.0).abs() < 1e-4);
     }
 
     #[test]
@@ -4530,27 +5209,27 @@ mod tests {
         let spans = format_session_tabs_spans(&app, 100);
         let text_content: String = spans.iter().map(|s| s.content.as_ref()).collect();
 
-        assert!(text_content.contains("● Session 1"));
+        assert!(text_content.contains("● Term 1"));
         assert!(text_content.contains("│"));
         assert!(text_content.contains("+ (Ctrl+T)"));
         assert!(text_content.contains("[Tab / ⇆ Switch · Ctrl+W Close]"));
 
         // Verify active session styling
-        let active_span = spans.iter().find(|s| s.content.contains("Session 1")).unwrap();
+        let active_span = spans.iter().find(|s| s.content.contains("Term 1")).unwrap();
         assert_eq!(active_span.style.fg, Some(app.theme.accent));
         assert!(active_span.style.add_modifier.contains(Modifier::BOLD));
 
         // 2. Multi-session formatting
-        app.new_session(); // creates Session 2, active_session = 1
+        app.new_session(); // creates Term 2, active_session = 1
         assert_eq!(app.sessions.len(), 2);
         assert_eq!(app.active_session, 1);
 
         let spans2 = format_session_tabs_spans(&app, 120);
-        let s1_span = spans2.iter().find(|s| s.content.contains("Session 1")).unwrap();
+        let s1_span = spans2.iter().find(|s| s.content.contains("Term 1")).unwrap();
         assert_eq!(s1_span.style.fg, Some(app.theme.muted));
         assert!(!s1_span.style.add_modifier.contains(Modifier::BOLD));
 
-        let s2_span = spans2.iter().find(|s| s.content.contains("Session 2")).unwrap();
+        let s2_span = spans2.iter().find(|s| s.content.contains("Term 2")).unwrap();
         assert_eq!(s2_span.style.fg, Some(app.theme.accent));
         assert!(s2_span.style.add_modifier.contains(Modifier::BOLD));
 
@@ -4768,7 +5447,7 @@ mod tests {
         assert!(!free_text.contains("[⭐ PRO]"));
 
         // Activate Pro key
-        cfg.pro_license_key = Some("CACODE-PRO-VIP-2026".to_string());
+        cfg.pro_license_key = Some("CACD99-ABC123-6".to_string());
         assert!(cfg.is_pro());
 
         let app_pro = App::new(cfg);
@@ -4809,3 +5488,245 @@ mod tests {
         assert_eq!(chain[2].name(), "9Router");
     }
 }
+#[cfg(test)]
+mod audit_probe {
+    #[test]
+    fn probe_utf8_slice_panic() {
+        let s = format!("{{\"qq\":\"{}\"}}", "é".repeat(40));
+        let r = std::panic::catch_unwind(|| super::format_tool_action("custom_tool", &s));
+        println!("UTF8 PANIC = {}", r.is_err());
+        assert!(r.is_ok(), "multi-byte tool args must never panic the TUI");
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Minimal OpenAI-compatible mock: serves `replies` in order (last repeats).
+    async fn mock(replies: Vec<serde_json::Value>, delay_ms: u64) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let replies = std::sync::Arc::new(replies);
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let replies = replies.clone();
+                let n = n.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1 << 20];
+                    let mut got = 0;
+                    loop {
+                        let k = s.read(&mut buf[got..]).await.unwrap_or(0);
+                        got += k;
+                        let t = String::from_utf8_lossy(&buf[..got]).to_string();
+                        if let Some(h) = t.find("\r\n\r\n") {
+                            let cl = t.lines().find(|l| l.to_lowercase().starts_with("content-length:")).and_then(|l| l[15..].trim().parse::<usize>().ok()).unwrap_or(0);
+                            if got >= h + 4 + cl {
+                                break;
+                            }
+                        }
+                        if k == 0 {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let i = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = replies.get(i).or(replies.last()).unwrap().to_string();
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    fn text(t: &str) -> serde_json::Value {
+        serde_json::json!({"choices": [{"message": {"role": "assistant", "content": t}}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}})
+    }
+    fn tool(name: &str, args: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": name, "arguments": args.to_string()}}]}}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}})
+    }
+
+    fn point(app: &mut App, idx: usize, url: &str, dir: &std::path::Path, mode: PermissionMode) {
+        let a = &mut app.sessions[idx].agent;
+        a.provider = Provider::Custom { name: "mock".into(), base_url: url.into(), api_key: String::new(), model: "m".into() };
+        a.fallback_chain.clear();
+        a.workspace_root = Some(dir.to_path_buf());
+        a.permission_mode = mode;
+        a.inject_repo_context = false;
+        a.record_usage = false;
+        a.autosave = false;
+        a.stream = false;
+    }
+
+    async fn pump_until(app: &mut App, mut done: impl FnMut(&App) -> bool) {
+        let t0 = Instant::now();
+        while !done(app) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "timed out waiting for UI state");
+            app.drain_agent_events();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_switch_mid_turn_does_not_wedge_other_tabs() {
+        let d = tempfile::tempdir().unwrap();
+        let url = mock(vec![text("slow answer")], 600).await;
+        let mut app = App::new(CaCodeConfig::default());
+        app.new_session();
+        point(&mut app, 0, &url, d.path(), PermissionMode::Yolo);
+        point(&mut app, 1, &url, d.path(), PermissionMode::Yolo);
+        app.active_session = 0;
+        app.start_turn("first".into());
+        assert!(app.sessions[0].is_busy());
+        app.next_session(); // user switches to Term 2 while Term 1 is thinking
+        app.drain_agent_events();
+        assert!(!app.is_thinking, "Term 2 is idle and must accept input");
+        app.start_turn("second".into());
+        assert!(app.sessions[1].is_busy(), "Term 2 starts its own turn instead of steering a dead channel");
+        pump_until(&mut app, |a| !a.sessions[0].is_busy() && !a.sessions[1].is_busy()).await;
+        for s in &app.sessions {
+            assert_eq!(s.agent.history.last().unwrap().content, "slow answer");
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_dialog_applies_edit_only_after_yes() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "hello\n").unwrap();
+        let url = mock(
+            vec![tool("read_file", serde_json::json!({"path": "a.txt"})), tool("edit_file", serde_json::json!({"path": "a.txt", "old_string": "hello", "new_string": "bye"})), text("done")],
+            0,
+        )
+        .await;
+        let mut app = App::new(CaCodeConfig::default());
+        point(&mut app, 0, &url, d.path(), PermissionMode::Ask);
+        app.start_turn("edit it".into());
+        pump_until(&mut app, |a| !a.sessions[0].approvals.is_empty()).await;
+        let t = app.sessions[0].approvals.front().unwrap();
+        assert!(t.request.diff.as_ref().unwrap().contains("+bye"));
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "hello\n", "nothing written before approval");
+        // keys go to the dialog
+        assert!(handle_global_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)));
+        pump_until(&mut app, |a| !a.sessions[0].is_busy()).await;
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "bye\n");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_keeps_history_of_cancelled_turn() {
+        let d = tempfile::tempdir().unwrap();
+        let url = mock(vec![tool("bash", serde_json::json!({"command": "sleep 20"}))], 0).await;
+        let mut app = App::new(CaCodeConfig::default());
+        point(&mut app, 0, &url, d.path(), PermissionMode::Yolo);
+        app.start_turn("long".into());
+        pump_until(&mut app, |a| a.sessions[0].messages.iter().any(|m| m.role == "tool_start")).await;
+        app.cancel_turn();
+        pump_until(&mut app, |a| !a.sessions[0].is_busy()).await;
+        let h = &app.sessions[0].agent.history;
+        assert_eq!(h.first().unwrap().content, "long", "user prompt kept");
+        assert!(h.iter().any(|m| m.role == "tool"), "tool result (cancelled) kept so the next request is valid");
+    }
+
+    #[tokio::test]
+    async fn compress_runs_in_background() {
+        let d = tempfile::tempdir().unwrap();
+        let url = mock(vec![text("[COMPACTED CONTEXT SUMMARY] s")], 500).await;
+        let mut app = App::new(CaCodeConfig::default());
+        point(&mut app, 0, &url, d.path(), PermissionMode::Yolo);
+        for i in 0..6 {
+            app.sessions[0].agent.history.push(Message::user(format!("q{i}")));
+            app.sessions[0].agent.history.push(Message::assistant(format!("a{i}")));
+        }
+        let t0 = Instant::now();
+        app.start_compress();
+        assert!(t0.elapsed() < Duration::from_millis(100), "start_compress must return immediately");
+        app.drain_agent_events();
+        assert!(app.is_thinking);
+        pump_until(&mut app, |a| a.bg_busy == 0).await;
+        assert!(app.sessions[0].agent.history[0].content.contains("COMPACTED"));
+    }
+
+    #[test]
+    fn paste_folding_and_expansion() {
+        let mut app = App::new(CaCodeConfig::default());
+        let big: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        handle_paste(&mut app, &big);
+        let input = app.session().input.clone();
+        assert_eq!(input, "[Pasted #1: 20 lines]");
+        assert_eq!(app.session().expand_pastes(&input), big.replace("\r\n", "\n"));
+        handle_paste(&mut app, " small");
+        assert!(app.session().input.ends_with(" small"));
+    }
+
+    #[test]
+    fn mention_detection_and_matching() {
+        assert_eq!(mention_at_cursor("look at @src/ma", 15), Some((8, "src/ma".into())));
+        assert_eq!(mention_at_cursor("@dev", 4), None);
+        assert_eq!(mention_at_cursor("no mention", 10), None);
+        let files = vec!["src/main.rs".to_string(), "crates/x/src/main.rs".to_string(), "README.md".to_string()];
+        assert_eq!(match_files(&files, "main", 8)[0], "src/main.rs");
+        assert_eq!(match_files(&files, "read", 8), vec!["README.md".to_string()]);
+    }
+
+    #[test]
+    fn highlighter_marks_keywords_strings_comments() {
+        let th = Theme::default();
+        let spans = highlight_code_line("let s = \"hi\"; // note", "rust", &th);
+        let kw = spans.iter().find(|s| s.content == "let").unwrap();
+        assert_eq!(kw.style.fg, Some(th.accent));
+        assert!(spans.iter().any(|s| s.content == "\"hi\"" && s.style.fg == Some(th.success)));
+        assert!(spans.iter().any(|s| s.content.starts_with("// note")));
+        let lifetimes = highlight_code_line("fn f<'a>(x: &'a str) {}", "rust", &th);
+        assert!(lifetimes.iter().any(|s| s.content == "str"), "rust lifetimes are not strings");
+    }
+
+    #[test]
+    fn ui_renders_approval_dialog_with_diff() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(CaCodeConfig::default());
+        let (t, _rx) = ApprovalTicket::new(cacode_core::events::ApprovalRequest {
+            id: 1,
+            tool: "edit_file".into(),
+            summary: "Edit src/main.rs".into(),
+            diff: Some("--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-hello\n+bye\n".into()),
+        });
+        app.sessions[0].approvals.push_back(t);
+        app.sessions[0].show_welcome = false;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| ui(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Approval required"), "dialog title missing");
+        assert!(text.contains("Edit src/main.rs"));
+        assert!(text.contains("+bye") && text.contains("-hello"));
+        assert!(text.contains("[y] Approve") && text.contains("[n] Reject"));
+    }
+
+    #[tokio::test]
+    async fn read_state_survives_across_turns() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "one\n").unwrap();
+        let url = mock(
+            vec![
+                tool("read_file", serde_json::json!({"path": "a.txt"})),
+                text("read it"),
+                tool("edit_file", serde_json::json!({"path": "a.txt", "old_string": "one", "new_string": "two"})),
+                text("edited"),
+            ],
+            0,
+        )
+        .await;
+        let mut app = App::new(CaCodeConfig::default());
+        point(&mut app, 0, &url, d.path(), PermissionMode::Yolo);
+        app.start_turn("read a.txt".into());
+        pump_until(&mut app, |a| !a.sessions[0].is_busy()).await;
+        app.start_turn("now change it".into());
+        pump_until(&mut app, |a| !a.sessions[0].is_busy()).await;
+        let errs: Vec<&Message> = app.sessions[0].agent.history.iter().filter(|m| m.is_error).collect();
+        assert!(errs.is_empty(), "edit in turn 2 must see the read from turn 1: {:?}", errs);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "two\n");
+    }
+}
+

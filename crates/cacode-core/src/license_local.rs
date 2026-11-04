@@ -49,11 +49,28 @@ pub fn remove_license(app: &str) -> Result<()> {
 }
 
 /// Returns true when the license is valid right now.
-/// Lifetime tier (99) never expires; others are checked against `now`.
+/// Lifetime tier (99) and `expires_at == 0` never expire; others are checked against `now`.
 pub fn is_license_valid(lic: &LocalLicense) -> bool {
-    if lic.tier == "99" {
+    if lic.tier == "99" || lic.expires_at == 0 {
         return true;
     }
     let now = chrono::Utc::now().timestamp();
     now <= lic.expires_at
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lic(tier: &str, exp: i64) -> LocalLicense {
+        LocalLicense { key: "k".into(), product: "CD".into(), tier: tier.into(), expires_at: exp }
+    }
+
+    #[test]
+    fn lifetime_and_expiry_semantics() {
+        assert!(is_license_valid(&lic("99", 1)));
+        assert!(is_license_valid(&lic("01", 0)), "expires_at = 0 means lifetime");
+        assert!(!is_license_valid(&lic("01", 1)), "expired in 1970");
+        assert!(is_license_valid(&lic("01", chrono::Utc::now().timestamp() + 3600)));
+    }
 }

@@ -15,13 +15,23 @@ pub fn run(format: String) -> Result<()> {
         return Ok(());
     }
     let conn = Connection::open(&db_path)?;
-    // Aggregate per model
+    crate::usage_db::init(&conn)?;
+    // Aggregate per model; flag estimated token counts and unknown prices.
     let mut stmt = conn.prepare(
-        "SELECT model, COUNT(*) as calls, SUM(prompt_tokens) as prompt, SUM(completion_tokens) as completion, SUM(total_tokens) as total, SUM(est_cost) as cost FROM token_usage GROUP BY model",
+        "SELECT model, COUNT(*) as calls, SUM(prompt_tokens) as prompt, SUM(completion_tokens) as completion, SUM(total_tokens) as total, SUM(est_cost) as cost, SUM(estimated), MIN(cost_known) FROM token_usage GROUP BY model ORDER BY cost DESC",
     )?;
     let rows = stmt.query_map([], |row| {
+        let est: i64 = row.get(6)?;
+        let known: i64 = row.get(7)?;
+        let mut model = row.get::<_, String>(0)?;
+        if est > 0 {
+            model.push_str(" ~est");
+        }
+        if known == 0 {
+            model.push_str(" ?price");
+        }
         Ok((
-            row.get::<_, String>(0)?,
+            model,
             row.get::<_, i64>(1)?,
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
@@ -63,6 +73,7 @@ pub fn run(format: String) -> Result<()> {
                 println!("| {:20} | {:5} | {:12} | {:15} | {:11} | {:15.6} |", model, calls, prompt, completion, total, cost);
             }
             println!("+----------------------+-------+--------------+-----------------+-------------+-----------------+");
+            println!("~est = some token counts were estimated (provider sent no usage); ?price = model missing from pricing table (cost counted as $0). Override in ~/.cacode/pricing.toml");
         }
     }
     Ok(())
